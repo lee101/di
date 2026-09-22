@@ -980,6 +980,7 @@ const DispatchMetadata = struct {
     status_detail: ?[]u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
+    gemini_search_completion: ?types.GeminiSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
     subagent_completion: ?types.SubagentStatus = null,
     tool_result_memory: ?types.ToolResultMemory = null,
@@ -989,6 +990,7 @@ const DispatchMetadata = struct {
         ctx.model_content_kind_sink = &self.model_content_kind;
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
+        ctx.gemini_search_completion_sink = &self.gemini_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
         ctx.tool_result_memory_sink = &self.tool_result_memory;
         ctx.command_result_json_sink = &self.command_result_json;
@@ -1012,6 +1014,7 @@ fn toolExecutionResultFromDispatch(
             .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
+            .gemini_search_completion = metadata.gemini_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
             .subagent_completion = metadata.subagent_completion,
             .tool_result_memory = memory,
@@ -1023,6 +1026,7 @@ fn toolExecutionResultFromDispatch(
             .status_detail = metadata.status_detail,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
+            .gemini_search_completion = metadata.gemini_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
             .subagent_completion = metadata.subagent_completion,
             .tool_result_memory = memory,
@@ -6701,7 +6705,7 @@ test "install_skill explicit tool installs local skill source" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const result = try executeToolCall(rt.context(), arena_state.allocator(), .{ .id = "1", .name = "install_skill", .arguments_json = args_json });
-    try expectContains(result.model_output, "Installed 1 skill(s) into fx.");
+    try expectContains(result.model_output, "Installed 1 skill(s) into di.");
     try expectContains(result.model_output, "- workflow&quot;&lt;injected&gt;\n");
     try expectNotContains(result.model_output, "<skill");
     try expectNotContains(result.model_output, "BODY SENTINEL");

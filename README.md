@@ -9,7 +9,11 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 - **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
 - **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
+- **Inline images:** PNG screenshots and attachments render in the transcript through Kitty graphics, with a text fallback in other terminals
+- **Live status:** session cost, token totals, context usage, and the current Git branch stay visible in the status line
 - **Extensible:** skills, MCP servers, and subagents
+- **Project instructions:** honors AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, and .github/copilot-instructions.md at the workspace root and in scoped directories
+- **Grounded web research:** `gemini_search` answers queries through Gemini grounded by Google Search (set `GEMINI_API_KEY`)
 
 <p>
   <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
@@ -18,6 +22,8 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
 </p>
 
 ## Build
+
+Requires Zig 0.16 or newer. If `zig version` prints 0.15.x, build with `~/.zvm/bin/zig build` or make Zig 0.16 the default on `PATH`.
 
 ```bash
 git clone https://github.com/lee101/di.git
@@ -37,9 +43,12 @@ export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
 di
 ```
 
-The default OpenPaths model is `openpaths/stealth/ox-alpha`. When that model is
-unavailable, di circuit-breaks to `deepseek-v4-flash-vision-exp` for the rest
-of the turn and shows a recovered banner.
+The default OpenPaths model is `xiaomi/mimo-v2.6-pro`. Model lists are fetched
+live from OpenPaths or OpenRouter and cached on disk, so new models such as
+`xiaomi/mimo-v2.6-flash` show up in `/model` without an update; when a listing
+is unavailable, any model id can be typed directly. A selection persisted under
+the retired default `openpaths/stealth/ox-alpha` circuit-breaks to
+`xiaomi/mimo-v2.6-pro` for the rest of the turn and shows a recovered banner.
 
 OpenRouter `:free` variants and the `openrouter/free` router still require an
 `OPENROUTER_API_KEY`; “free” describes inference price, not anonymous API
@@ -53,7 +62,10 @@ does not copy one provider's bearer token to another provider.
 OpenPaths, OpenRouter, Vercel AI Gateway, an eligible ChatGPT/Codex
 subscription, and an eligible Grok subscription. Selecting a row also selects
 the credential and transport that advertised it, so model choice is the normal
-workflow rather than a separate provider-configuration exercise.
+workflow rather than a separate provider-configuration exercise. The latest
+catalog is cached under `~/.fx` so the menu opens instantly and refreshes in the
+background, and a typed id that is not listed still selects through the
+`Use <query>` row.
 
 Sign in with one of:
 
@@ -74,6 +86,13 @@ Or make a one-shot request:
 ```bash
 di ask "explain the changes in this repository"
 ```
+
+The status line keeps session spend honest: cumulative cost, token totals,
+context usage against the model window, and the current Git branch, backed by
+the same accounting as `/cost` and `/usage`. PNG images in the transcript
+render inline through Kitty graphics (kitty, Ghostty, WezTerm, Warp), and fall
+back to a stable `[Image: ...]` line elsewhere (force with `FX_KITTY_IMAGES=1`,
+suppress with `FX_NO_KITTY_IMAGES=1`).
 
 ### Compatibility state
 

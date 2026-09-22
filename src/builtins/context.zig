@@ -51,6 +51,15 @@ const project_instruction_guidance =
     "Direct user instructions take precedence over project instructions. " ++
     "When project instructions conflict, follow the narrowest applicable project scope.";
 
+const rule_file_names = [_][]const u8{
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+};
+const agents_md_name_index: usize = 0;
+
 const CandidateClass = enum {
     ancestor,
     target,
@@ -60,6 +69,7 @@ const RuleCandidate = struct {
     source: []const u8,
     scope: []const u8,
     class: CandidateClass,
+    name_index: usize,
     body: ?[]const u8 = null,
     observed_bytes: usize = 0,
     distance: usize = std.math.maxInt(usize),
@@ -144,6 +154,7 @@ const SelectionScratch = struct {
     ranking_endpoints: std.ArrayList([]const u8) = .empty,
     delivered_sources: std.ArrayList([]const u8) = .empty,
     evaluated_endpoints: std.ArrayList([]const u8) = .empty,
+    loaded_bodies: std.ArrayList([]const u8) = .empty,
     omissions: std.ArrayList(context_contract.ContextOmissionInput) = .empty,
     notices: std.ArrayList([]const u8) = .empty,
     omission_summary: context_contract.ContextOmissionSummaryBuilder = .{},
@@ -152,6 +163,14 @@ const SelectionScratch = struct {
         if (!containsString(self.delivered_sources.items, source)) {
             try self.delivered_sources.append(self.arena, source);
         }
+    }
+
+    fn bodyAlreadyLoaded(self: *const SelectionScratch, body: []const u8) bool {
+        return containsString(self.loaded_bodies.items, body);
+    }
+
+    fn registerLoadedBody(self: *SelectionScratch, body: []const u8) !void {
+        if (!self.bodyAlreadyLoaded(body)) try self.loaded_bodies.append(self.arena, body);
     }
 
     fn addEvaluated(self: *SelectionScratch, endpoint: []const u8) !void {
@@ -251,7 +270,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
 
     var global_rule: ?LoadedRule = null;
     var global_source_path: ?[]const u8 = null;
-    var project_rule: ?LoadedRule = null;
+    var project_rules: std.ArrayList(LoadedRule) = .empty;
 
     if (options.initial) {
         try scratch.addEvaluated(options.workspace_root);
@@ -269,7 +288,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 };
                 if (canonical_home) |home_root| {
                     global_source_path = try std.fs.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
-                    global_rule = try loadRuleForSelection(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes);
+                    global_rule = try loadDiscoveredRule(arena, &scratch, global_source_path.?, options.context_limits.project_instruction_file_bytes, false);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         if (options.bounded_reconstruction) {
                             launch_home = home_root;
@@ -285,11 +304,21 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
             }
 
             if (std.fs.path.isAbsolute(options.workspace_root)) {
-                const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, "AGENTS.md" });
-                if (global_source_path == null or
-                    !std.mem.eql(u8, global_source_path.?, project_source))
-                {
-                    project_rule = try loadRuleForSelection(arena, &scratch, project_source, options.context_limits.project_instruction_file_bytes);
+                for (rule_file_names, 0..) |name, name_index| {
+                    const project_source = try std.fs.path.join(arena, &.{ options.workspace_root, name });
+                    if (global_source_path == null or
+                        !std.mem.eql(u8, global_source_path.?, project_source))
+                    {
+                        if (try loadDiscoveredRule(
+                            arena,
+                            &scratch,
+                            project_source,
+                            options.context_limits.project_instruction_file_bytes,
+                            name_index != agents_md_name_index,
+                        )) |rule| {
+                            try project_rules.append(arena, rule);
+                        }
+                    }
                 }
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
@@ -309,6 +338,11 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     for (scratch.candidates.items) |*candidate| {
         switch (try loadRuleWithBudget(arena, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null)) {
             .body => |body| {
+                if (candidate.name_index != agents_md_name_index and scratch.bodyAlreadyLoaded(body.text)) {
+                    try scratch.addDelivered(candidate.source);
+                    continue;
+                }
+                try scratch.registerLoadedBody(body.text);
                 candidate.body = body.text;
                 candidate.observed_bytes = body.observed_bytes;
                 candidate.distance = minimumDistance(candidate.scope, scratch.ranking_endpoints.items);
@@ -336,7 +370,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
     var rendered_rules: std.ArrayList(RenderedRule) = .empty;
     defer rendered_rules.deinit(arena);
 
-    if (global_rule != null or project_rule != null or selected.len > 0) {
+    if (global_rule != null or project_rules.items.len > 0 or selected.len > 0) {
         try appendSection(&out, "project-instructions-guidance", project_instruction_guidance);
     }
     if (global_rule) |rule| {
@@ -353,7 +387,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
             try rendered_rules.append(arena, .{ .source = candidate.source, .start = start, .end = out.written().len });
         }
     }
-    if (project_rule) |rule| {
+    for (project_rules.items) |rule| {
         const start = out.written().len;
         try appendSectionFrom(&out, "project-rules", rule.source, rule.body);
         try appendProjectInstructionLimitMarker(&out, &scratch, rule.source, rule.observed_bytes, options.context_limits.project_instruction_file_bytes);
@@ -434,6 +468,19 @@ fn loadRuleForSelection(
     }
 }
 
+fn loadDiscoveredRule(
+    arena: Allocator,
+    scratch: *SelectionScratch,
+    source: []const u8,
+    limit: context_limits.Resolved,
+    dedup_content: bool,
+) !?LoadedRule {
+    const loaded = (try loadRuleForSelection(arena, scratch, source, limit)) orelse return null;
+    if (dedup_content and scratch.bodyAlreadyLoaded(loaded.body)) return null;
+    try scratch.registerLoadedBody(loaded.body);
+    return loaded;
+}
+
 fn collectLaunchAncestorCandidates(
     arena: Allocator,
     scratch: *SelectionScratch,
@@ -486,29 +533,41 @@ fn appendRuleCandidate(
     class: CandidateClass,
     prior_delivered: []const []const u8,
 ) !bool {
-    const source = try std.fs.path.join(arena, &.{ scope, "AGENTS.md" });
-    if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) return true;
-    for (scratch.candidates.items) |candidate| {
-        // A previous walk already covered these ancestors, or stopped at the work cap.
-        if (std.mem.eql(u8, candidate.source, source)) return scratch.work_budget == null;
-    }
-    if (scratch.work_budget) |*budget| {
-        switch (budget.admit_candidate(source)) {
-            .admitted => {},
-            // Initial global/workspace probes need not have walked this scope's ancestors.
-            .duplicate => return true,
-            .exhausted => {
-                try scratch.addOmission(source, .selection_cap);
-                return false;
-            },
+    var covered_by_prior_walk = false;
+    for (rule_file_names, 0..) |name, name_index| {
+        const source = try std.fs.path.join(arena, &.{ scope, name });
+        if (containsString(prior_delivered, source) or containsString(scratch.delivered_sources.items, source)) continue;
+        var already_candidate = false;
+        for (scratch.candidates.items) |candidate| {
+            // A previous walk already covered these ancestors, or stopped at the work cap.
+            if (std.mem.eql(u8, candidate.source, source)) {
+                already_candidate = true;
+                break;
+            }
         }
+        if (already_candidate) {
+            covered_by_prior_walk = true;
+            continue;
+        }
+        if (scratch.work_budget) |*budget| {
+            switch (budget.admit_candidate(source)) {
+                .admitted => {},
+                // Initial global/workspace probes need not have walked this scope's ancestors.
+                .duplicate => continue,
+                .exhausted => {
+                    try scratch.addOmission(source, .selection_cap);
+                    return false;
+                },
+            }
+        }
+        try scratch.candidates.append(arena, .{
+            .source = source,
+            .scope = scope,
+            .class = class,
+            .name_index = name_index,
+        });
     }
-    try scratch.candidates.append(arena, .{
-        .source = source,
-        .scope = scope,
-        .class = class,
-    });
-    return true;
+    return !covered_by_prior_walk or scratch.work_budget == null;
 }
 
 fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) Allocator.Error!RuleLoad {
@@ -640,6 +699,7 @@ fn rankCandidateLessThan(_: void, lhs: *RuleCandidate, rhs: *RuleCandidate) bool
     const lhs_depth = pathDepth(lhs.scope);
     const rhs_depth = pathDepth(rhs.scope);
     if (lhs_depth != rhs_depth) return lhs_depth > rhs_depth;
+    if (lhs.name_index != rhs.name_index) return lhs.name_index < rhs.name_index;
     return std.mem.lessThan(u8, lhs.source, rhs.source);
 }
 
@@ -647,6 +707,7 @@ fn renderCandidateLessThan(_: void, lhs: *RuleCandidate, rhs: *RuleCandidate) bo
     const lhs_depth = pathDepth(lhs.scope);
     const rhs_depth = pathDepth(rhs.scope);
     if (lhs_depth != rhs_depth) return lhs_depth < rhs_depth;
+    if (lhs.name_index != rhs.name_index) return lhs.name_index < rhs.name_index;
     return std.mem.lessThan(u8, lhs.source, rhs.source);
 }
 
@@ -1360,16 +1421,20 @@ test "initial gather loads a contained AGENTS symlink with logical provenance" {
     defer alloc.free(workspace);
     const logical_source = try std.fs.path.join(alloc, &.{ workspace, "AGENTS.md" });
     defer alloc.free(logical_source);
+    const mirrored_source = try std.fs.path.join(alloc, &.{ workspace, "CLAUDE.md" });
+    defer alloc.free(mirrored_source);
 
     var context = try gatherProjectContextWithHome(alloc, .{
         .workspace_root = workspace,
     }, home);
     defer context.deinit(alloc);
 
-    try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "LINKED_PROJECT_RULE") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, context.modelVisibleBytes(), "LINKED_PROJECT_RULE"));
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), logical_source) != null);
-    try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
+    try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), mirrored_source) == null);
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
     try std.testing.expectEqualStrings(logical_source, context.delivered_sources[0]);
+    try std.testing.expectEqualStrings(mirrored_source, context.delivered_sources[1]);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "symlinked rule file") == null);
 }
 
@@ -1445,6 +1510,273 @@ test "initial gather renders an identical global and workspace source once" {
     try std.testing.expect(std.mem.find(u8, visible, "<global-rules") != null);
     try std.testing.expect(std.mem.find(u8, visible, "<project-rules") == null);
     try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
+}
+
+test "initial gather loads every ecosystem rule file at the root in filename order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/AGENTS.md", "ROOT_AGENTS_MARKER");
+    try writeTestFile(tmp.dir, "home/work/CLAUDE.md", "ROOT_CLAUDE_MARKER");
+    try writeTestFile(tmp.dir, "home/work/GEMINI.md", "ROOT_GEMINI_MARKER");
+    try writeTestFile(tmp.dir, "home/work/.cursorrules", "ROOT_CURSOR_MARKER");
+    try writeTestFile(tmp.dir, "home/work/.github/copilot-instructions.md", "ROOT_COPILOT_MARKER");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+    }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    const agents_index = std.mem.find(u8, visible, "ROOT_AGENTS_MARKER") orelse return error.TestExpectedEqual;
+    const claude_index = std.mem.find(u8, visible, "ROOT_CLAUDE_MARKER") orelse return error.TestExpectedEqual;
+    const gemini_index = std.mem.find(u8, visible, "ROOT_GEMINI_MARKER") orelse return error.TestExpectedEqual;
+    const cursor_index = std.mem.find(u8, visible, "ROOT_CURSOR_MARKER") orelse return error.TestExpectedEqual;
+    const copilot_index = std.mem.find(u8, visible, "ROOT_COPILOT_MARKER") orelse return error.TestExpectedEqual;
+    try std.testing.expect(agents_index < claude_index);
+    try std.testing.expect(claude_index < gemini_index);
+    try std.testing.expect(gemini_index < cursor_index);
+    try std.testing.expect(cursor_index < copilot_index);
+
+    inline for (rule_file_names) |name| {
+        const attr = try std.fmt.allocPrint(alloc, "<project-rules from=\"{s}/{s}\">", .{ workspace, name });
+        defer alloc.free(attr);
+        try std.testing.expect(std.mem.find(u8, visible, attr) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 5), context.delivered_sources.len);
+}
+
+test "mirrored AGENTS.md bodies across scopes still inject one section per source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/AGENTS.md", "MIRRORED_RULE");
+    try writeTestFile(tmp.dir, "home/work/src/AGENTS.md", "MIRRORED_RULE");
+    try writeTestFile(tmp.dir, "home/work/src/main.zig", "");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    const target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/src/main.zig");
+    defer alloc.free(target);
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target, .kind = .file }},
+    }, home);
+    defer context.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, context.modelVisibleBytes(), "MIRRORED_RULE"));
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
+}
+
+test "content-identical CLAUDE.md copy is skipped but delivered" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/AGENTS.md", "SAME_RULE");
+    try writeTestFile(tmp.dir, "home/work/CLAUDE.md", "SAME_RULE");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    const agents_source = try std.fs.path.join(alloc, &.{ workspace, "AGENTS.md" });
+    defer alloc.free(agents_source);
+    const claude_source = try std.fs.path.join(alloc, &.{ workspace, "CLAUDE.md" });
+    defer alloc.free(claude_source);
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+    }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, visible, "SAME_RULE"));
+    try std.testing.expect(std.mem.find(u8, visible, agents_source) != null);
+    try std.testing.expect(std.mem.find(u8, visible, claude_source) == null);
+    try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
+    try std.testing.expectEqualStrings(agents_source, context.delivered_sources[0]);
+    try std.testing.expectEqualStrings(claude_source, context.delivered_sources[1]);
+}
+
+test "content-identical extended rule across scopes injects once and stays delivered" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/CLAUDE.md", "DUP_EXT_RULE");
+    try writeTestFile(tmp.dir, "home/work/src/AGENTS.md", "NESTED_RULE");
+    try writeTestFile(tmp.dir, "home/work/src/CLAUDE.md", "DUP_EXT_RULE");
+    try writeTestFile(tmp.dir, "home/work/src/main.zig", "");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    const nested_claude = try std.fs.path.join(alloc, &.{ workspace, "src/CLAUDE.md" });
+    defer alloc.free(nested_claude);
+    const target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work/src/main.zig");
+    defer alloc.free(target);
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target, .kind = .file }},
+    }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, visible, "DUP_EXT_RULE"));
+    try std.testing.expect(std.mem.find(u8, visible, "NESTED_RULE") != null);
+    try std.testing.expect(std.mem.find(u8, visible, nested_claude) == null);
+    try std.testing.expectEqual(@as(usize, 3), context.delivered_sources.len);
+}
+
+test "symlinked extended rule candidate is omitted without exposing its target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/outside-secret.txt", "DO_NOT_EXPOSE");
+    const secret = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/outside-secret.txt");
+    defer alloc.free(secret);
+    try createSymlinkOrSkip(tmp.dir, secret, "home/work/CLAUDE.md");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+    }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expect(std.mem.find(u8, visible, "DO_NOT_EXPOSE") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "reason=\"symlinked rule file\"") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "CLAUDE.md") != null);
+    try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
+    try std.testing.expectEqual(@as(usize, 1), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "replace the symlink") != null);
+}
+
+test "combined project instruction cap bounds multi-file totals with an omission notice" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var body: [1000]u8 = undefined;
+    @memset(&body, 'a');
+    @memcpy(body[0..12], "AGENTS_BODY_");
+    try writeTestFile(tmp.dir, "home/work/AGENTS.md", &body);
+    @memset(&body, 'b');
+    @memcpy(body[0..12], "CLAUDE_BODY_");
+    try writeTestFile(tmp.dir, "home/work/CLAUDE.md", &body);
+    @memset(&body, 'c');
+    @memcpy(body[0..12], "CURSOR_BODY_");
+    try writeTestFile(tmp.dir, "home/work/.cursorrules", &body);
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    var limits = context_limits.Values{};
+    limits.project_instructions_total_bytes = .{ .value = .{ .bytes = 1500 }, .source = .command_line };
+
+    var context = try gatherProjectContextWithHome(alloc, .{
+        .workspace_root = workspace,
+        .context_limits = limits,
+    }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expect(std.mem.find(u8, visible, "CURSOR_BODY_") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "AGENTS_BODY_") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "CLAUDE_BODY_") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "<context_limit name=\"project_instructions_total_bytes\"") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "omitted_count=\"2\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), context.notices.len);
+    try std.testing.expect(std.mem.find(u8, context.notices[0], "project instructions omitted 2 source(s)") != null);
+}
+
+test "context: false project instruction loading discovers no rule files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/work/AGENTS.md", "OFF_AGENTS");
+    try writeTestFile(tmp.dir, "home/work/CLAUDE.md", "OFF_CLAUDE");
+    try writeTestFile(tmp.dir, "home/work/.cursorrules", "OFF_CURSOR");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+
+    var context = try selectProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{},
+        .home = home,
+        .initial = true,
+        .load_project_instruction_files = false,
+    });
+    defer context.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), context.modelVisibleBytes().len);
+    try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
+}
+
+test "scoped delta walk discovers nested ecosystem rule files in filename order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "work/nested/AGENTS.md", "NESTED_AGENTS_MARKER");
+    try writeTestFile(tmp.dir, "work/nested/CLAUDE.md", "NESTED_CLAUDE_MARKER");
+    try writeTestFile(tmp.dir, "work/nested/GEMINI.md", "NESTED_GEMINI_MARKER");
+    try writeTestFile(tmp.dir, "work/nested/.cursorrules", "NESTED_CURSOR_MARKER");
+    try writeTestFile(tmp.dir, "work/nested/main.zig", "");
+
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "work");
+    defer alloc.free(workspace);
+    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "work/nested");
+    defer alloc.free(nested);
+    const target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "work/nested/main.zig");
+    defer alloc.free(target);
+
+    var context = try selectApplicableProjectContext(alloc, .{
+        .workspace_root = workspace,
+        .targets = &.{.{ .path = target, .kind = .file }},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    const agents_index = std.mem.find(u8, visible, "NESTED_AGENTS_MARKER") orelse return error.TestExpectedEqual;
+    const claude_index = std.mem.find(u8, visible, "NESTED_CLAUDE_MARKER") orelse return error.TestExpectedEqual;
+    const gemini_index = std.mem.find(u8, visible, "NESTED_GEMINI_MARKER") orelse return error.TestExpectedEqual;
+    const cursor_index = std.mem.find(u8, visible, "NESTED_CURSOR_MARKER") orelse return error.TestExpectedEqual;
+    try std.testing.expect(agents_index < claude_index);
+    try std.testing.expect(claude_index < gemini_index);
+    try std.testing.expect(gemini_index < cursor_index);
+
+    inline for (.{ "AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules" }) |name| {
+        const attr = try std.fmt.allocPrint(alloc, "<scoped-rules from=\"{s}/{s}\" scope=\"{s}\">", .{ nested, name, nested });
+        defer alloc.free(attr);
+        try std.testing.expect(std.mem.find(u8, visible, attr) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), context.delivered_sources.len);
 }
 
 test "scoped selection keeps the nearest readable cap and reports unusable and capped sources" {
@@ -2279,7 +2611,7 @@ fn detectGitWorktreeState(arena: Allocator, workspace_root: []const u8, git_dir:
     const index = readSmallFile(arena, index_path, @intCast(stat.size + 1)) catch return .unknown;
     if (gitReadExpired(started_ns)) return .unknown;
 
-    return worktreeStateFromSmallIndex(arena, workspace_root, index, started_ns) catch .unknown;
+    return worktreeStateFromSmallIndex(arena, workspace_root, index, started_ns, @intCast(stat.mtime.nanoseconds)) catch .unknown;
 }
 
 fn gitPathPresence(git_dir: []const u8, child: []const u8) GitPathPresence {
@@ -2295,7 +2627,7 @@ fn gitPathPresence(git_dir: []const u8, child: []const u8) GitPathPresence {
     return .present;
 }
 
-fn worktreeStateFromSmallIndex(arena: Allocator, workspace_root: []const u8, index: []const u8, started_ns: i128) !GitWorktreeState {
+fn worktreeStateFromSmallIndex(arena: Allocator, workspace_root: []const u8, index: []const u8, started_ns: i128, index_file_mtime_ns: i128) !GitWorktreeState {
     if (index.len < 12 or !std.mem.eql(u8, index[0..4], "DIRC")) return .unknown;
 
     const version = std.mem.readInt(u32, index[4..8], .big);
@@ -2329,7 +2661,7 @@ fn worktreeStateFromSmallIndex(arena: Allocator, workspace_root: []const u8, ind
         const path = index[path_start..path_end];
         if (!isSafeIndexPath(path)) return .unknown;
 
-        switch (try indexEntryMatchesWorktree(arena, workspace_root, index[entry_start..], path)) {
+        switch (try indexEntryMatchesWorktree(arena, workspace_root, index[entry_start..], path, index_file_mtime_ns)) {
             .clean => {},
             .dirty => return .dirty,
             .unknown => return .unknown,
@@ -2344,7 +2676,9 @@ fn worktreeStateFromSmallIndex(arena: Allocator, workspace_root: []const u8, ind
     return .unknown;
 }
 
-fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry: []const u8, path: []const u8) !IndexEntryMatch {
+const git_tracked_content_limit: usize = 256 * 1024;
+
+fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry: []const u8, path: []const u8, index_file_mtime_ns: i128) !IndexEntryMatch {
     if (entry.len < 62) return .unknown;
 
     const mode = std.mem.readInt(u32, entry[24..28], .big);
@@ -2354,6 +2688,8 @@ fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry
     const index_mtime_sec = std.mem.readInt(u32, entry[8..12], .big);
     const index_mtime_nsec = std.mem.readInt(u32, entry[12..16], .big);
     const index_size = std.mem.readInt(u32, entry[36..40], .big);
+    const object_id = entry[40..60];
+    if (std.mem.allEqual(u8, object_id, 0)) return .dirty;
 
     const abs_path = try std.fs.path.join(arena, &.{ workspace_root, path });
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), abs_path, .{ .follow_symlinks = false }) catch |err| {
@@ -2371,9 +2707,29 @@ fn indexEntryMatchesWorktree(arena: Allocator, workspace_root: []const u8, entry
     if (mtime_sec < 0 or mtime_sec > std.math.maxInt(u32)) return .unknown;
     if (mtime_nsec < 0 or mtime_nsec > std.math.maxInt(u32)) return .unknown;
 
-    if (index_mtime_sec != @as(u32, @intCast(mtime_sec))) return .dirty;
-    if (index_mtime_nsec != @as(u32, @intCast(mtime_nsec))) return .dirty;
-    return .clean;
+    const worktree_mtime_sec: u32 = @intCast(mtime_sec);
+    const worktree_mtime_nsec: u32 = @intCast(mtime_nsec);
+    if (index_mtime_sec != worktree_mtime_sec) return .dirty;
+    if (index_mtime_nsec != worktree_mtime_nsec) return .dirty;
+
+    // The stat cache matches, but coarse timestamp granularity hides same-tick
+    // rewrites. Git resolves such racily clean entries by hashing the content,
+    // so verify entries recorded at or after the index write time.
+    const entry_mtime_ns = @as(i128, index_mtime_sec) * std.time.ns_per_s + @as(i128, index_mtime_nsec);
+    if (entry_mtime_ns < index_file_mtime_ns) return .clean;
+    if (index_size > git_tracked_content_limit) return .unknown;
+
+    const content = readSmallFile(arena, abs_path, git_tracked_content_limit) catch |err| {
+        return switch (err) {
+            error.FileNotFound => .dirty,
+            else => .unknown,
+        };
+    };
+    if (content.len != index_size) return .dirty;
+
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(content, &digest, .{});
+    return if (std.mem.eql(u8, object_id, &digest)) .clean else .dirty;
 }
 
 fn isSafeIndexPath(path: []const u8) bool {
@@ -2538,6 +2894,13 @@ fn writeSinglePathGitIndex(dir: std.Io.Dir, index_path: []const u8, file_path: [
     const mtime_nsec = try u32TimePart(stat.mtime.nanoseconds, 1);
     const size: u32 = @intCast(stat.size);
 
+    var content_file = try io_mod.openExistingReadOnlyRegularFile(dir, file_path, .follow);
+    defer content_file.close(io_mod.getIo());
+    const content = try io_mod.readFileToEnd(alloc, &content_file, size + 1);
+    defer alloc.free(content);
+    var object_id: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(content, &object_id, .{});
+
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(alloc);
 
@@ -2556,7 +2919,7 @@ fn writeSinglePathGitIndex(dir: std.Io.Dir, index_path: []const u8, file_path: [
     try appendBeU32(&bytes, alloc, 0);
     try appendBeU32(&bytes, alloc, 0);
     try appendBeU32(&bytes, alloc, size);
-    try appendZeroes(&bytes, alloc, 20);
+    try bytes.appendSlice(alloc, &object_id);
     try appendBeU16(&bytes, alloc, @intCast(index_rel_path.len));
     try bytes.appendSlice(alloc, index_rel_path);
     try bytes.append(alloc, 0);

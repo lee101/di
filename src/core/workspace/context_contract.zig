@@ -475,7 +475,7 @@ const current_inventory = [_]EntrypointInventory{
     .{
         .entrypoint = .interactive,
         .assembly_path = "main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies",
-        .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets",
+        .static_context = "builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) before enqueue, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history",
         .tools = "App.snapshotModelToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery",
         .permission = "PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts",
@@ -486,7 +486,7 @@ const current_inventory = [_]EntrypointInventory{
     .{
         .entrypoint = .ask,
         .assembly_path = "cli_ask.runPromptInternal -> agent_runtime dependencies",
-        .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets",
+        .static_context = "builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) before the prompt, then adds scoped deltas from effective structured tool targets",
         .transient_context = "tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path",
         .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery",
         .permission = "ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy",
@@ -497,7 +497,7 @@ const current_inventory = [_]EntrypointInventory{
     .{
         .entrypoint = .acp,
         .assembly_path = "acp.prompt.handlePrompt -> agent_runtime dependencies",
-        .static_context = "builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot from accepted local resources before each ACP prompt, then adds scoped tool-target deltas",
+        .static_context = "builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) from accepted local resources before each ACP prompt, then adds scoped tool-target deltas",
         .transient_context = "tool_runtime transient context each model step using the prompt-captured permission mode, ACP session state, and noninteractive tool/update callbacks",
         .tools = "mode-filtered paired tool advertisement and included custom-provider guidance with ACP session permission rules, deferred MCP discovery",
         .permission = "ACP session mode ask/auto; approval-required actions map to refusal or policy decisions instead of terminal prompts",
@@ -665,7 +665,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\entrypoints:
         \\- entrypoint: interactive
         \\  assembly_path: main.App.enqueuePrompt -> app_agent_runtime.processQueuedPrompt -> agent_runtime dependencies
-        \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before enqueue, then adds scoped deltas from effective structured tool targets
+        \\  static_context: builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) before enqueue, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step: env_context, captured permission mode, background runtime, non-live background history
         \\  tools: App.snapshotModelToolProjection pairs full tool advertisement with included custom-provider guidance after permission and deferred MCP discovery
         \\  permission: PermissionEngine mode, persistent rules, and session grants are enforced by interactive permission prompts
@@ -674,7 +674,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  drift: live terminal approvals, clarification UI, and full interactive tool surface differ from headless entrypoints by design
         \\- entrypoint: di ask
         \\  assembly_path: cli_ask.runPromptInternal -> agent_runtime dependencies
-        \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot before the prompt, then adds scoped deltas from effective structured tool targets
+        \\  static_context: builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) before the prompt, then adds scoped deltas from effective structured tool targets
         \\  transient_context: tool_runtime transient context each model step with captured permission mode, noninteractive output callbacks, and no live user question path
         \\  tools: mode-filtered paired tool advertisement and included custom-provider guidance with permission rules and deferred MCP discovery
         \\  permission: ask, --auto, or --yolo mode; approval-required actions fail with a noninteractive blocker instead of prompting unless yolo bypasses fx policy
@@ -683,7 +683,7 @@ test "entrypoint context inventory snapshot documents current deltas" {
         \\  drift: noninteractive permission blockers and absent live clarification UI differ from interactive by design
         \\- entrypoint: ACP
         \\  assembly_path: acp.prompt.handlePrompt -> agent_runtime dependencies
-        \\  static_context: builtins/context captures one global/root/ancestor/applicable AGENTS.md snapshot from accepted local resources before each ACP prompt, then adds scoped tool-target deltas
+        \\  static_context: builtins/context captures one global/root/ancestor/applicable rules snapshot (AGENTS.md, CLAUDE.md, GEMINI.md, .cursorrules, .github/copilot-instructions.md) from accepted local resources before each ACP prompt, then adds scoped tool-target deltas
         \\  transient_context: tool_runtime transient context each model step using the prompt-captured permission mode, ACP session state, and noninteractive tool/update callbacks
         \\  tools: mode-filtered paired tool advertisement and included custom-provider guidance with ACP session permission rules, deferred MCP discovery
         \\  permission: ACP session mode ask/auto; approval-required actions map to refusal or policy decisions instead of terminal prompts

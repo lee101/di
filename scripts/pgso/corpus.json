@@ -13,7 +13,8 @@
     "tui-render-lab.test.ts": "The suite validates render-lab infrastructure and owns separate native opt-in scenarios.",
     "tui-render-live-stress.test.ts": "The suite requires a real model credential and explicit live stress opt-in.",
     "web-fetch-live.test.ts": "The suite requires explicit live-network opt-in.",
-    "web-search-live.test.ts": "The suite requires a real model credential and live provider responses."
+    "web-search-live.test.ts": "The suite requires a real model credential and live provider responses.",
+    "gemini-search-live.test.ts": "live-network/credentialed: the suite requires a real GEMINI_API_KEY and live Gemini API responses."
   },
   "defaults": {
     "cwd": "tests/e2e",
@@ -85,6 +86,8 @@
     {"name": "e2e-session-title", "argv": ["bun", "test", "--max-concurrency", "1", "./session-title.test.ts"], "test_file": "session-title.test.ts"},
     {"name": "e2e-web-fetch-fake-network", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-fake-network.test.ts"], "test_file": "web-fetch-fake-network.test.ts"},
     {"name": "e2e-web-search-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-fake-gateway.test.ts"], "test_file": "web-search-fake-gateway.test.ts"},
+    {"name": "gemini-search-fake", "argv": ["bun", "test", "--max-concurrency", "1", "./gemini-search-fake.test.ts"], "test_file": "gemini-search-fake.test.ts"},
+    {"name": "think-tool", "argv": ["bun", "test", "--max-concurrency", "1", "./think-tool.test.ts"], "test_file": "think-tool.test.ts"},
     {"name": "e2e-vision-route-fake-gateway", "argv": ["bun", "test", "--max-concurrency", "1", "./vision-route-fake-gateway.test.ts"], "test_file": "vision-route-fake-gateway.test.ts"},
     {"name": "e2e-acp", "argv": ["bun", "test", "--max-concurrency", "1", "./acp.test.ts"], "test_file": "acp.test.ts"},
     {"name": "e2e-mcp-http", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-http.test.ts"], "test_file": "mcp-http.test.ts"},
@@ -103,7 +106,11 @@
     {"name": "e2e-tui-interrupt-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-interrupt-recovery.test.ts"], "test_file": "tui-interrupt-recovery.test.ts"},
     {"name": "e2e-tui-terminal-tool", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-terminal-tool.test.ts"], "test_file": "tui-terminal-tool.test.ts"},
     {"name": "e2e-tui-native-clear-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-native-clear-recovery.test.ts"], "test_file": "tui-native-clear-recovery.test.ts"},
-    {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"}
+    {"name": "e2e-tui-gateway-stream-lifecycle", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-gateway-stream-lifecycle.test.ts"], "test_file": "tui-gateway-stream-lifecycle.test.ts"},
+    {"name": "e2e-capability-search", "argv": ["bun", "test", "--max-concurrency", "1", "./capability-search.test.ts"], "test_file": "capability-search.test.ts"},
+    {"name": "e2e-read-tool-result", "argv": ["bun", "test", "--max-concurrency", "1", "./read-tool-result.test.ts"], "test_file": "read-tool-result.test.ts"},
+    {"name": "e2e-mcp-failure-modes", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-failure-modes.test.ts"], "test_file": "mcp-failure-modes.test.ts"},
+    {"name": "e2e-context-files", "argv": ["bun", "test", "--max-concurrency", "1", "./context-files.test.ts"], "test_file": "context-files.test.ts"}
   ],
   "verification_scenarios": [
     {"name": "verify-slack-install", "argv": ["bun", "test", "--max-concurrency", "1", "./slack-install.test.ts"], "test_file": "slack-install.test.ts", "requires_tmux": false},
@@ -127,6 +134,8 @@
     {"name": "verify-tui-slash-menu", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-menu.test.ts"], "test_file": "tui-slash-menu.test.ts"},
     {"name": "verify-web-fetch-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-fetch-permission-progress.test.ts"], "test_file": "web-fetch-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
-    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"}
+    {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
+    {"name": "verify-tui-slash-preferences", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-preferences.test.ts"], "test_file": "tui-slash-preferences.test.ts"},
+    {"name": "verify-settings-permissions-warning", "argv": ["bun", "test", "--max-concurrency", "1", "./settings-permissions-warning.test.ts"], "test_file": "settings-permissions-warning.test.ts"}
   ]
 }

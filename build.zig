@@ -1,4 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const zig_too_old = builtin.zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) == .lt;
+
+comptime {
+    const minimum = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+    if (builtin.zig_version.order(minimum) == .lt) {
+        @compileError(std.fmt.comptimePrint(
+            "di requires Zig 0.16.0 or newer; this is {s}. " ++
+                "Build with ~/.zvm/bin/zig build, or make Zig 0.16 the default `zig` on PATH (for example via zigup).",
+            .{builtin.zig_version_string},
+        ));
+    }
+}
 
 const UpdateChannel = enum { stable, dev };
 
@@ -67,6 +81,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("build_options", build_options.createModule());
 
     b.installArtifact(exe);
+
+    // Canonical `fx` name pinned by suites, CI workflows, and PGSO corpus.py.
+    const install_fx = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
+    b.getInstallStep().dependOn(&install_fx.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -392,39 +410,51 @@ fn addNapiArtifact(
 }
 
 fn discoverNodeIncludeDir(b: *std.Build) []const u8 {
-    var code: u8 = 0;
-    const out = b.runAllowFail(
-        &.{ "node", "-p", "require('node:path').join(require('node:path').dirname(process.execPath), '..', 'include', 'node')" },
-        &code,
-        .ignore,
-    ) catch std.process.fatal("Node.js is required to locate node_api.h; pass -Dnode-include-dir=<path>", .{});
-    if (code != 0) std.process.fatal("could not locate node_api.h; pass -Dnode-include-dir=<path>", .{});
-    const trimmed = std.mem.trim(u8, out, " \t\r\n");
-    return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
+    if (comptime zig_too_old) {
+        return "";
+    } else {
+        var code: u8 = 0;
+        const out = b.runAllowFail(
+            &.{ "node", "-p", "require('node:path').join(require('node:path').dirname(process.execPath), '..', 'include', 'node')" },
+            &code,
+            .ignore,
+        ) catch std.process.fatal("Node.js is required to locate node_api.h; pass -Dnode-include-dir=<path>", .{});
+        if (code != 0) std.process.fatal("could not locate node_api.h; pass -Dnode-include-dir=<path>", .{});
+        const trimmed = std.mem.trim(u8, out, " \t\r\n");
+        return b.allocator.dupe(u8, trimmed) catch std.process.fatal("could not allocate Node include path", .{});
+    }
 }
 
 fn readGitCommit(b: *std.Build) []const u8 {
-    var code: u8 = 0;
-    const out = b.runAllowFail(
-        &.{ "git", "rev-parse", "--short=12", "HEAD" },
-        &code,
-        .ignore,
-    ) catch return "unknown";
-    if (code != 0) return "unknown";
-    const trimmed = std.mem.trim(u8, out, " \t\r\n");
-    return b.allocator.dupe(u8, trimmed) catch "unknown";
+    if (comptime zig_too_old) {
+        return "unknown";
+    } else {
+        var code: u8 = 0;
+        const out = b.runAllowFail(
+            &.{ "git", "rev-parse", "--short=12", "HEAD" },
+            &code,
+            .ignore,
+        ) catch return "unknown";
+        if (code != 0) return "unknown";
+        const trimmed = std.mem.trim(u8, out, " \t\r\n");
+        return b.allocator.dupe(u8, trimmed) catch "unknown";
+    }
 }
 
 fn readAppVersion(b: *std.Build) []const u8 {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, "src/main.zig", b.allocator, .limited(1024 * 1024)) catch
-        @panic("could not read src/main.zig to resolve app version");
-    defer b.allocator.free(bytes);
+    if (comptime zig_too_old) {
+        return "0.0.0";
+    } else {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, "src/main.zig", b.allocator, .limited(1024 * 1024)) catch
+            @panic("could not read src/main.zig to resolve app version");
+        defer b.allocator.free(bytes);
 
-    const prefix = "pub const version = \"";
-    const start = (std.mem.find(u8, bytes, prefix) orelse
-        @panic("could not find pub const version in src/main.zig")) + prefix.len;
-    const end_rel = std.mem.findScalar(u8, bytes[start..], '"') orelse
-        @panic("could not parse pub const version in src/main.zig");
-    return b.allocator.dupe(u8, bytes[start .. start + end_rel]) catch
-        @panic("could not allocate app version");
+        const prefix = "pub const version = \"";
+        const start = (std.mem.find(u8, bytes, prefix) orelse
+            @panic("could not find pub const version in src/main.zig")) + prefix.len;
+        const end_rel = std.mem.findScalar(u8, bytes[start..], '"') orelse
+            @panic("could not parse pub const version in src/main.zig");
+        return b.allocator.dupe(u8, bytes[start .. start + end_rel]) catch
+            @panic("could not allocate app version");
+    }
 }

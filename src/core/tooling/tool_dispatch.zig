@@ -313,6 +313,7 @@ pub const DispatchContext = struct {
     on_context_notice: ?ContextNoticeSinkFn = null,
     inner_usage_sink: ?*?core_types.ToolUsage = null,
     web_search_completion_sink: ?*?core_types.WebSearchCompletion = null,
+    gemini_search_completion_sink: ?*?core_types.GeminiSearchCompletion = null,
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
     model_content_kind_sink: ?*ModelContentKind = null,
@@ -414,6 +415,8 @@ pub const ExecutorKind = enum {
     edit_file,
     web_fetch,
     web_search,
+    gemini_search,
+    think,
     run_command,
     terminal,
     skill,
@@ -799,6 +802,7 @@ pub const DispatchResult = struct {
     status_detail: ?[]u8 = null,
     inner_usage: ?core_types.ToolUsage = null,
     web_search_completion: ?core_types.WebSearchCompletion = null,
+    gemini_search_completion: ?core_types.GeminiSearchCompletion = null,
     web_fetch_completion: ?core_types.WebFetchCompletion = null,
     tool_result_memory: ?core_types.ToolResultMemory = null,
     command_result_json: ?[]const u8 = null,
@@ -842,6 +846,7 @@ pub const AuthorizedDispatchResult = struct {
 pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!DispatchResult {
     var captured_usage: ?core_types.ToolUsage = null;
     var captured_web_search_completion: ?core_types.WebSearchCompletion = null;
+    var captured_gemini_search_completion: ?core_types.GeminiSearchCompletion = null;
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
     var captured_model_content_kind: ModelContentKind = .ordinary;
@@ -849,6 +854,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
     if (call_ctx.web_search_completion_sink == null) call_ctx.web_search_completion_sink = &captured_web_search_completion;
+    if (call_ctx.gemini_search_completion_sink == null) call_ctx.gemini_search_completion_sink = &captured_gemini_search_completion;
     if (call_ctx.web_fetch_completion_sink == null) call_ctx.web_fetch_completion_sink = &captured_web_fetch_completion;
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
     if (call_ctx.model_content_kind_sink == null) call_ctx.model_content_kind_sink = &captured_model_content_kind;
@@ -865,6 +871,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const result = try admitted.tool.call(admitted.context, admitted.input);
             const inner_usage = if (admitted.context.inner_usage_sink) |slot| slot.* else captured_usage;
             const web_search_completion = if (admitted.context.web_search_completion_sink) |slot| slot.* else captured_web_search_completion;
+            const gemini_search_completion = if (admitted.context.gemini_search_completion_sink) |slot| slot.* else captured_gemini_search_completion;
             const web_fetch_completion = if (admitted.context.web_fetch_completion_sink) |slot| slot.* else captured_web_fetch_completion;
             const tool_result_memory = if (admitted.context.tool_result_memory_sink) |slot| slot.* else captured_tool_result_memory;
             const command_result_json = if (admitted.context.command_result_json_sink) |slot| slot.* else captured_command_result_json;
@@ -879,6 +886,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
                 .images = output.images,
                 .inner_usage = inner_usage,
                 .web_search_completion = web_search_completion,
+                .gemini_search_completion = gemini_search_completion,
                 .web_fetch_completion = web_fetch_completion,
                 .tool_result_memory = tool_result_memory,
                 .command_result_json = command_result_json,
@@ -942,6 +950,11 @@ pub fn reportInnerUsage(ctx: DispatchContext, usage: core_types.ToolUsage) void 
 
 pub fn reportWebSearchCompletion(ctx: DispatchContext, completion: core_types.WebSearchCompletion) void {
     const sink = ctx.web_search_completion_sink orelse return;
+    sink.* = completion;
+}
+
+pub fn reportGeminiSearchCompletion(ctx: DispatchContext, completion: core_types.GeminiSearchCompletion) void {
+    const sink = ctx.gemini_search_completion_sink orelse return;
     sink.* = completion;
 }
 

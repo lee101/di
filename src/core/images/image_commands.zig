@@ -87,7 +87,9 @@ pub fn Commands(comptime App: type) type {
             var loaded = image_attachments.loadClipboardImageAttachment(app.alloc) catch |err| {
                 if (err == error.NoClipboardImage) {
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "no image found on clipboard" }, true);
-                } else if (err != error.Unsupported) {
+                } else if (err == error.Unsupported) {
+                    try app.writeDomainNotice(.{ .topic = "images", .tone = .neutral, .body = "Clipboard image paste is not available on this platform." }, true);
+                } else {
                     const line = try std.fmt.allocPrint(app.alloc, "failed to paste clipboard image: {s}", .{@errorName(err)});
                     defer app.alloc.free(line);
                     try app.writeDomainNotice(.{ .topic = "images", .tone = .@"error", .body = line }, true);
@@ -973,7 +975,7 @@ test "managePending reports empty lists populated lists and clear" {
     try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
 }
 
-test "attachClipboard is silent on unsupported platforms" {
+test "attachClipboard reports unavailable clipboard image paste off macOS" {
     if (@import("builtin").os.tag == .macos) return;
 
     const alloc = std.testing.allocator;
@@ -982,6 +984,6 @@ test "attachClipboard is silent on unsupported platforms" {
 
     try Commands(FakeApp).attachClipboard(&app);
 
-    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try expectTranscriptContains(&app, "Clipboard image paste is not available on this platform.");
     try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
 }

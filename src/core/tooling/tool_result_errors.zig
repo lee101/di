@@ -229,7 +229,8 @@ fn permissionDeniedSuggestion(
 }
 
 fn is_network_tool(tool_name: []const u8) bool {
-    return std.mem.eql(u8, tool_name, "web_search");
+    return std.mem.eql(u8, tool_name, "web_search") or
+        std.mem.eql(u8, tool_name, "gemini_search");
 }
 
 pub fn isToolPermissionDeniedOutput(output: []const u8) bool {

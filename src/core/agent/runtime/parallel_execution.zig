@@ -329,6 +329,7 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         .status = execution.status,
         .model_output = try alloc.dupe(u8, execution.model_output),
         .web_search_completion = execution.web_search_completion,
+        .gemini_search_completion = execution.gemini_search_completion,
         .web_fetch_completion = execution.web_fetch_completion,
         .inner_usage = execution.inner_usage,
     };

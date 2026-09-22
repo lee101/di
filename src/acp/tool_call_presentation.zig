@@ -26,6 +26,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "web_fetch")) return .fetch;
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;
+    if (std.mem.eql(u8, tool_name, "gemini_search")) return .search;
     if (std.mem.eql(u8, tool_name, "write_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "edit_file")) return .edit;
     if (std.mem.eql(u8, tool_name, "shell")) return .execute;

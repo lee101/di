@@ -949,6 +949,26 @@ pub const WebFetchCompletion = struct {
     }
 };
 
+pub const GeminiSearchCompletion = struct {
+    pub const max_model_len: usize = 64;
+
+    model_buf: [max_model_len]u8 = [_]u8{0} ** max_model_len,
+    model_len: u8 = 0,
+    queries: u32 = 0,
+    sources: u32 = 0,
+    duration_ms: u64 = 0,
+
+    pub fn setModel(self: *GeminiSearchCompletion, model_value: []const u8) void {
+        const n = @min(model_value.len, max_model_len);
+        if (n > 0) @memcpy(self.model_buf[0..n], model_value[0..n]);
+        self.model_len = @intCast(n);
+    }
+
+    pub fn model(self: *const GeminiSearchCompletion) []const u8 {
+        return self.model_buf[0..self.model_len];
+    }
+};
+
 pub const SubagentStatus = struct {
     session_title: ?[]const u8 = null,
     model: []const u8,

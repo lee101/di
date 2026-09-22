@@ -32,6 +32,8 @@ TRAINING_E2E_TESTS = (
     "session-title.test.ts",
     "web-fetch-fake-network.test.ts",
     "web-search-fake-gateway.test.ts",
+    "gemini-search-fake.test.ts",
+    "think-tool.test.ts",
     "vision-route-fake-gateway.test.ts",
     "acp.test.ts",
     "mcp-http.test.ts",
@@ -51,6 +53,10 @@ TRAINING_E2E_TESTS = (
     "tui-terminal-tool.test.ts",
     "tui-native-clear-recovery.test.ts",
     "tui-gateway-stream-lifecycle.test.ts",
+    "capability-search.test.ts",
+    "read-tool-result.test.ts",
+    "mcp-failure-modes.test.ts",
+    "context-files.test.ts",
 )
 
 VERIFICATION_E2E_TESTS = (
@@ -76,11 +82,14 @@ VERIFICATION_E2E_TESTS = (
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
+    "tui-slash-preferences.test.ts",
+    "settings-permissions-warning.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (
     "ci-shards.test.ts",
     "context-limits-live.test.ts",
+    "gemini-search-live.test.ts",
     "notifications.test.ts",
     "tmux-helpers.test.ts",
     "tui-agent.test.ts",
@@ -370,8 +379,8 @@ class PgsoCorpusTests(unittest.TestCase):
             EXCLUDED_E2E_TESTS,
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
-        self.assertEqual(36, len(corpus.scenarios))
-        self.assertEqual(58, len(corpus.candidate_scenarios))
+        self.assertEqual(42, len(corpus.scenarios))
+        self.assertEqual(66, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

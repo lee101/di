@@ -380,6 +380,7 @@ const ToolCallRecord = struct {
     command_result_json: ?[]u8 = null,
     ask_question_text: ?[]u8 = null,
     web_search_completion: ?types.WebSearchCompletion = null,
+    gemini_search_completion: ?types.GeminiSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
 };
 
@@ -3080,6 +3081,7 @@ fn appendToolCallRecord(
         .command_result_json = command_result_json,
         .ask_question_text = ask_question_text,
         .web_search_completion = if (result) |execution| execution.web_search_completion else null,
+        .gemini_search_completion = if (result) |execution| execution.gemini_search_completion else null,
         .web_fetch_completion = if (result) |execution| execution.web_fetch_completion else null,
     });
 }
@@ -4287,6 +4289,15 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         if (tc.web_search_completion) |completion| {
             try out.writer.print(",\"web_search\":{{\"searches\":{d},\"duration_ms\":{d}}}", .{ completion.searches, completion.duration_ms });
+        }
+        if (tc.gemini_search_completion) |completion| {
+            try out.writer.writeAll(",\"gemini_search\":{\"model\":");
+            try std.json.Stringify.value(completion.model(), .{}, &out.writer);
+            try out.writer.print(",\"queries\":{d},\"sources\":{d},\"duration_ms\":{d}}}", .{
+                completion.queries,
+                completion.sources,
+                completion.duration_ms,
+            });
         }
         if (tc.web_fetch_completion) |completion| {
             try out.writer.writeAll(",\"web_fetch\":{\"url\":");

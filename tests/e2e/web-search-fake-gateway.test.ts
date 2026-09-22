@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -294,11 +295,18 @@ function createIsolatedRoot(
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-web-search-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
-  mkdirSync(join(home, ".fx"), { recursive: true });
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  chmodSync(join(home, ".fx"), 0o700);
   mkdirSync(workspace, { recursive: true });
-  const permission: Record<string, Record<string, string>> = {};
+  const settingsPermission = settings.permission;
+  const permission: Record<string, Record<string, string>> =
+    settingsPermission !== null && typeof settingsPermission === "object"
+      ? { ...(settingsPermission as Record<string, Record<string, string>>) }
+      : {};
   if (webSearchPermission) permission.web_search = { "*": webSearchPermission };
-  writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ ...settings, permission }));
+  const settingsPath = join(home, ".fx", "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ ...settings, permission }), { mode: 0o600 });
+  chmodSync(settingsPath, 0o600);
   return { root, home, workspace: realpathSync(workspace) };
 }
 
@@ -354,6 +362,13 @@ function toolResultText(body: string, callId: string): string {
     part.type === "tool-result" && part.toolCallId === callId
   );
   if (!result) throw new Error(`Missing tool result for ${callId}`);
+  const output = result.output;
+  if (output !== null && typeof output === "object") {
+    const denied = output as Record<string, unknown>;
+    if (denied.type === "execution-denied" && typeof denied.reason === "string") {
+      return denied.reason;
+    }
+  }
   return contentText(result.output);
 }
 
@@ -1060,6 +1075,78 @@ describe("web_search Gateway fixture", () => {
   );
 
   test(
+    "loose settings modes warn that permission rules are not applied",
+    async () => {
+      const root = createIsolatedRoot("deny");
+      chmodSync(join(root.home, ".fx", "settings.json"), 0o664);
+      const gateway = startFakeGateway([outerText("search capability unavailable")]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Search current Zig release information."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        // The run still completes; the warning is fail-loud on stderr.
+        const json = parseFxJson(result);
+        expect(json.output).toContain("search capability unavailable");
+        expect(result.stderr).toContain("configured permission rules are NOT being applied");
+        expect(result.stderr).toContain(join(root.home, ".fx", "settings.json"));
+        expect(result.stderr).toContain("settings.json has mode 0664");
+        expect(result.stderr).toContain("0700");
+        expect(result.stderr).toContain("0600");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "private settings modes apply configured deny rules",
+    async () => {
+      const root = createIsolatedRoot(null, {
+        permission: { write_file: { "*": "deny" } },
+      });
+      const gateway = startFakeGateway([
+        outerToolCalls([{
+          id: "write_outer_1",
+          name: "write_file",
+          input: { path: "denied-write.txt", content: "must not land" },
+        }]),
+        outerText("write was denied"),
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Write the output file as instructed."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.output).toContain("write was denied");
+        expect(gateway.requests).toHaveLength(2);
+        expect(toolResultText(gateway.requests[1]!.body, "write_outer_1")).toContain(
+          "tool_permission_denied",
+        );
+        expect(existsSync(join(root.workspace, "denied-write.txt"))).toBe(false);
+        expect(result.stderr).not.toContain("NOT being applied");
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "direct provider may return zero results without a worker retry",
     async () => {
       const root = createIsolatedRoot();
@@ -1250,6 +1337,179 @@ describe("web_search Gateway fixture", () => {
         expect(JSON.stringify(messages)).not.toContain("Found 1 result");
       } finally {
         await client.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "FX_WEB_SEARCH_BACKEND=ai_gateway_perplexity_search selects the perplexity provider tool",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        outerDirectProviderSearch("perplexity_search"),
+        outerFinalAnswer(),
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Search the web for the latest Zig release."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway, {
+              FX_WEB_SEARCH_BACKEND: "ai_gateway_perplexity_search",
+            }),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        const json = parseFxJson(result);
+        expect(json.output).toContain(SOURCE_URL);
+        expect(json.tool_calls).toHaveLength(0);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
+        expect(gateway.requests[0].body).not.toContain("gateway.exa_search");
+        expect(gateway.requests[0].body).not.toContain("gateway.parallel_search");
+        expect(gateway.requests[0].body).toContain("gateway.perplexity_search");
+        expect(gateway.requests[0].body).toContain('"name":"perplexity_search"');
+        expect(gateway.requests[0].body).not.toContain('"name":"web_search"');
+        const initial = parseGatewayRequest(gateway.requests[0]!.body);
+        const continuing = parseGatewayRequest(gateway.requests[1]!.body);
+        expect(serializedToolNames(initial)).toEqual(
+          AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.map((name) =>
+            name === "exa_search" ? "perplexity_search" : name
+          ),
+        );
+        expect(toolShapesWithoutDescriptions(continuing)).toEqual(
+          toolShapesWithoutDescriptions(initial),
+        );
+        expect(findUnavailableCapabilityReferences(initial)).toEqual([]);
+        const guidance = customProviderGuidanceState(initial);
+        expect(guidance.providerToolIndices).toHaveLength(1);
+        expect(guidance.guidanceMessageIndices).toHaveLength(1);
+        const providerTool = toolByName(initial, "perplexity_search");
+        expect(providerTool?.type).toBe("provider");
+        expect(providerTool?.id).toBe("gateway.perplexity_search");
+        const args = providerTool?.args;
+        if (!args || typeof args !== "object") {
+          throw new Error("missing perplexity provider tool args");
+        }
+        expect("maxResults" in args).toBe(true);
+        expect("maxTokens" in args).toBe(true);
+        expect("numResults" in args).toBe(false);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "web_search domain-filter tool calls round-trip filters and degrade without a worker request",
+    async () => {
+      const cases = [
+        {
+          backend: undefined,
+          input: { query: "latest Zig release", allowed_domains: ["ziglang.org"] },
+          serializedFilter: '"allowed_domains":["ziglang.org"]',
+          label: "allowed: ziglang.org",
+          providerToolName: "exa_search",
+        },
+        {
+          backend: undefined,
+          input: { query: "latest Zig release", blocked_domains: ["spam.example"] },
+          serializedFilter: '"blocked_domains":["spam.example"]',
+          label: "blocked: spam.example",
+          providerToolName: "exa_search",
+        },
+        {
+          backend: "ai_gateway_perplexity_search",
+          input: { query: "latest Zig release", allowed_domains: ["ziglang.org"] },
+          serializedFilter: '"allowed_domains":["ziglang.org"]',
+          label: "allowed: ziglang.org",
+          providerToolName: "perplexity_search",
+        },
+        {
+          backend: "ai_gateway_perplexity_search",
+          input: { query: "latest Zig release", blocked_domains: ["spam.example"] },
+          serializedFilter: '"blocked_domains":["spam.example"]',
+          label: "blocked: spam.example",
+          providerToolName: "perplexity_search",
+        },
+      ];
+      for (const testCase of cases) {
+        const root = createIsolatedRoot();
+        const gateway = startFakeGateway([
+          outerSearchCall(testCase.input),
+          outerText("The search capability was unavailable."),
+        ]);
+        try {
+          const result = await runFx(
+            ["ask", "--auto", "--json", "--no-save", "Search the web for the latest Zig release."],
+            {
+              cwd: root.workspace,
+              env: fakeGatewayEnv(root, gateway, {
+                FX_WEB_SEARCH_BACKEND: testCase.backend,
+              }),
+              timeoutMs: TIMEOUT,
+            },
+          );
+
+          const json = parseFxJson(result);
+          expect(json.tool_calls).toEqual([{ name: "web_search", status: "error" }]);
+          expect(result.stderr).toContain("Searching latest Zig release");
+          expect(result.stderr).toContain(testCase.label);
+          expect(gateway.requests).toHaveLength(2);
+          for (const request of gateway.requests) {
+            expect(request.headers.get("ai-language-model-id")).toBe(OUTER_MODEL);
+          }
+          const initial = parseGatewayRequest(gateway.requests[0]!.body);
+          expect(toolByName(initial, testCase.providerToolName)?.type).toBe("provider");
+          expect(gateway.requests[1]!.body).toContain(testCase.serializedFilter);
+          const toolResult = toolResultText(gateway.requests[1]!.body, "search_outer_1");
+          expect(toolResult).toContain(
+            "web_search is unavailable: no local runtime with a configured Gateway transport policy is installed",
+          );
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 4,
+  );
+
+  test(
+    "web_search rejects combined allow and block domain filters without a worker request",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        outerSearchCall({
+          query: "latest Zig release",
+          allowed_domains: ["ziglang.org"],
+          blocked_domains: ["spam.example"],
+        }),
+        outerText("The search request was invalid."),
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Search the web for the latest Zig release."],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([{ name: "web_search", status: "error" }]);
+        expect(gateway.requests).toHaveLength(2);
+        const toolResult = toolResultText(gateway.requests[1]!.body, "search_outer_1");
+        expect(toolResult).toContain("web_search accepts only one non-empty domain filter");
+      } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

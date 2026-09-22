@@ -81,7 +81,7 @@ fn collect_clipboard_process_output(
     return multi_reader.toOwnedSlice(1);
 }
 
-fn clipboard_process_term(status: c_int) std.process.Child.Term {
+fn child_process_term(status: c_int) std.process.Child.Term {
     const raw_status: u32 = @bitCast(status);
     return if (std.c.W.IFEXITED(raw_status))
         .{ .exited = std.c.W.EXITSTATUS(raw_status) }
@@ -103,7 +103,7 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
     child.stderr = null;
 }
 
-fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
+pub fn try_reap_child_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
     const pid = child.id orelse return error.WaitFailed;
     var status: c_int = undefined;
     const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
@@ -111,7 +111,7 @@ fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.
     if (waited != pid) return error.WaitFailed;
 
     child.id = null;
-    return clipboard_process_term(status);
+    return child_process_term(status);
 }
 
 fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
@@ -129,7 +129,7 @@ fn wait_for_clipboard_process(
 ) !std.process.Child.Term {
     const io = io_mod.getIo();
     while (true) {
-        if (try try_reap_clipboard_process(child)) |term| return term;
+        if (try try_reap_child_process(child)) |term| return term;
 
         const now = std.Io.Clock.Timestamp.now(io, .awake);
         if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
@@ -172,6 +172,13 @@ fn run_clipboard_process(
 // Publish eager file representations so the pasteboard server owns them after
 // this short-lived process exits.
 fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) host.ClipboardError!bool {
+    if (comptime builtin.os.tag == .linux) {
+        return copy_file_contents_to_clipboard(
+            path,
+            &file_clipboard_candidates,
+            io_mod.getenv("WAYLAND_DISPLAY") != null,
+        );
+    }
     if (comptime builtin.os.tag != .macos) return false;
 
     const script =
@@ -226,6 +233,56 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
     return error.CopyFailed;
 }
 
+const FileClipboardCandidate = struct {
+    argv: []const []const u8,
+    wayland_only: bool,
+};
+
+const file_clipboard_candidates = [_]FileClipboardCandidate{
+    .{ .argv = &.{"wl-copy"}, .wayland_only = true },
+    .{ .argv = &.{ "xclip", "-selection", "clipboard" }, .wayland_only = false },
+    .{ .argv = &.{ "xsel", "--clipboard", "--input" }, .wayland_only = false },
+};
+
+fn copy_file_contents_to_clipboard(
+    path: []const u8,
+    candidates: []const FileClipboardCandidate,
+    wayland: bool,
+) host.ClipboardError!bool {
+    for (candidates) |candidate| {
+        if (candidate.wayland_only and !wayland) continue;
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return error.CopyFailed;
+        defer file.close(io_mod.getIo());
+        const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromSeconds(2),
+        });
+        const term = run_clipboard_file_feed(&file, candidate.argv, deadline) catch |err| {
+            debug_trace.logf("host", "clipboard file copy tool failed err={s}", .{@errorName(err)});
+            continue;
+        };
+        if (copySucceeded(term)) return true;
+        logUnsuccessfulTerm(term);
+    }
+    return false;
+}
+
+fn run_clipboard_file_feed(
+    file: *std.Io.File,
+    argv: []const []const u8,
+    deadline: std.Io.Clock.Timestamp,
+) !std.process.Child.Term {
+    const io = io_mod.getIo();
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .{ .file = file.* },
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    return wait_for_clipboard_process(&child, deadline);
+}
+
 fn clipboardCommand(os_tag: std.Target.Os.Tag) ?[]const []const u8 {
     return switch (os_tag) {
         .macos => &.{"pbcopy"},
@@ -267,4 +324,96 @@ test "native clipboard accepts only a successful exit" {
     try std.testing.expect(!copySucceeded(.{ .signal = .TERM }));
     try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
     try std.testing.expect(!copySucceeded(.{ .unknown = 1 }));
+}
+
+fn expect_capture_contents(capture_path: []const u8, expected: []const u8) !void {
+    const alloc = std.testing.allocator;
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, capture_path, .{});
+    defer file.close(std.testing.io);
+    const recorded = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    defer alloc.free(recorded);
+    try std.testing.expectEqualStrings(expected, recorded);
+}
+
+test "linux file clipboard feeds file bytes to the recording tool" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.md", .data = "trace line one\ntrace line two\n" });
+    const trace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "trace.md");
+    defer alloc.free(trace_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "capture.txt", .data = "" });
+    const capture_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "capture.txt");
+    defer alloc.free(capture_path);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", "/bin/cat > \"$1\"", "stub", capture_path };
+    const candidates = [_]FileClipboardCandidate{.{ .argv = &argv, .wayland_only = false }};
+    try std.testing.expect(try copy_file_contents_to_clipboard(trace_path, &candidates, false));
+    try expect_capture_contents(capture_path, "trace line one\ntrace line two\n");
+}
+
+test "linux file clipboard skips wayland-only tools and falls through failed tools" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.md", .data = "payload" });
+    const trace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "trace.md");
+    defer alloc.free(trace_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wl.txt", .data = "" });
+    const wl_capture = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "wl.txt");
+    defer alloc.free(wl_capture);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "x.txt", .data = "" });
+    const x_capture = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "x.txt");
+    defer alloc.free(x_capture);
+
+    const wl_argv = [_][]const u8{ "/bin/sh", "-c", "/bin/cat > \"$1\"", "stub", wl_capture };
+    const fail_argv = [_][]const u8{ "/bin/sh", "-c", "exit 1" };
+    const x_argv = [_][]const u8{ "/bin/sh", "-c", "/bin/cat > \"$1\"", "stub", x_capture };
+    const candidates = [_]FileClipboardCandidate{
+        .{ .argv = &wl_argv, .wayland_only = true },
+        .{ .argv = &fail_argv, .wayland_only = false },
+        .{ .argv = &x_argv, .wayland_only = false },
+    };
+
+    try std.testing.expect(try copy_file_contents_to_clipboard(trace_path, &candidates, false));
+    try expect_capture_contents(wl_capture, "");
+    try expect_capture_contents(x_capture, "payload");
+
+    try std.testing.expect(try copy_file_contents_to_clipboard(trace_path, &candidates, true));
+    try expect_capture_contents(wl_capture, "payload");
+}
+
+test "linux file clipboard reports no copy when tools fail or are missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.md", .data = "payload" });
+    const trace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "trace.md");
+    defer alloc.free(trace_path);
+
+    const candidates = [_]FileClipboardCandidate{
+        .{ .argv = &.{ "/bin/sh", "-c", "exit 1" }, .wayland_only = false },
+        .{ .argv = &.{"/no/such/clipboard-tool"}, .wayland_only = false },
+    };
+    try std.testing.expect(!try copy_file_contents_to_clipboard(trace_path, &candidates, true));
+}
+
+test "linux file clipboard kills a hanging tool at the deadline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "trace.md", .data = "payload" });
+    const trace_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "trace.md");
+    defer alloc.free(trace_path);
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
+    defer file.close(std.testing.io);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30" };
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(100),
+    });
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(error.Timeout, run_clipboard_file_feed(&file, &argv, deadline));
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms < 5000);
 }

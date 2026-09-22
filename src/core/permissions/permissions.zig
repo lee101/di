@@ -93,11 +93,16 @@ pub const PermissionTargetKind = enum {
 };
 
 pub const web_search_permission = "web_search";
+pub const gemini_search_permission = "gemini_search";
 pub const web_fetch_permission = "web_fetch";
 pub const yolo_warning_text = "Full access enabled: fx permission checks disabled";
 
 pub fn isWebSearchToolName(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, web_search_permission);
+}
+
+pub fn isGeminiSearchToolName(tool_name: []const u8) bool {
+    return std.mem.eql(u8, tool_name, gemini_search_permission);
 }
 
 pub fn isWebFetchToolName(tool_name: []const u8) bool {
@@ -183,6 +188,10 @@ pub fn permissionTargetForCall(
 
     if (isWebSearchToolName(call.name)) {
         return arena.dupe(u8, web_search_permission);
+    }
+
+    if (isGeminiSearchToolName(call.name)) {
+        return arena.dupe(u8, gemini_search_permission);
     }
 
     if (isWebFetchToolName(call.name)) {
@@ -1433,7 +1442,7 @@ pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
 /// Returns the persistent rule pattern for a session grant. Caller owns the returned slice.
 pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: []const u8, permission_name: []const u8, pattern: []const u8) ![]u8 {
     const permission = permissionNameForTool(permission_name);
-    if (isWebSearchToolName(permission)) return alloc.dupe(u8, "*");
+    if (isWebSearchToolName(permission) or isGeminiSearchToolName(permission)) return alloc.dupe(u8, "*");
     if (std.mem.eql(u8, permission, web_fetch_permission)) return canonicalWebFetchDomainPattern(alloc, pattern);
     if (std.mem.eql(u8, permission, "bash")) {
         if (command_environment.isExplicitPermissionCommandIdentity(pattern)) {
