@@ -2,6 +2,7 @@ const std = @import("std");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const io_mod = @import("../core/shared/io.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const secret = @import("../core/auth/secret.zig");
@@ -408,16 +409,22 @@ pub fn streamPrepared(
         request.cancel_flag,
         request.content_capture_limit,
     );
+    var completed = completion;
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
-            .completion = completion,
+            .completion = completed,
             .ownership = .owned,
         } };
         owned.deinit(alloc);
     }
+    completed.billing = try billingFromUsage(alloc, request.model, completion.usage);
     return .{
         .completed = .{
-            .completion = completion,
+            .completion = completed,
+            .usage = if (completed.billing != null)
+                .{ .exact = .openpaths }
+            else
+                .{ .unavailable = .possibly_billed },
             .ownership = .owned,
         },
     };
@@ -784,8 +791,64 @@ fn parseUsage(object: std.json.ObjectMap) ?types.Usage {
     if (value != .object) return null;
     const input = unsignedField(value.object, "prompt_tokens");
     const output = unsignedField(value.object, "completion_tokens");
-    if (input == null and output == null) return null;
-    return .{ .input_tokens = input, .output_tokens = output };
+    const cost = costField(value.object, "cost");
+    const prompt_details = objectMapField(value.object, "prompt_tokens_details");
+    const cache_read = if (prompt_details) |details| unsignedField(details, "cached_tokens") else null;
+    const cache_write = if (prompt_details) |details| unsignedField(details, "cache_write_tokens") else null;
+    const completion_details = objectMapField(value.object, "completion_tokens_details");
+    const reasoning = if (completion_details) |details| unsignedField(details, "reasoning_tokens") else null;
+    if (input == null and output == null and cost == null and
+        cache_read == null and cache_write == null and reasoning == null) return null;
+    return .{
+        .input_tokens = input,
+        .output_tokens = output,
+        .cache_read_tokens = cache_read,
+        .cache_write_tokens = cache_write,
+        .reasoning_tokens = reasoning,
+        .cost = cost,
+    };
+}
+
+fn objectMapField(object: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = object.get(key) orelse return null;
+    if (value != .object) return null;
+    return value.object;
+}
+
+fn costField(object: std.json.ObjectMap, key: []const u8) ?f64 {
+    const value = object.get(key) orelse return null;
+    const cost: f64 = switch (value) {
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        .number_string, .string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => return null,
+    };
+    if (!std.math.isFinite(cost) or cost < 0) return null;
+    return cost;
+}
+
+/// Builds the exact-usage billing record when the provider settled the charge.
+/// Without a provider-reported cost the billing window must stay incomplete,
+/// so this returns null instead of guessing zero.
+fn billingFromUsage(
+    alloc: Allocator,
+    model: []const u8,
+    usage: types.Usage,
+) !?types.ProviderBilling {
+    const cost = usage.cost orelse return null;
+    const owned_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(owned_model);
+    return .{
+        .created_at_ms = io_mod.milliTimestamp(),
+        .model = owned_model,
+        .total_cost = cost,
+        .input_tokens = usage.input_tokens orelse 0,
+        .output_tokens = usage.output_tokens orelse 0,
+        .cache_read_tokens = usage.cache_read_tokens orelse 0,
+        .cache_write_tokens = usage.cache_write_tokens orelse 0,
+        .reasoning_tokens = usage.reasoning_tokens,
+        .billable_web_search_calls = 0,
+    };
 }
 
 fn appendToolArguments(
@@ -1033,6 +1096,139 @@ test "chat completions request uses OpenAI wire shape" {
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_tokens\":4096") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning_effort\"") == null);
+}
+
+fn testToolDecode(_: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return error.InvalidToolArguments;
+}
+
+fn testToolCall(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return error.InvalidToolArguments;
+}
+
+fn testToolReadsOnly(_: tool_dispatch.ToolInput) bool {
+    return true;
+}
+
+fn testToolIrreversible(_: tool_dispatch.ToolInput) bool {
+    return false;
+}
+
+const test_provider_executed_tool = tool_dispatch.Tool{
+    .name = "web_search",
+    .description = "Search the web",
+    .model_schema = .{ .name = "web_search", .description = "Search the web" },
+    .provider_executed = true,
+    .decode = testToolDecode,
+    .call = testToolCall,
+    .reads_only_fn = testToolReadsOnly,
+    .irreversible_fn = testToolIrreversible,
+};
+
+const test_unadvertised_tool = tool_dispatch.Tool{
+    .name = "ghost",
+    .description = "Not registered for advertisement",
+    .model_schema = .{ .name = "ghost", .description = "Not registered for advertisement" },
+    .decode = testToolDecode,
+    .call = testToolCall,
+    .reads_only_fn = testToolReadsOnly,
+    .irreversible_fn = testToolIrreversible,
+};
+
+test "openpaths omits provider-executed advertised tools from requests" {
+    const read_file_schema = model_tool_schema.FunctionSchema{
+        .name = "read_file",
+        .description = "Read",
+        .input_schema = .{},
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Read it." }};
+    const body = try buildRequest(std.testing.allocator, .{
+        .model = "xiaomi/mimo-v2.6-pro",
+        .messages = &messages,
+        .tools = .{
+            .registry = .{ .tools = &.{test_provider_executed_tool} },
+            .advertised_names = &.{ "web_search", "read_file" },
+            .advertised_functions = &.{read_file_schema},
+        },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function\",\"function\":{\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "web_search") == null);
+}
+
+test "openpaths usage parsing captures cost and cache details" {
+    const wire =
+        "data: {\"id\":\"gen_9\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":194,\"completion_tokens\":2,\"cost\":0.95,\"prompt_tokens_details\":{\"cached_tokens\":100,\"cache_write_tokens\":10},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n" ++
+        "data: [DONE]\n\n";
+    var reader: std.Io.Reader = .fixed(wire);
+    var cancelled = std.atomic.Value(bool).init(false);
+    const completion = try consumeSse(
+        std.testing.allocator,
+        &reader,
+        undefined,
+        null,
+        null,
+        null,
+        null,
+        &cancelled,
+        null,
+    );
+    var owned = stream_provider.Result{ .completed = .{ .completion = completion, .ownership = .owned } };
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u64, 194), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 2), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 100), completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 10), completion.usage.cache_write_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), completion.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?f64, 0.95), completion.usage.cost.?);
+
+    const billing = (try billingFromUsage(std.testing.allocator, "xiaomi/mimo-v2.6-pro", completion.usage)).?;
+    defer std.testing.allocator.free(@constCast(billing.model));
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", billing.model);
+    try std.testing.expectEqual(@as(f64, 0.95), billing.total_cost);
+    try std.testing.expectEqual(@as(u64, 194), billing.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), billing.output_tokens);
+    try std.testing.expectEqual(@as(u64, 100), billing.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
+    try std.testing.expectEqual(@as(?u64, 7), billing.reasoning_tokens);
+}
+
+test "openpaths billing stays unset without provider-reported cost" {
+    const usage = types.Usage{ .input_tokens = 3, .output_tokens = 4 };
+    try std.testing.expect((try billingFromUsage(std.testing.allocator, "xiaomi/mimo-v2.6-pro", usage)) == null);
+    const invalid_cost = types.Usage{ .input_tokens = 3, .cost = std.math.nan(f64) };
+    try std.testing.expect(costField(blk: {
+        var object = std.json.ObjectMap.init(std.testing.allocator);
+        defer object.deinit();
+        try object.put("cost", .{ .float = -1.0 });
+        break :blk object;
+    }, "cost") == null);
+    _ = invalid_cost;
+}
+
+test "openpaths rejects advertised tools without a usable schema" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Read it." }};
+    try std.testing.expectError(error.InvalidToolSchema, buildRequest(std.testing.allocator, .{
+        .model = "xiaomi/mimo-v2.6-pro",
+        .messages = &messages,
+        .tools = .{
+            .registry = .{ .tools = &.{test_unadvertised_tool} },
+            .advertised_names = &.{"ghost"},
+        },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    }));
+    try std.testing.expectError(error.InvalidToolSchema, buildRequest(std.testing.allocator, .{
+        .model = "xiaomi/mimo-v2.6-pro",
+        .messages = &messages,
+        .tools = .{ .advertised_names = &.{"missing"} },
+        .tool_choice = .auto,
+        .provider_options = .{},
+    }));
 }
 
 test "chat completions request serializes reasoning effort and images" {
