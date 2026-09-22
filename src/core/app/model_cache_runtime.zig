@@ -23,6 +23,8 @@ else
 
 const Allocator = std.mem.Allocator;
 const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+/// Mirrors the model id bound enforced by gateway openpaths.validateModel.
+const max_model_id_bytes: usize = 256;
 
 const ModelCacheState = enum {
     idle,
@@ -235,6 +237,9 @@ pub const ModelMenuItem = struct {
     provider: []const u8,
     capabilities: model_capabilities.Capabilities,
     origin: ?ModelOrigin = null,
+    /// Trailing typed-model row ("Use <query>"); its id is the user's query,
+    /// not a catalog entry.
+    custom: bool = false,
 
     fn deinit(self: ModelMenuItem, alloc: Allocator) void {
         alloc.free(self.id);
@@ -261,12 +266,43 @@ pub const ModelMenu = struct {
         return self.query_buf[0..self.query_len];
     }
 
-    pub fn setQuery(self: *ModelMenu, query_text: []const u8) void {
+    pub fn setQuery(self: *ModelMenu, alloc: Allocator, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
         if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected_index = 0;
         self.window_start = 0;
+        self.refreshCustomRow(alloc);
+    }
+
+    /// Rebuilds the trailing "Use <query>" row for the current query. It shows
+    /// only for valid typed ids that do not exactly match a listed item. The
+    /// row is a display affordance: allocation failure drops it, and selection
+    /// resolves typed ids straight from the query either way.
+    fn refreshCustomRow(self: *ModelMenu, alloc: Allocator) void {
+        var index = self.items.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (self.items.items[index].custom) {
+                self.items.items[index].deinit(alloc);
+                _ = self.items.orderedRemove(index);
+            }
+        }
+        const typed = std.mem.trim(u8, self.query(), " \t\r\n");
+        if (!validTypedModelId(typed)) return;
+        for (self.items.items) |item| {
+            if (std.mem.eql(u8, item.id, typed)) return;
+        }
+        const id = alloc.dupe(u8, typed) catch return;
+        self.items.append(alloc, .{
+            .id = id,
+            .provider = modelProvider(id),
+            .capabilities = .{},
+            .origin = null,
+            .custom = true,
+        }) catch {
+            alloc.free(id);
+        };
     }
 
     pub fn providerFilter(self: *const ModelMenu) ModelProviderFilter {
@@ -328,9 +364,28 @@ pub const ModelMenu = struct {
     }
 
     pub fn selectedItemAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
-        if (!self.active or self.load_state != .ready) return null;
+        if (!self.active) return null;
         const item = self.itemAt(self.selected_index) orelse return null;
+        if (self.load_state != .ready and !item.custom) return null;
         return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
+    }
+
+    /// Enter resolution for the model menu. A non-empty query names the model
+    /// directly: an exact listed id selects that row, otherwise the typed id
+    /// becomes the selection (the trailing "Use <query>" row) and invalid typed
+    /// ids are rejected. Empty queries keep the ordinary highlighted selection.
+    pub fn enterSelectionAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
+        if (!self.active) return null;
+        const typed = std.mem.trim(u8, self.query(), " \t\r\n");
+        if (typed.len == 0) return self.selectedItemAlloc(alloc);
+        for (self.items.items) |item| {
+            if (item.custom) continue;
+            if (std.mem.eql(u8, item.id, typed)) {
+                return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
+            }
+        }
+        if (!validTypedModelId(typed)) return null;
+        return .{ .id = try alloc.dupe(u8, typed), .origin = null };
     }
 
     fn clearSnapshot(self: *ModelMenu, alloc: Allocator) void {
@@ -375,13 +430,36 @@ fn modelMenuItemMatches(
     provider_filter: ModelProviderFilter,
     query: []const u8,
 ) bool {
-    if (!providerMatchesFilter(item.provider, provider_filter)) return false;
     const query_text = std.mem.trim(u8, query, " \t\r\n");
+    if (item.custom) return query_text.len > 0 and std.mem.eql(u8, item.id, query_text);
+    if (!providerMatchesFilter(item.provider, provider_filter)) return false;
     if (query_text.len == 0) return true;
     if (text_utils.containsIgnoreCase(item.id, query_text)) return true;
     if (text_utils.containsIgnoreCase(item.provider, query_text)) return true;
     if (item.origin) |origin| return text_utils.containsIgnoreCase(origin.label(), query_text);
     return false;
+}
+
+/// True when the trailing typed-model row ("Use <query>") is showing.
+pub fn modelMenuCustomRowVisible(
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+) bool {
+    for (items) |item| {
+        if (item.custom and modelMenuItemMatches(item, provider_filter, query)) return true;
+    }
+    return false;
+}
+
+/// Typed model ids follow the same rules as the gateway's model validation:
+/// non-empty, at most 256 bytes, and no control or space bytes.
+pub fn validTypedModelId(model: []const u8) bool {
+    if (model.len == 0 or model.len > max_model_id_bytes) return false;
+    for (model) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
 }
 
 fn providerFilter(provider: []const u8) ModelProviderFilter {
@@ -400,7 +478,10 @@ fn providerFilter(provider: []const u8) ModelProviderFilter {
 pub fn modelProviderFilterAvailable(items: []const ModelMenuItem, filter: ModelProviderFilter) bool {
     if (filter == .all) return true;
     var seen = [_]bool{false} ** model_provider_filter_count;
-    for (items) |item| seen[@intFromEnum(providerFilter(item.provider))] = true;
+    for (items) |item| {
+        if (item.custom) continue;
+        seen[@intFromEnum(providerFilter(item.provider))] = true;
+    }
 
     var specific_count: usize = 0;
     for (seen[1..]) |available| specific_count += @intFromBool(available);
@@ -428,6 +509,13 @@ pub const Runtime = struct {
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
     menu: ModelMenu = .{},
+    cache_path: ?[]u8 = null,
+    cache_path_resolved: bool = false,
+    /// True while the loaded catalog came from the on-disk cache and no live
+    /// fetch has replaced it yet.
+    cache_seeded: bool = false,
+    refresh_provider: ?model_catalog.Provider = null,
+    refresh_access: ?OwnedCatalogAccess = null,
 
     pub fn init(alloc: Allocator, models_path: []const u8) Self {
         return .{
@@ -441,6 +529,8 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.origins.deinit(self.alloc);
         freeMergeSources(self.alloc, &self.owned_merge_sources);
+        if (self.refresh_access) |*access| access.deinit(self.alloc);
+        if (self.cache_path) |path| self.alloc.free(path);
     }
 
     /// Replaces the secondary catalogs merged into the menu on the next load.
@@ -474,6 +564,8 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.ensureCachePath();
+        self.rememberRefreshSource(provider, access);
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -504,6 +596,8 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.ensureCachePath();
+        self.rememberRefreshSource(provider, access);
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -522,6 +616,9 @@ pub const Runtime = struct {
                 return;
             },
         };
+        if (loaded.catalog.items.len > 0) {
+            self.persistCatalogCache(loaded.catalog.items, loaded.provenance.access.source);
+        }
 
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
@@ -567,6 +664,7 @@ pub const Runtime = struct {
                 !std.meta.eql(self.requested_access.?, requested_access));
         var reused_public_catalog = false;
         if (access_changed and
+            !self.cache_seeded and
             self.state == .ready and
             requested_access.level == .public_only)
         {
@@ -595,7 +693,9 @@ pub const Runtime = struct {
         const should_load = switch (self.state) {
             .idle => true,
             .failed => now - self.last_attempt_ms >= 1000,
-            .ready => if (self.outcome.last_failure) |failed|
+            .ready => if (self.cache_seeded)
+                true
+            else if (self.outcome.last_failure) |failed|
                 expired or (failed.failure.retryable and now - self.last_attempt_ms >= 1000)
             else
                 expired,
@@ -629,6 +729,7 @@ pub const Runtime = struct {
             self.outcome = .{};
         }
         self.state = .idle;
+        self.cache_seeded = false;
         self.completion_pending = false;
         self.last_attempt_ms = 0;
         self.requested_access = null;
@@ -663,6 +764,8 @@ pub const Runtime = struct {
         // blocking provider work, so these best-effort fetches stay inline.
         var moved = owned_catalog.*;
         owned_catalog.* = .empty;
+        self.ensureCachePath();
+        if (moved.items.len > 0) self.persistCatalogCache(moved.items, metadata.source);
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
         fillOrigins(self.alloc, &origins, moved.items.len, fallback_origin) catch {};
@@ -693,6 +796,13 @@ pub const Runtime = struct {
 
     pub fn openMenu(self: *Self) !void {
         self.finishThreadIfDone();
+        self.ensureCachePath();
+        const seeded = self.seedFromCache();
+        try self.buildOpenMenu();
+        if (seeded) self.kickRefresh();
+    }
+
+    fn buildOpenMenu(self: *Self) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
 
@@ -708,7 +818,122 @@ pub const Runtime = struct {
     }
 
     pub fn setMenuQuery(self: *Self, query: []const u8) void {
-        self.menu.setQuery(query);
+        self.menu.setQuery(self.alloc, query);
+    }
+
+    /// Points the persistent catalog cache at `path` instead of the default
+    /// `~/.fx/model_catalog.json`. Call before loads start.
+    pub fn setCachePath(self: *Self, path: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(owned);
+        if (self.cache_path) |old| self.alloc.free(old);
+        self.cache_path = owned;
+    }
+
+    fn ensureCachePath(self: *Self) void {
+        if (self.cache_path != null or self.cache_path_resolved) return;
+        self.cache_path_resolved = true;
+        self.cache_path = defaultCachePath(self.alloc);
+    }
+
+    fn rememberRefreshSource(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+    ) void {
+        const owned = OwnedCatalogAccess.init(self.alloc, access) catch return;
+        if (self.refresh_access) |*old| old.deinit(self.alloc);
+        self.refresh_access = owned;
+        self.refresh_provider = provider;
+    }
+
+    /// Re-runs the last known catalog fetch in the background after the menu
+    /// was seeded from disk.
+    fn kickRefresh(self: *Self) void {
+        const provider = self.refresh_provider orelse return;
+        const access = self.refresh_access orelse return;
+        // An independent copy: startWarmup replaces the remembered access.
+        var temp = OwnedCatalogAccess.init(self.alloc, access.access) catch return;
+        defer temp.deinit(self.alloc);
+        self.startWarmup(provider, temp.access);
+    }
+
+    /// Paints the menu instantly from the on-disk cache when nothing is loaded
+    /// yet. Returns true when a background refresh should be kicked.
+    fn seedFromCache(self: *Self) bool {
+        var cached = self.readCatalogCache() orelse return false;
+        defer model_catalog.freeModelCatalog(self.alloc, &cached.entries);
+        if (cached.entries.items.len == 0) return false;
+
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.catalog.items.len > 0 or self.outcome.loaded != null) return false;
+
+        var origins: std.ArrayList(?ModelOrigin) = .empty;
+        defer origins.deinit(self.alloc);
+        const origin: ?ModelOrigin = if (cached.source) |source|
+            ModelOrigin.fromSource(source)
+        else
+            null;
+        fillOrigins(self.alloc, &origins, cached.entries.items.len, origin) catch return false;
+
+        const moved = cached.entries;
+        cached.entries = .empty;
+        self.catalog = moved;
+        replaceOriginsLocked(self, &origins);
+        self.outcome = .{ .loaded = .{ .access = .{
+            .level = .public_only,
+            .source = cached.source,
+            .public_only_reason = null,
+            .private_models_may_be_hidden = false,
+        } } };
+        self.cache_seeded = true;
+        // An in-flight fetch owns the state machine until it completes.
+        if (self.state != .loading) self.state = .ready;
+        self.requested_access = if (self.refresh_access) |*access|
+            model_catalog.AccessMetadata.init(access.access)
+        else
+            null;
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=cache_seeded entries={d}", .{moved.items.len});
+        return true;
+    }
+
+    fn readCatalogCache(self: *Self) ?CachedCatalog {
+        const path = self.cache_path orelse return null;
+        var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
+        defer file.close(io_mod.getIo());
+        const text = io_mod.readFileToEnd(self.alloc, &file, max_cache_file_bytes) catch return null;
+        defer self.alloc.free(text);
+        return parseCatalogCache(self.alloc, text) catch null;
+    }
+
+    /// Best-effort write of the freshly fetched primary catalog so the next
+    /// menu open paints instantly. Never fails the load.
+    fn persistCatalogCache(
+        self: *Self,
+        entries: []const model_catalog.ModelCatalogEntry,
+        source: ?credentials.Source,
+    ) void {
+        const path = self.cache_path orelse return;
+        const count = @min(entries.len, model_catalog.max_catalog_models);
+        var models: std.ArrayList(CachedModelWire) = .empty;
+        defer models.deinit(self.alloc);
+        models.ensureTotalCapacity(self.alloc, count) catch return;
+        for (entries[0..count]) |entry| models.append(self.alloc, .{
+            .id = entry.id,
+            .image_input_claim = entry.image_input_claim,
+        }) catch return;
+
+        var output: std.Io.Writer.Allocating = .init(self.alloc);
+        defer output.deinit();
+        std.json.Stringify.value(CacheFileWire{
+            .source = if (source) |value| @tagName(value) else null,
+            .fetched_at_ms = io_mod.milliTimestamp(),
+            .models = models.items,
+        }, .{}, &output.writer) catch return;
+        io_mod.writeFileAtomic(self.alloc, path, output.written()) catch |err| {
+            debug_trace.logf("catalog", "model catalog cache write failed err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn pollLoadTransition(self: *Self) !bool {
@@ -896,6 +1121,9 @@ pub const Runtime = struct {
             },
         };
         self.cancel_requested.store(false, .seq_cst);
+        if (loaded.catalog.items.len > 0) {
+            self.persistCatalogCache(loaded.catalog.items, loaded.provenance.access.source);
+        }
 
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
@@ -1021,8 +1249,18 @@ pub const Runtime = struct {
         if (!menu.active) return;
         switch (self.state) {
             .idle, .loading => {
-                menu.clearSnapshot(self.alloc);
-                menu.load_state = .loading;
+                if (self.cache_seeded and self.catalog.items.len > 0) {
+                    try hydrateMenuSnapshot(
+                        self.alloc,
+                        menu,
+                        self.catalog.items,
+                        self.origins.items,
+                        self.primaryOriginLocked(),
+                    );
+                } else {
+                    menu.clearSnapshot(self.alloc);
+                    menu.load_state = .loading;
+                }
             },
             .failed => {
                 menu.clearSnapshot(self.alloc);
@@ -1037,8 +1275,65 @@ pub const Runtime = struct {
             ),
         }
         menu.catalog_state = modelMenuCatalogState(self.outcome);
+        // A disk-seeded catalog keeps painting through refresh failures with no
+        // failure flash; live status returns once a fetch lands.
+        if (self.cache_seeded) menu.catalog_state.failure = null;
     }
 };
+
+const cache_file_name = "model_catalog.json";
+const max_cache_file_bytes: usize = 4 * 1024 * 1024;
+
+/// On-disk shape of the persistent model catalog cache.
+const CachedModelWire = struct {
+    id: []const u8,
+    image_input_claim: ?bool = null,
+};
+
+const CacheFileWire = struct {
+    source: ?[]const u8 = null,
+    fetched_at_ms: i64 = 0,
+    models: []const CachedModelWire = &.{},
+};
+
+const CachedCatalog = struct {
+    entries: std.ArrayList(model_catalog.ModelCatalogEntry),
+    source: ?credentials.Source,
+    fetched_at_ms: i64,
+};
+
+fn parseCatalogCache(alloc: Allocator, text: []const u8) !CachedCatalog {
+    // Legacy cache files (no image_input_claim, maybe has_image_input) parse to null claims.
+    var parsed = try std.json.parseFromSlice(CacheFileWire, alloc, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const source = if (parsed.value.source) |tag|
+        std.meta.stringToEnum(credentials.Source, tag)
+    else
+        null;
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    const count = @min(parsed.value.models.len, model_catalog.max_catalog_models);
+    for (parsed.value.models[0..count]) |raw| {
+        if (!validTypedModelId(raw.id)) continue;
+        const id = try alloc.dupe(u8, raw.id);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{
+            .id = id,
+            .model_type = model_type,
+            .image_input_claim = raw.image_input_claim,
+        });
+    }
+    return .{ .entries = entries, .source = source, .fetched_at_ms = parsed.value.fetched_at_ms };
+}
+
+fn defaultCachePath(alloc: Allocator) ?[]u8 {
+    if (@import("builtin").is_test) return null;
+    const home = io_mod.getenv("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return std.fs.path.join(alloc, &.{ home, ".fx", cache_file_name }) catch null;
+}
 
 fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
@@ -1109,6 +1404,7 @@ fn hydrateMenuSnapshot(
     menu.clearSnapshot(alloc);
     menu.items = items;
     menu.load_state = .ready;
+    menu.refreshCustomRow(alloc);
 }
 
 fn primaryOriginFromAccess(access: model_catalog.AccessMetadata) ?ModelOrigin {
@@ -1237,6 +1533,32 @@ fn testCatalog(alloc: Allocator, model_id: []const u8) !std.ArrayList(model_cata
     try entries.append(alloc, .{ .id = id, .model_type = model_type });
     return entries;
 }
+
+const StaticCatalog = struct {
+    ids: []const []const u8 = &.{},
+    fail: bool = false,
+    calls: usize = 0,
+
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        if (self.fail) return .{ .failure = .{ .category = .transport, .retryable = true } };
+        var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        errdefer model_catalog.freeModelCatalog(alloc, &entries);
+        for (self.ids) |raw_id| {
+            const id = try alloc.dupe(u8, raw_id);
+            errdefer alloc.free(id);
+            const model_type = try alloc.dupe(u8, "language");
+            errdefer alloc.free(model_type);
+            try entries.append(alloc, .{ .id = id, .model_type = model_type });
+        }
+        return .{ .catalog = entries };
+    }
+
+    fn provider(self: *StaticCatalog) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetch };
+    }
+};
 
 const RefreshCatalog = struct {
     first_failure: ?model_catalog.Failure = null,
@@ -1761,11 +2083,13 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 
-    runtime.menu.setQuery("BLUE");
-    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    runtime.menu.setQuery(alloc, "BLUE");
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
     try std.testing.expectEqualStrings("private/blue-hornbill", runtime.menu.itemAt(0).?.id);
+    try std.testing.expect(runtime.menu.itemAt(1).?.custom);
+    try std.testing.expectEqualStrings("BLUE", runtime.menu.itemAt(1).?.id);
 
-    runtime.menu.setQuery("");
+    runtime.menu.setQuery(alloc, "");
     try std.testing.expect(runtime.menu.moveProvider(1));
     try std.testing.expectEqual(ModelProviderFilter.anthropic, runtime.menu.providerFilter());
     try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
@@ -1839,10 +2163,12 @@ test "merged menus tag origins filter by route and flag cross-provider picks" {
     try std.testing.expectEqual(@as(?ModelOrigin, .ai_gateway_api_key), runtime.menu.itemAt(0).?.origin);
     try std.testing.expectEqual(@as(?ModelOrigin, .grok_subscription), runtime.menu.itemAt(1).?.origin);
 
-    // Querying by route label finds the Grok-served row only.
-    runtime.menu.setQuery("grok");
-    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
-    runtime.menu.setQuery("");
+    // Querying by route label finds the Grok-served row plus the typed row.
+    runtime.menu.setQuery(alloc, "grok");
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.filteredItemCount());
+    try std.testing.expectEqualStrings("meta/llama-4", runtime.menu.itemAt(0).?.id);
+    try std.testing.expect(runtime.menu.itemAt(1).?.custom);
+    runtime.menu.setQuery(alloc, "");
 
     const selected = (try runtime.menu.selectedItemAlloc(alloc)).?;
     defer alloc.free(selected.id);
@@ -2064,6 +2390,221 @@ test "model cache request resolution distinguishes readiness miss failure idle a
         runtime.resolveForRequest("provider/new-reasoning-model", &cancel_flag),
     );
     runtime.state = .ready;
+}
+
+test "model menu Enter accepts typed ids and rejects invalid input" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    var entries = try testCatalog(alloc, "listed/model");
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    runtime.menu.active = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, entries.items, &.{}, null);
+
+    runtime.menu.setQuery(alloc, "listed/model");
+    {
+        const selected = (try runtime.menu.enterSelectionAlloc(alloc)).?;
+        defer alloc.free(selected.id);
+        try std.testing.expectEqualStrings("listed/model", selected.id);
+    }
+
+    runtime.menu.setQuery(alloc, "brand/new-model");
+    {
+        const selected = (try runtime.menu.enterSelectionAlloc(alloc)).?;
+        defer alloc.free(selected.id);
+        try std.testing.expectEqualStrings("brand/new-model", selected.id);
+        try std.testing.expect(selected.origin == null);
+    }
+
+    runtime.menu.setQuery(alloc, "bad id");
+    try std.testing.expect((try runtime.menu.enterSelectionAlloc(alloc)) == null);
+    runtime.menu.setQuery(alloc, "bad\tid");
+    try std.testing.expect((try runtime.menu.enterSelectionAlloc(alloc)) == null);
+
+    const oversized = [_]u8{'a'} ** 257;
+    try std.testing.expect(!validTypedModelId(&oversized));
+    try std.testing.expect(validTypedModelId("xiaomi/mimo-v2.6-flash"));
+
+    // Typed selection works while the catalog load has failed.
+    runtime.menu.load_state = .failed;
+    runtime.menu.setQuery(alloc, "typed/while-failed");
+    {
+        const selected = (try runtime.menu.enterSelectionAlloc(alloc)).?;
+        defer alloc.free(selected.id);
+        try std.testing.expectEqualStrings("typed/while-failed", selected.id);
+    }
+}
+
+test "model menu offers a Use query row for non-exact typed ids" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    var entries = try testCatalog(alloc, "listed/model");
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    runtime.menu.active = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, entries.items, &.{}, null);
+
+    runtime.menu.setQuery(alloc, "listed/model");
+    try std.testing.expect(!modelMenuCustomRowVisible(runtime.menu.items.items, .all, runtime.menu.query()));
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+
+    runtime.menu.setQuery(alloc, "brand/new-model");
+    try std.testing.expect(modelMenuCustomRowVisible(runtime.menu.items.items, .all, runtime.menu.query()));
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    const custom = runtime.menu.itemAt(0).?;
+    try std.testing.expect(custom.custom);
+    try std.testing.expectEqualStrings("brand/new-model", custom.id);
+
+    runtime.menu.setQuery(alloc, "bad id");
+    try std.testing.expect(!modelMenuCustomRowVisible(runtime.menu.items.items, .all, runtime.menu.query()));
+    try std.testing.expectEqual(@as(usize, 0), runtime.menu.filteredItemCount());
+
+    // The row stays available for explicit selection while the load failed.
+    runtime.menu.load_state = .failed;
+    runtime.menu.setQuery(alloc, "typed/while-failed");
+    try std.testing.expect(modelMenuCustomRowVisible(runtime.menu.items.items, .all, runtime.menu.query()));
+    try std.testing.expectEqual(@as(usize, 1), runtime.menu.filteredItemCount());
+    const explicit = (try runtime.menu.selectedItemAlloc(alloc)).?;
+    defer alloc.free(explicit.id);
+    try std.testing.expectEqualStrings("typed/while-failed", explicit.id);
+}
+
+test "model catalog cache round-trips ids source and timestamp with the entry cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "cache");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "cache");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, cache_file_name });
+    defer alloc.free(path);
+
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    try runtime.setCachePath(path);
+
+    var entries = try testCatalog(alloc, "vendor/one");
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    for ([_][]const u8{ "vendor/two", "vendor/three" }) |raw| {
+        const id = try alloc.dupe(u8, raw);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.persistCatalogCache(entries.items, .openrouter_api_key);
+
+    var cached = runtime.readCatalogCache().?;
+    defer model_catalog.freeModelCatalog(alloc, &cached.entries);
+    try std.testing.expectEqual(@as(?credentials.Source, .openrouter_api_key), cached.source);
+    try std.testing.expect(cached.fetched_at_ms > 0);
+    try std.testing.expectEqual(@as(usize, 3), cached.entries.items.len);
+    try std.testing.expectEqualStrings("vendor/one", cached.entries.items[0].id);
+    try std.testing.expectEqualStrings("vendor/two", cached.entries.items[1].id);
+    try std.testing.expectEqualStrings("vendor/three", cached.entries.items[2].id);
+
+    var many: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    defer model_catalog.freeModelCatalog(alloc, &many);
+    var index: usize = 0;
+    while (index < model_catalog.max_catalog_models + 1) : (index += 1) {
+        var buf: [32]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "vendor/model-{d}", .{index});
+        const id = try alloc.dupe(u8, raw);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try many.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.persistCatalogCache(many.items, null);
+    var capped = runtime.readCatalogCache().?;
+    defer model_catalog.freeModelCatalog(alloc, &capped.entries);
+    try std.testing.expect(capped.source == null);
+    try std.testing.expectEqual(model_catalog.max_catalog_models, capped.entries.items.len);
+}
+
+test "model catalog cache round-trips tri-state image input claims distinctly" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "cache");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "cache");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, cache_file_name });
+    defer alloc.free(path);
+
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    try runtime.setCachePath(path);
+
+    const claims = [_]?bool{ true, false, null };
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    for (claims, [_][]const u8{ "vendor/sees", "vendor/text-only", "vendor/unknown" }) |claim, raw| {
+        const id = try alloc.dupe(u8, raw);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try entries.append(alloc, .{ .id = id, .model_type = model_type, .image_input_claim = claim });
+    }
+    runtime.persistCatalogCache(entries.items, .openrouter_api_key);
+
+    var cached = runtime.readCatalogCache().?;
+    defer model_catalog.freeModelCatalog(alloc, &cached.entries);
+    try std.testing.expectEqual(@as(usize, 3), cached.entries.items.len);
+    for (claims, cached.entries.items) |claim, entry| {
+        try std.testing.expectEqual(claim, entry.image_input_claim);
+    }
+
+    var legacy = try parseCatalogCache(alloc,
+        \\{"models":[{"id":"vendor/legacy","has_image_input":true},{"id":"vendor/old"}]}
+    );
+    defer model_catalog.freeModelCatalog(alloc, &legacy.entries);
+    try std.testing.expectEqual(@as(usize, 2), legacy.entries.items.len);
+    for (legacy.entries.items) |entry| {
+        try std.testing.expectEqual(@as(?bool, null), entry.image_input_claim);
+    }
+}
+
+test "model catalog cache loads when the network result is a failure" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "cache");
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "cache");
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, cache_file_name });
+    defer alloc.free(path);
+
+    var source = StaticCatalog{ .ids = &.{ "vendor/one", "vendor/two" } };
+    {
+        var writer_runtime = Runtime.init(alloc, "/v1/models");
+        defer writer_runtime.deinit();
+        try writer_runtime.setCachePath(path);
+        writer_runtime.loadCooperative(source.provider(), authenticatedCatalogAccess("test-key", "team_123"));
+        try std.testing.expectEqual(ModelCacheState.ready, writer_runtime.state);
+    }
+
+    var failing = StaticCatalog{ .fail = true };
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    try runtime.setCachePath(path);
+    runtime.loadCooperative(failing.provider(), authenticatedCatalogAccess("test-key", "team_123"));
+    try std.testing.expectEqual(ModelCacheState.failed, runtime.state);
+
+    try runtime.openMenu();
+    try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.items.items.len);
+    try std.testing.expectEqualStrings("vendor/one", runtime.menu.items.items[0].id);
+    try std.testing.expectEqualStrings("vendor/two", runtime.menu.items.items[1].id);
+
+    // Opening the menu kicked the background refresh; its failure keeps the
+    // cached items on screen with no failure flash.
+    try waitForWarmup(&runtime);
+    try std.testing.expectEqual(@as(usize, 2), failing.calls);
+    _ = try runtime.pollLoadTransition();
+    try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
+    try std.testing.expectEqual(@as(usize, 2), runtime.menu.items.items.len);
+    try std.testing.expect(runtime.menu.catalog_state.failure == null);
 }
 
 test "model cache request resolution records lookup misses for the trace report" {

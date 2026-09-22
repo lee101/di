@@ -234,7 +234,7 @@ const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";
 pub const vercel_gateway_extended_time_value = "true";
-/// Identifies fx on every AI Gateway request; the zig std.http default
+/// Identifies di on every AI Gateway request; the zig std.http default
 /// (`zig/<version> (std.http)`) is never sent to the gateway.
 pub const user_agent = "di/" ++ build_options.app_version;
 var resolved_model_trace_emitted = std.atomic.Value(bool).init(false);
@@ -9056,8 +9056,8 @@ test "gateway chat request sends extended time and attribution headers" {
 
     if (fixture.failure) |err| return err;
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
-    try std.testing.expectEqualStrings("https://github.com/vercel-labs/fx", fixture.capturedHeaderValue("http-referer").?);
-    try std.testing.expectEqualStrings("fx", fixture.capturedHeaderValue("x-title").?);
+    try std.testing.expectEqualStrings("https://github.com/lee101/di", fixture.capturedHeaderValue("http-referer").?);
+    try std.testing.expectEqualStrings("di", fixture.capturedHeaderValue("x-title").?);
     try std.testing.expectEqualStrings(
         vercel_gateway_extended_time_value,
         fixture.capturedHeaderValue(vercel_gateway_extended_time_header).?,

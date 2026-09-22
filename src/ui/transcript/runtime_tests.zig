@@ -15164,7 +15164,7 @@ test "active tool cancellation is presented immediately without closing lifecycl
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 2),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What can di do differently?"),
     );
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
@@ -15213,7 +15213,7 @@ test "late successful settlement preserves its result and one turn cancellation"
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What can di do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15270,7 +15270,7 @@ test "post-cancel sibling settlement preserves one turn cancellation" {
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What can di do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15319,7 +15319,7 @@ test "late zero-output command settlement reserves distinct presentation entries
         defer rendered.deinit(alloc);
         try std.testing.expectEqual(
             @as(usize, 1),
-            std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+            std.mem.count(u8, rendered.bytes, "What can di do differently?"),
         );
         try std.testing.expectEqual(
             @as(usize, 1),
@@ -15379,7 +15379,7 @@ fn checkLateZeroOutputCommandCancellationAllocationFailuresImpl(alloc: Allocator
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What can di do differently?"),
     );
 }
 

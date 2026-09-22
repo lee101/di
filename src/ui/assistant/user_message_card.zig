@@ -4,6 +4,8 @@ const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const types = @import("../../core/shared/types.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
+const image_renderer = @import("../images/image_renderer.zig");
+const kitty_graphics = @import("../images/kitty_graphics.zig");
 const visual_layout = @import("../input/visual_layout.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
@@ -23,6 +25,8 @@ var accent_style: []const u8 = shared_theme.fx_dark.user_card_accent_style;
 
 var marker_style: []const u8 = shared_theme.fx_dark.user_card_marker_style;
 
+var image_caps_override: ?image_renderer.Caps = null;
+
 pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
     applyTheme(shared_theme.builtin(light), terminal_bg);
 }
@@ -30,6 +34,7 @@ pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
 pub fn applyTheme(theme: shared_theme.Theme, _: ?Rgb) void {
     marker_style = theme.user_card_marker_style;
     accent_style = theme.user_card_accent_style;
+    image_renderer.setDimStyle(theme.dim_style);
 }
 
 pub fn promptMarkerStyle() []const u8 {
@@ -217,6 +222,38 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         text;
     defer if (skill_tokens.len > 0) alloc.free(token_text);
 
+    const image_caps = image_caps_override orelse image_renderer.detectCaps();
+    const image_plans = try alloc.alloc(image_renderer.Plan, images.len);
+    defer alloc.free(image_plans);
+    for (images, image_plans) |image, *plan| {
+        try build_checkpoint.tick(checkpoint);
+        const source = image_renderer.Source.fromAttachment(image_renderer.userKey(image.id), image);
+        plan.* = try image_renderer.admitImage(
+            alloc,
+            source,
+            &kitty_graphics.transcript_budget,
+            image_caps,
+        );
+    }
+
+    var hidden_text: ?[]u8 = null;
+    defer if (hidden_text) |value| alloc.free(value);
+    const badge_text: []const u8 = blk: {
+        for (image_plans) |plan| {
+            if (plan.mode == .kitty) {
+                const stripped = try stripHiddenImagePlaceholders(
+                    alloc,
+                    token_text,
+                    images,
+                    image_plans,
+                );
+                hidden_text = stripped;
+                break :blk stripped;
+            }
+        }
+        break :blk token_text;
+    };
+
     var expanded_buf: std.Io.Writer.Allocating = .init(alloc);
     defer expanded_buf.deinit();
     if (images.len > 0) {
@@ -224,7 +261,7 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
             try image_attachments.expandPlaceholdersWithLinkedBadges(
                 alloc,
                 &expanded_buf.writer,
-                token_text,
+                badge_text,
                 images,
                 null,
             )
@@ -232,12 +269,12 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
             try image_attachments.expandPlaceholdersWithBadges(
                 alloc,
                 &expanded_buf.writer,
-                token_text,
+                badge_text,
                 images,
                 null,
             );
     } else {
-        try expanded_buf.writer.writeAll(token_text);
+        try expanded_buf.writer.writeAll(badge_text);
     }
     const display_text = expanded_buf.written();
 
@@ -259,6 +296,25 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         checkpoint,
         max_rows,
     );
+
+    if (images.len > 0) {
+        const layout = image_renderer.Layout{ .max_columns = @intCast(window) };
+        for (images) |image| {
+            try build_checkpoint.tick(checkpoint);
+            const source = image_renderer.Source.fromAttachment(image_renderer.userKey(image.id), image);
+            var slot: std.Io.Writer.Allocating = .init(alloc);
+            defer slot.deinit();
+            _ = try image_renderer.render(
+                alloc,
+                &slot.writer,
+                source,
+                &kitty_graphics.transcript_budget,
+                layout,
+                image_caps,
+            );
+            try appendImageSlotRows(alloc, &rows, &row_buf, slot.written(), max_rows);
+        }
+    }
 
     for (rows.items) |content| {
         try emitRow(&out.writer, content);
@@ -314,6 +370,60 @@ fn appendVisibleRow(
         }
     }
     try appendRow(alloc, rows, content);
+}
+
+fn appendImageSlotRows(
+    alloc: std.mem.Allocator,
+    rows: *std.ArrayList([]const u8),
+    row_buf: *std.Io.Writer.Allocating,
+    slot_bytes: []const u8,
+    max_rows: ?usize,
+) !void {
+    var start: usize = 0;
+    while (start < slot_bytes.len) {
+        const newline = std.mem.indexOfScalarPos(u8, slot_bytes, start, '\n') orelse slot_bytes.len;
+        const content = slot_bytes[start..newline];
+        row_buf.clearRetainingCapacity();
+        try writeRowPrefix(&row_buf.writer);
+        try row_buf.writer.writeAll(content);
+        try appendVisibleRow(alloc, rows, row_buf.written(), max_rows);
+        start = if (newline < slot_bytes.len) newline + 1 else newline;
+    }
+}
+
+fn imageRendererTakesOver(
+    images: []const types.ImageAttachment,
+    plans: []const image_renderer.Plan,
+    id: usize,
+) bool {
+    for (images, plans) |image, plan| {
+        if (image.id == id) return plan.mode == .kitty;
+    }
+    return false;
+}
+
+fn stripHiddenImagePlaceholders(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    images: []const types.ImageAttachment,
+    plans: []const image_renderer.Plan,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '[') {
+            if (image_attachments.matchImagePlaceholder(text, index)) |match| {
+                if (imageRendererTakesOver(images, plans, match.id)) {
+                    index += match.length;
+                    continue;
+                }
+            }
+        }
+        try out.append(alloc, text[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 fn writeRowPrefix(writer: *std.Io.Writer) !void {
@@ -648,6 +758,8 @@ test "buildUserPromptCard terminates when a wide glyph exceeds window" {
 test "buildUserPromptCard handles image-only input" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const image = types.ImageAttachment{
         .id = 1,
@@ -668,6 +780,8 @@ test "buildUserPromptCard handles image-only input" {
 test "buildUserPromptCard handles image + text inline" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const image = types.ImageAttachment{
         .id = 1,
@@ -683,12 +797,15 @@ test "buildUserPromptCard handles image + text inline" {
     try std.testing.expect(std.mem.find(u8, card, "[Image 1]") != null);
     try std.testing.expect(std.mem.find(u8, card, "before ") != null);
     try std.testing.expect(std.mem.find(u8, card, " after") != null);
-    try std.testing.expectEqual(@as(usize, 1), countRows(card));
+    try std.testing.expect(std.mem.find(u8, card, "[Image: x.png image/png ") != null);
+    try std.testing.expectEqual(@as(usize, 2), countRows(card));
 }
 
 test "buildUserPromptCard wraps when badge + text overflows" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const image = types.ImageAttachment{
         .id = 1,
@@ -713,6 +830,8 @@ test "buildUserPromptCard wraps when badge + text overflows" {
 test "terminal image badges balance hyperlinks across narrow card rows" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
     const images = [_]types.ImageAttachment{.{
         .id = 1,
         .path = @constCast("/tmp/x.png"),
@@ -763,6 +882,8 @@ test "terminal image badges balance hyperlinks across narrow card rows" {
 test "buildUserPromptCard renders multiple inline placeholders" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const images = [_]types.ImageAttachment{
         .{ .id = 1, .path = @constCast("/tmp/a.png"), .media_type = @constCast("image/png") },
@@ -782,6 +903,8 @@ test "buildUserPromptCard renders multiple inline placeholders" {
 test "buildUserPromptCard labels each turn's image with its own id" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const first_images = [_]types.ImageAttachment{
         .{ .id = 1, .path = @constCast("/tmp/one.png"), .media_type = @constCast("image/png") },
@@ -805,6 +928,8 @@ test "buildUserPromptCard labels each turn's image with its own id" {
 test "buildUserPromptCard handles leading newline with image" {
     setStyle(false, null);
     const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    defer image_caps_override = null;
 
     const image = types.ImageAttachment{
         .id = 1,
@@ -839,4 +964,75 @@ test "pending terminal card keeps only the visible tail rows" {
     try std.testing.expect(std.mem.find(u8, card, "row2") == null);
     try std.testing.expect(std.mem.find(u8, card, "row3") != null);
     try std.testing.expect(std.mem.find(u8, card, "row4") != null);
+}
+
+fn testPngBytes(width: u32, height: u32, buf: *[24]u8) []const u8 {
+    @memset(buf, 0);
+    @memcpy(buf[0..8], kitty_graphics.png_magic);
+    std.mem.writeInt(u32, buf[16..20], width, .big);
+    std.mem.writeInt(u32, buf[20..24], height, .big);
+    return buf;
+}
+
+test "kitty image render hides badge and adds block after card content" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = true, .tmux = false };
+    kitty_graphics.transcript_budget.reset();
+    image_renderer.resetState();
+    defer {
+        image_caps_override = null;
+        kitty_graphics.transcript_budget.reset();
+        image_renderer.resetState();
+    }
+    image_renderer.setDimStyle("");
+
+    var png_buf: [24]u8 = undefined;
+    const png = testPngBytes(702, 18, &png_buf);
+    const images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/x.png"),
+        .media_type = @constCast("image/png"),
+        .inline_data = @constCast(png),
+    }};
+
+    const card = try buildUserPromptCard(alloc, "before [Image #1] after", &images, 80);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.find(u8, card, "[Image 1]") == null);
+    try std.testing.expect(std.mem.find(u8, card, "before") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b_Ga=t,f=100,q=2,i=1;") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b_Ga=p,q=2,i=1,p=1,c=78,r=1,C=1\x1b\\") != null);
+    try assertRowStructure(card);
+}
+
+test "fallback keeps badge and adds fallback line after card content" {
+    setStyle(false, null);
+    const alloc = std.testing.allocator;
+    image_caps_override = .{ .graphics = false, .tmux = false };
+    kitty_graphics.transcript_budget.reset();
+    image_renderer.resetState();
+    defer {
+        image_caps_override = null;
+        kitty_graphics.transcript_budget.reset();
+        image_renderer.resetState();
+    }
+    image_renderer.setDimStyle("");
+
+    var png_buf: [24]u8 = undefined;
+    const png = testPngBytes(300, 200, &png_buf);
+    const images = [_]types.ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/tmp/x.png"),
+        .media_type = @constCast("image/png"),
+        .inline_data = @constCast(png),
+    }};
+
+    const card = try buildUserPromptCard(alloc, "before [Image #1] after", &images, 80);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.find(u8, card, "[Image 1]") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b_G") == null);
+    try std.testing.expect(std.mem.find(u8, card, "[Image: x.png image/png 300x200]") != null);
+    try std.testing.expectEqual(@as(usize, 2), countRows(card));
 }

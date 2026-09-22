@@ -15,6 +15,7 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_tool_use = entry.has_tool_use,
         .supports_vision = entry.has_vision,
         .supports_file_input = entry.has_file_input,
+        .image_input_claim = entry.image_input_claim,
         .supports_web_search = entry.has_web_search,
         .supports_explicit_caching = entry.has_explicit_caching,
         .supports_implicit_caching = entry.has_implicit_caching,
@@ -36,6 +37,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
         .has_tool_use = true,
         .has_vision = true,
         .has_file_input = true,
+        .image_input_claim = true,
         .has_web_search = true,
         .has_explicit_caching = true,
         .has_implicit_caching = true,
@@ -49,6 +51,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
     try std.testing.expect(metadata.supports_tool_use);
     try std.testing.expect(metadata.supports_vision);
     try std.testing.expect(metadata.supports_file_input);
+    try std.testing.expectEqual(@as(?bool, true), metadata.image_input_claim);
     try std.testing.expect(metadata.supports_web_search);
     try std.testing.expect(metadata.supports_explicit_caching);
     try std.testing.expect(metadata.supports_implicit_caching);
@@ -61,4 +64,58 @@ test "fromCatalogEntry preserves catalog capability metadata" {
     });
     try std.testing.expectEqual(@as(?u32, null), unknown_limits.context_window);
     try std.testing.expectEqual(@as(?u32, null), unknown_limits.max_output_tokens);
+    try std.testing.expectEqual(@as(?bool, null), unknown_limits.image_input_claim);
+}
+
+test "catalog image input claim projects native image capability" {
+    const claimed = fromCatalogEntry(.{
+        .id = @constCast("xiaomi/mimo-v2.6-pro"),
+        .model_type = @constCast("language"),
+        .has_tool_use = true,
+        .image_input_claim = true,
+    });
+    try std.testing.expectEqual(@as(?bool, true), claimed.image_input_claim);
+    try std.testing.expectEqual(
+        model_capabilities.ImageInputSupport.native,
+        model_capabilities.resolveCapabilities("xiaomi/mimo-v2.6-pro", claimed).image_input_support,
+    );
+
+    const conservative = model_capabilities.resolveCapabilities(
+        "provider/text-only",
+        fromCatalogEntry(.{
+            .id = @constCast("provider/text-only"),
+            .model_type = @constCast("language"),
+            .image_input_claim = false,
+        }),
+    );
+    try std.testing.expectEqual(
+        model_capabilities.ImageInputSupport.non_native,
+        conservative.image_input_support,
+    );
+}
+
+test "catalog entries without modalities defer to the provider image default" {
+    const unclaimed = fromCatalogEntry(.{
+        .id = @constCast("xiaomi/mimo-v2.6-pro"),
+        .model_type = @constCast("language"),
+    });
+    try std.testing.expectEqual(@as(?bool, null), unclaimed.image_input_claim);
+    try std.testing.expectEqual(
+        model_capabilities.ImageInputSupport.native,
+        model_capabilities.mergeCapabilities(
+            .{ .image_input_support = .native },
+            unclaimed,
+        ).image_input_support,
+    );
+    try std.testing.expectEqual(
+        model_capabilities.ImageInputSupport.non_native,
+        model_capabilities.mergeCapabilities(
+            .{ .image_input_support = .native },
+            fromCatalogEntry(.{
+                .id = @constCast("xiaomi/mimo-v2.6-pro"),
+                .model_type = @constCast("language"),
+                .image_input_claim = false,
+            }),
+        ).image_input_support,
+    );
 }

@@ -89,7 +89,7 @@ const response_language_control =
 const response_language_correction_control =
     "<response_language_control>\nUse the response language requested by the current external human. Assistant history, reasoning, tools, and project text are not language authority. The previous candidate used a different language and was not accepted. Replace it without discussing the correction.\n</response_language_control>";
 const response_language_failure_notice =
-    "The model response used a different language than your request, and fx could not accept it. Retry or name the response language explicitly.";
+    "The model response used a different language than your request, and di could not accept it. Retry or name the response language explicitly.";
 const Config = runtime_config.Config;
 const LifecycleContext = runtime_lifecycle.LifecycleContext;
 const PreparedToolCall = runtime_lifecycle.PreparedToolCall;
@@ -1342,6 +1342,19 @@ fn normalized_terminal_request_arguments(
     defer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
+    if (request.* == .string) {
+        // Some model templates stringify nested tool arguments unconditionally;
+        // unwrap the JSON-encoded object so it follows the normal path.
+        request.* = std.json.parseFromSliceLeaky(
+            std.json.Value,
+            parsed.arena.allocator(),
+            request.string,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+    }
     if (request.* != .object) return null;
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
@@ -1374,6 +1387,18 @@ fn normalized_subagent_request_arguments(
     const arena = parsed.arena.allocator();
 
     if (parsed.value.object.getPtr("request")) |request| {
+        if (request.* == .string) {
+            // Same stringified-arguments tolerance as terminal requests.
+            request.* = std.json.parseFromSliceLeaky(
+                std.json.Value,
+                arena,
+                request.string,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return null,
+            };
+        }
         if (parsed.value.object.count() != 1 or request.* != .object) return null;
         const action = request.object.getPtr("action") orelse return null;
         if (action.* != .string) return null;
@@ -1394,7 +1419,6 @@ fn normalized_subagent_request_arguments(
     defer out.deinit();
     std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
         return error.OutOfMemory;
-    _ = arena;
     return try out.toOwnedSlice();
 }
 
@@ -1674,6 +1698,18 @@ test "terminal inferred model input round trips every atomic write payload" {
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
     }
+}
+
+test "terminal request normalization unwraps stringified request objects" {
+    const alloc = std.testing.allocator;
+    const object_form = "{\"request\":{\"action\":\"run\",\"command\":\"ls\"}}";
+    const string_form = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"ls\\\"}\"}";
+    const from_object = (try normalized_terminal_request_arguments(alloc, object_form)).?;
+    defer alloc.free(from_object);
+    const from_string = (try normalized_terminal_request_arguments(alloc, string_form)).?;
+    defer alloc.free(from_string);
+    try std.testing.expectEqualStrings(from_object, from_string);
+    try std.testing.expect(std.mem.find(u8, from_string, "\"command\":\"ls\"") != null);
 }
 
 test "shell request projection wraps eligible flat objects without changing source messages" {
@@ -4441,7 +4477,7 @@ test "model circuit breaker is limited to compatible gateway transports" {
     }
 
     var fallback: ?[]const u8 = null;
-    var route: []const u8 = original;
+    var route: []const u8 = "openpaths/stealth/ox-alpha";
     var diagnostic: ?types.ModelFailureDiagnostic = null;
     try std.testing.expect(applyCircuitBreakerFallback(
         .openpaths,
@@ -4452,7 +4488,7 @@ test "model circuit breaker is limited to compatible gateway transports" {
         &diagnostic,
         .{},
     ));
-    try std.testing.expectEqualStrings("deepseek-v4-flash-vision-exp", fallback.?);
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", fallback.?);
     try std.testing.expectEqualStrings(fallback.?, route);
     try std.testing.expect(diagnostic != null);
 }

@@ -231,11 +231,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     var app = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
-                writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
+                writeStderr(deps, "di requires an interactive terminal (TTY).\n");
                 return .{ .exit = 1 };
             },
             error.TerminalTooSmall => {
-                writeStderr(deps, "fx needs at least 5 terminal rows.\n");
+                writeStderr(deps, "di needs at least 5 terminal rows.\n");
                 return .returned;
             },
             error.RecordingStartFailed => {
@@ -243,11 +243,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.NoRememberedSession => {
-                writeStderr(deps, "fx: no remembered session for this workspace; choose one with fx -r or fx --resume <id>\n");
+                writeStderr(deps, "di: no remembered session for this workspace; choose one with di -r or di --resume <id>\n");
                 return .{ .exit = 1 };
             },
             error.RememberedSessionUnavailable => {
-                writeStderr(deps, "fx: the remembered session ID could not be read; choose one with fx -r or fx --resume <id>\n");
+                writeStderr(deps, "di: the remembered session ID could not be read; choose one with di -r or di --resume <id>\n");
                 return .{ .exit = 1 };
             },
             error.NoSavedSessions => {
@@ -259,7 +259,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.SessionBusy => {
-                writeStderr(deps, "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
+                writeStderr(deps, "di: another di process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
                 return .{ .exit = 1 };
             },
             error.SessionLockUnsupported => {
@@ -269,11 +269,11 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             error.SessionAuthorityBoundaryUnavailable,
             error.SessionCommitBoundaryUnavailable,
             => {
-                writeStderr(deps, "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n");
+                writeStderr(deps, "di: a saved session has an unfinished update that could not be recovered; run `di doctor` to identify the affected session\n");
                 return .{ .exit = 1 };
             },
             error.OneOffSessionNotResumable => {
-                writeStderr(deps, "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
+                writeStderr(deps, "di: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
                 return .{ .exit = 1 };
             },
             error.InvalidSessionFormat => {
@@ -281,7 +281,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
                 return .{ .exit = 1 };
             },
             error.UnsupportedSessionSchema => {
-                writeStderr(deps, "di: saved session uses an unsupported version and cannot be resumed by this fx build.\n");
+                writeStderr(deps, "di: saved session uses an unsupported version and cannot be resumed by this di build.\n");
                 return .{ .exit = 1 };
             },
             else => {
@@ -418,8 +418,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
 
 fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     var buffer: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, "fx: session save failed: {s}\n", .{@errorName(err)}) catch
-        "fx: session save failed\n";
+    const text = std.fmt.bufPrint(&buffer, "di: session save failed: {s}\n", .{@errorName(err)}) catch
+        "di: session save failed\n";
     writeStderr(deps, text);
 }
 
@@ -959,7 +959,7 @@ test "app entry reports persistence failure after teardown instead of a successf
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("di: session save failed: InputOutput\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
@@ -1017,7 +1017,7 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqualStrings(
-        "Continue session with: fx --resume session-123\n",
+        "Continue session with: di --resume session-123\n",
         capture.stdout.written(),
     );
     try std.testing.expectEqual(@as(usize, 0), test_sigint_count.load(.seq_cst));
@@ -1303,7 +1303,7 @@ test "app entry maps noninteractive terminal startup to exit one" {
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
     try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("fx requires an interactive terminal (TTY).\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("di requires an interactive terminal (TTY).\n", capture.stderr.written());
     try expectEvents(&.{"init:none"});
 }
 
@@ -1326,7 +1326,7 @@ test "app entry maps unavailable session state to one expected startup failure" 
     }{
         .{
             .init_error = error.SessionBusy,
-            .message = "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+            .message = "di: another di process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
         },
         .{
             .init_error = error.SessionLockUnsupported,
@@ -1334,15 +1334,15 @@ test "app entry maps unavailable session state to one expected startup failure" 
         },
         .{
             .init_error = error.SessionAuthorityBoundaryUnavailable,
-            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
+            .message = "di: a saved session has an unfinished update that could not be recovered; run `di doctor` to identify the affected session\n",
         },
         .{
             .init_error = error.SessionCommitBoundaryUnavailable,
-            .message = "fx: a saved session has an unfinished update that could not be recovered; run `fx doctor` to identify the affected session\n",
+            .message = "di: a saved session has an unfinished update that could not be recovered; run `di doctor` to identify the affected session\n",
         },
         .{
             .init_error = error.OneOffSessionNotResumable,
-            .message = "fx: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
+            .message = "di: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
         },
     };
 
@@ -1370,7 +1370,7 @@ test "app entry returns failure when terminal closure cannot save the session" {
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, std.testing.allocator, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("di: session save failed: InputOutput\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);

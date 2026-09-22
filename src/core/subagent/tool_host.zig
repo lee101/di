@@ -955,9 +955,10 @@ pub const Runtime = struct {
         result: model_contract.Result,
     ) !ManagedExecutionResult {
         _ = self;
+        const body = try model_contract.encodeResultAlloc(alloc, result);
         return .{
             .success = result.ok,
-            .body = try model_contract.encodeResultAlloc(alloc, result),
+            .body = body,
         };
     }
 
@@ -1079,7 +1080,8 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
     runtime.acknowledgeYielded("other", "work");
     try std.testing.expect(runtime.hasYieldedChild("child"));
-    runtime.yielded.items[0].result = .{ .success = true, .body = try alloc.dupe(u8, "saved result") };
+    const saved_body = try alloc.dupe(u8, "saved result");
+    runtime.yielded.items[0].result = .{ .success = true, .body = saved_body };
     runtime.acknowledgeYielded("child", "work");
     try std.testing.expect(!runtime.hasYieldedChild("child"));
     try std.testing.expect(!runtime.hasPendingYielded());

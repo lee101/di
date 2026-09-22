@@ -872,12 +872,30 @@ pub fn Runtime(comptime App: type) type {
                 items.git_branch = identity.git_branch;
             }
             if (app.statusline_context) {
-                items.context_used = app.total_input_tokens;
+                var context_used = app.total_input_tokens;
+                if (comptime @hasField(App, "session")) {
+                    if (comptime @hasDecl(@TypeOf(app.session.usage), "liveContextSnapshot")) {
+                        if (app.session.usage.liveContextSnapshot()) |live| {
+                            context_used = live.used;
+                        }
+                    }
+                }
+                items.context_used = context_used;
                 items.context_total = model_capabilities.resolveForApp(App, app, visible_model).context_window;
             }
             if (comptime @hasField(App, "statusline_session")) {
                 if (app.statusline_session) {
                     items.session_title = app_session_runtime.Runtime(App).cachedSessionTitle(app);
+                }
+            }
+            if (comptime @hasField(App, "session")) {
+                if (comptime @hasField(@TypeOf(app.session), "usage")) {
+                    if (comptime @hasDecl(@TypeOf(app.session.usage), "sessionTotals")) {
+                        const totals = app.session.usage.sessionTotals();
+                        items.total_input_tokens = totals.input_tokens;
+                        items.total_output_tokens = totals.output_tokens;
+                        items.total_cost = totals.total_cost;
+                    }
                 }
             }
             return items;

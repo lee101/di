@@ -1450,7 +1450,7 @@ pub const StatusSnapshot = struct {
         if (self.active_source != null) return null;
         if (self.stored_key_status == .unavailable) {
             if (self.required_source == .stored_key) return switch (surface) {
-                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Start di and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "The selected stored API key could not be read from " ++ credentials.stored_key_backend_label ++ ". Run /provider to choose an available credential; no other credential was selected.",
             };
             return credentials.unreadable_store_message;
@@ -1464,23 +1464,23 @@ pub const StatusSnapshot = struct {
         };
         const required_source = self.required_source orelse return automatic_help;
         return switch (required_source) {
-            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
-            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
-            .openpaths_api_key => "OPENPATHS_API_KEY is selected but unavailable. Set OPENPATHS_API_KEY before starting fx; no other credential was selected.",
-            .openrouter_api_key => "OPENROUTER_API_KEY is selected but unavailable. Set OPENROUTER_API_KEY before starting fx; no other credential was selected.",
+            .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting di; no other credential was selected.",
+            .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting di; no other credential was selected.",
+            .openpaths_api_key => "OPENPATHS_API_KEY is selected but unavailable. Set OPENPATHS_API_KEY before starting di; no other credential was selected.",
+            .openrouter_api_key => "OPENROUTER_API_KEY is selected but unavailable. Set OPENROUTER_API_KEY before starting di; no other credential was selected.",
             .stored_key => switch (surface) {
-                .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
+                .cli => "A stored API key is selected but unavailable. Start di and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
             },
             .fx_login => switch (surface) {
                 .cli => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run fx login to repair this source; no other credential was selected."
+                    "The saved di login could not be loaded. Run di login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected.",
+                    "di login is selected but unavailable. Run di login to reconnect; no other credential was selected.",
                 .interactive => if (self.fx_login_status == .unavailable)
-                    "The saved fx login could not be loaded. Run /login to repair this source; no other credential was selected."
+                    "The saved di login could not be loaded. Run /login to repair this source; no other credential was selected."
                 else
-                    "fx login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
+                    "di login is selected but unavailable. Run /login to reconnect; no other credential was selected.",
             },
             .chatgpt_subscription => switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
@@ -3793,9 +3793,9 @@ test "auth status names each explicit key source and its recovery" {
         cli_recovery: []const u8,
         interactive_recovery: []const u8,
     }{
-        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting fx", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting fx" },
-        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting fx", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting fx" },
-        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start fx and open /provider", .interactive_recovery = "Run /provider" },
+        .{ .source = .vercel_oidc_token, .label = "VERCEL_OIDC_TOKEN", .cli_recovery = "Set VERCEL_OIDC_TOKEN before starting di", .interactive_recovery = "Set VERCEL_OIDC_TOKEN before starting di" },
+        .{ .source = .ai_gateway_api_key, .label = "AI_GATEWAY_API_KEY", .cli_recovery = "Set AI_GATEWAY_API_KEY before starting di", .interactive_recovery = "Set AI_GATEWAY_API_KEY before starting di" },
+        .{ .source = .stored_key, .label = "stored API key", .cli_recovery = "Start di and open /provider", .interactive_recovery = "Run /provider" },
     };
     for (cases) |case| {
         const status = StatusSnapshot{ .required_source = case.source };
@@ -3835,7 +3835,7 @@ test "auth status keeps an unavailable explicit fx login distinct from automatic
             .fx_login_status = read_status,
         };
         const help = status.missingHelp(.cli).?;
-        try std.testing.expect(std.mem.find(u8, help, "Run fx login") != null);
+        try std.testing.expect(std.mem.find(u8, help, "Run di login") != null);
         try std.testing.expect(std.mem.find(u8, help, "no other credential was selected") != null);
         const interactive = status.missingHelp(.interactive).?;
         try std.testing.expect(std.mem.find(u8, interactive, "Run /login") != null);

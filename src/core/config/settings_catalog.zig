@@ -52,9 +52,9 @@ pub const Snapshot = struct {
     fast_mode: bool = false,
     supports_fast_mode: bool = false,
     permission_mode: []const u8 = "ask",
-    statusline_context: bool = false,
-    statusline_session: bool = false,
-    statusline_workspace: bool = false,
+    statusline_context: bool = true,
+    statusline_session: bool = true,
+    statusline_workspace: bool = true,
     slash_menu_categories: bool = true,
     collapse_tool_calls: bool = false,
     session_titles: bool = true,
@@ -557,6 +557,8 @@ test "status line menu describes toggle changes without performing effects" {
 
     const enabled: Snapshot = .{
         .statusline_context = true,
+        .statusline_session = false,
+        .statusline_workspace = false,
     };
     try std.testing.expectEqualStrings("off", menu.selectedChange(enabled).?.value);
 

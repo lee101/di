@@ -377,6 +377,8 @@ pub const Usage = struct {
     billable_web_search_calls: u64 = 0,
     latest_context_sequence: u64 = 0,
     latest_context_used: ?u64 = null,
+    reported_input_tokens: u64 = 0,
+    reported_output_tokens: u64 = 0,
     lines_added: u64 = 0,
     lines_removed: u64 = 0,
     models: std.ArrayList(ModelAggregate) = .empty,
@@ -1579,6 +1581,22 @@ pub const Usage = struct {
         };
     }
 
+    pub const SessionTotals = struct {
+        input_tokens: u64,
+        output_tokens: u64,
+        total_cost: f64,
+    };
+
+    pub fn sessionTotals(self: *Usage) SessionTotals {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .input_tokens = self.reported_input_tokens,
+            .output_tokens = self.reported_output_tokens,
+            .total_cost = self.total_cost,
+        };
+    }
+
     fn observeContextUsage(self: *Usage, sequence: u64, provider_usage: types.Usage) void {
         const used: ?u64 = if (provider_usage.input_tokens) |input|
             if (provider_usage.output_tokens) |output|
@@ -1589,6 +1607,8 @@ pub const Usage = struct {
             null;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        if (provider_usage.input_tokens) |input| self.reported_input_tokens +|= input;
+        if (provider_usage.output_tokens) |output| self.reported_output_tokens +|= output;
         if (sequence < self.latest_context_sequence) return;
         self.latest_context_sequence = sequence;
         self.latest_context_used = used;

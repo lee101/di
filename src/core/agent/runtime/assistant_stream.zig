@@ -982,6 +982,7 @@ const StreamTraceEntry = union(enum) {
 
 const ansi_span_fixture_env = "FX_TEST_C04_STREAM_ANSI_OSC8_FIXTURE";
 const ansi_span_test_name = "streamed presentation preserves ANSI OSC 8 code fence and table spans";
+const ansi_span_run_marker = ansi_span_test_name ++ "...";
 
 fn ansi_span_fixture_enabled() bool {
     const value = std.process.Environ.getAlloc(
@@ -1427,21 +1428,42 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
-    const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
-        .cwd = .{ .path = cwd },
-        .environ_map = &environ,
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
 
-    switch (result.term) {
-        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => return error.TestExpectedEqual,
+    const exe_override: ?[]u8 = if (std.process.Environ.getAlloc(std.testing.environ, alloc, "ZIG_EXE")) |exe| exe else |_| null;
+    defer if (exe_override) |exe| alloc.free(exe);
+    const home_zig: ?[]u8 = blk: {
+        const home = std.process.Environ.getAlloc(std.testing.environ, alloc, "HOME") catch break :blk null;
+        defer alloc.free(home);
+        break :blk try std.fmt.allocPrint(alloc, "{s}/.zvm/bin/zig", .{home});
+    };
+    defer if (home_zig) |exe| alloc.free(exe);
+
+    for ([3]?[]const u8{ exe_override, "zig", home_zig }) |toolchain| {
+        const exe = toolchain orelse continue;
+        const result = std.process.run(alloc, std.testing.io, .{
+            .argv = &.{ exe, "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
+            .cwd = .{ .path = cwd },
+            .environ_map = &environ,
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer alloc.free(result.stdout);
+        defer alloc.free(result.stderr);
+        if (std.mem.find(u8, result.stderr, ansi_span_run_marker) == null) continue;
+        switch (result.term) {
+            .exited => |code| {
+                if (code != 0) std.debug.print("ansi span fixture stderr:\n{s}", .{result.stderr});
+                try std.testing.expectEqual(@as(u8, 0), code);
+            },
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expect(std.mem.find(u8, result.stderr, ansi_span_test_name) != null);
+        return;
     }
-    try std.testing.expect(std.mem.find(u8, result.stderr, ansi_span_test_name) != null);
+    return error.TestExpectedEqual;
 }
 
 test "streamed footnotes retain raw source and flush before a tool" {

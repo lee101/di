@@ -103,7 +103,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Repair profile settings and restart fx before sending a message.",
+                        .body = "Repair profile settings and restart di before sending a message.",
                     });
                     return false;
                 }
@@ -535,7 +535,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "Signed out of fx.",
+                    .body = "Signed out of di.",
                 }
             else
                 .{
@@ -1233,7 +1233,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run di login codex, then try switching again." else if (target == .grok) "Run di login grok, then try switching again." else credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -3424,7 +3424,7 @@ test "logout result reconciles live auth and renders only sanitized notices" {
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of fx.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Signed out of di.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     for ([_][]const u8{ "access-secret", "refresh-secret", "RemoteRevokeFailed", "https://issuer.example" }) |detail| {
         try std.testing.expect(std.mem.find(u8, app.transcript.items, detail) == null);

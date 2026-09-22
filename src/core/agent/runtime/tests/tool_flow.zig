@@ -5326,7 +5326,8 @@ test "processQueuedPrompt caps chatty grep_files model output" {
     try runFakePrompt(&gateway, &hooks, config, fixture.job());
 
     try expectBodyContains(&gateway, 1, "tool result truncated for grep_files");
-    try expectBodyContains(&gateway, 1, "original 2054 bytes; cap is 1024 bytes");
+    try expectBodyContains(&gateway, 1, "total 2054 bytes");
+    try expectBodyContains(&gateway, 1, "cap is 1024 bytes");
 }
 
 test "processQueuedPrompt caps chatty terminal exec result with explicit marker" {

@@ -103,7 +103,7 @@ pub const NameKey = struct {
 
 /// Default model served when the OpenPaths provider is active and the user has
 /// not chosen one. Verified against the OpenPaths catalog.
-pub const openpaths_default_model = "openpaths/stealth/ox-alpha";
+pub const openpaths_default_model = "xiaomi/mimo-v2.6-pro";
 
 pub const ProviderSelection = struct {
     provider: ProviderId,
@@ -212,6 +212,10 @@ fn hasNonEmptyEnv(name: []const u8) bool {
     const value = io_mod.getenv(name) orelse return false;
     return std.mem.trim(u8, value, " \t\r\n").len != 0;
 }
+test "openpaths default model is the MiMo pro id" {
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpaths_default_model);
+}
+
 test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.gateway, .ai_gateway_api_key));
     try std.testing.expect(authorizesCredential(.gateway, .fx_login));

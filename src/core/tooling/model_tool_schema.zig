@@ -168,7 +168,7 @@ pub fn writeObjectSchema(
         {
             return error.InvalidObjectSchema;
         }
-        try writer.writeAll("{\"oneOf\":[");
+        try writer.writeAll("{\"type\":\"object\",\"oneOf\":[");
         for (schema.one_of, 0..) |alternative, index| {
             if (index > 0) try writer.writeByte(',');
             try writeObjectSchema(alloc, writer, alternative);
@@ -395,7 +395,7 @@ test "object alternatives serialize as exclusive object branches" {
     defer parsed.deinit();
 
     const input_schema = parsed.value.object.get("inputSchema").?.object;
-    try std.testing.expect(input_schema.get("type") == null);
+    try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
     try std.testing.expect(input_schema.get("properties") == null);
     const one_of = input_schema.get("oneOf").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), one_of.len);

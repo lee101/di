@@ -271,7 +271,7 @@ pub fn projectToolImageMessages(
             "[Tool images were retained but not sent: this model receives image input through the vision tool, not inline. Call vision with the image file's local path to inspect it.]\n"
         else
             "[Tool images were retained but not sent: this model does not accept inline images and no vision fallback is available. Ask the user to attach the image directly or switch to a vision-capable model.]\n",
-        .unknown => "[Tool images were retained but not sent: fx could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
+        .unknown => "[Tool images were retained but not sent: di could not confirm image input support for this model (the model is not listed in the model catalog, or the catalog is unavailable). This can recover later in the session, so a retry may succeed; otherwise ask the user to attach the image directly.]\n",
     };
     const projected = try alloc.dupe(types.ChatMessage, messages);
     for (projected) |*message| {

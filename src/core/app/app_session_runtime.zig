@@ -269,7 +269,7 @@ const ResumeNotice = union(enum) {
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
-    try writer.writeAll("fx has been updated to ");
+    try writer.writeAll("di has been updated to ");
     if (upgrade.channel == .dev and update_target.isValidRevision(upgrade.revision)) {
         try writer.print("dev {s} (v{s})", .{
             upgrade.revision[0..@min(upgrade.revision.len, 12)],
@@ -2868,7 +2868,7 @@ pub fn Runtime(comptime App: type) type {
                 if (comptime @hasDecl(App, "writeDomainNotice")) {
                     const body = try std.fmt.allocPrint(
                         app.alloc,
-                        "Turn completed, but fx could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                        "Turn completed, but di could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
                         .{@errorName(err)},
                     );
                     defer app.alloc.free(body);
@@ -3020,11 +3020,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
-            const prefix = "fx v" ++ build_options.app_version ++ " | ";
+            const prefix = "di v" ++ build_options.app_version ++ " | ";
             var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
-                provider.set("fx v" ++ build_options.app_version);
+                provider.set("di v" ++ build_options.app_version);
                 return;
             };
             provider.set(label);
@@ -5392,7 +5392,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
             const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
+            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with di --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
             defer alloc.free(body);
             const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
             if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {
@@ -8010,7 +8010,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "",
             },
-            .expected = "fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "di has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -8019,7 +8019,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "1111111111111111111111111111111111111111",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "di has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/lee101/di/compare/1111111111111111111111111111111111111111...abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
         .{
             .upgrade = .{
@@ -8028,7 +8028,7 @@ test "upgrade notice body identifies stable notes and dev changes" {
                 .previous_revision = "",
                 .revision = "abcdef0123456789abcdef0123456789abcdef01",
             },
-            .expected = "fx has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/vercel-labs/fx/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
+            .expected = "di has been updated to dev abcdef012345 (v9.9.9) (\x1b]8;;https://github.com/lee101/di/commit/abcdef0123456789abcdef0123456789abcdef01\x1b\\\x1b[4mchanges\x1b[24m\x1b]8;;\x1b\\)",
         },
     };
 
@@ -8397,7 +8397,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expectEqualStrings("run server", context[2].assistant.user.text);
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expectEqualStrings(
-        "✓ fx has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
+        "✓ di has been updated to v9.9.9 (\x1b]8;;https://fx.sh/changelog#v9.9.9\x1b\\\x1b[4mnotes\x1b[24m\x1b]8;;\x1b\\)",
         app.notices.items[0],
     );
     try std.testing.expectEqual(@as(usize, 2), app.completed_tool_statuses.items.len);
@@ -11707,11 +11707,11 @@ test "terminal title shows the session title once cached and falls back to build
 
     try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("di v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.selected_model.appendSlice(alloc, "zai/glm-5.2");
     Runtime(TestApp).syncTerminalTitle(&app);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("di v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 
     try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
         .user = .{ .text = @constCast("wire the release notes generator") },
@@ -11732,7 +11732,7 @@ test "terminal title shows the session title once cached and falls back to build
 
     Runtime(TestApp).clearCachedSessionTitle(&app);
     try std.testing.expect(Runtime(TestApp).cachedSessionTitle(&app) == null);
-    try std.testing.expectEqualStrings("fx v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
+    try std.testing.expectEqualStrings("di v" ++ build_options.app_version ++ " | workspace", app.terminalTitleLabelText());
 }
 
 test "cached session title drops control bytes before they reach the terminal" {
@@ -11770,7 +11770,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.fmt.bufPrint(&expected_buffer, "di v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }

@@ -817,9 +817,9 @@ fn writeProviderLoginFailure(alloc: Allocator, deps: RunDeps, provider: model_pr
         return;
     }
     try writeProviderActivationError(alloc, deps, caller, switch (err) {
-        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the fx Vercel App client id first",
+        error.ClientIdMissing => "missing FX_OAUTH_CLIENT_ID; configure the di Vercel App client id first",
         error.AccessDenied, error.ChatGptAuthorizationFailed, error.GrokAuthorizationFailed => "authorization denied",
-        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run fx login again",
+        error.ExpiredToken, error.LoginTimedOut, error.ChatGptLoginTimedOut, error.GrokLoginTimedOut => "authorization expired; run di login again",
         else => "failed to sign in",
     });
 }
@@ -1023,7 +1023,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("di: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
+        try writer.writer.writeAll("usage: di [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -1215,7 +1215,7 @@ fn runNonInteractiveWithDeps(
             }
             const result = login_flow.logout(alloc, cfg.gateway_provider.oauth_transport) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
-                    try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                    try writeStderr(deps, "di logout: failed to durably remove saved di login\n");
                     return .handled_failure;
                 },
             };
@@ -1233,13 +1233,13 @@ fn runNonInteractiveWithDeps(
                             "logout credential preference clear failed err={s}",
                             .{@errorName(failure.err)},
                         );
-                        try writeStderr(deps, "fx logout: signed out, but failed to clear the saved fx login selection\n");
+                        try writeStderr(deps, "di logout: signed out, but failed to clear the saved di login selection\n");
                         return .handled_failure;
                     },
                 }
             }
             if (result.local_durability_failed) {
-                try writeStderr(deps, "fx logout: failed to durably remove saved fx login\n");
+                try writeStderr(deps, "di logout: failed to durably remove saved di login\n");
             } else {
                 try writeStdout(
                     deps,
@@ -1271,13 +1271,13 @@ fn runNonInteractiveWithDeps(
                 },
             ) catch |err| {
                 const message = switch (err) {
-                    error.NoSession => "fx teams: run fx login first\n",
-                    error.SessionChanged => "fx teams: authentication changed; try again\n",
-                    error.TeamRequestFailed => "fx teams: failed to list Vercel teams\n",
-                    error.InvalidTeamSelection => "fx teams: no team selected\n",
-                    error.AccessDenied => "fx teams: authorization denied\n",
-                    error.TeamValidationFailed => "fx teams: selected team could not access AI Gateway\n",
-                    else => "fx teams: failed to switch team\n",
+                    error.NoSession => "di teams: run di login first\n",
+                    error.SessionChanged => "di teams: authentication changed; try again\n",
+                    error.TeamRequestFailed => "di teams: failed to list Vercel teams\n",
+                    error.InvalidTeamSelection => "di teams: no team selected\n",
+                    error.AccessDenied => "di teams: authorization denied\n",
+                    error.TeamValidationFailed => "di teams: selected team could not access AI Gateway\n",
+                    else => "di teams: failed to switch team\n",
                 };
                 try writeStderr(deps, message);
                 return .handled_failure;
@@ -1294,11 +1294,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <name>\n");
+                try writeStderr(deps, "usage: di provider <name>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected openpaths, gateway, codex, grok, or a configured name\n");
+                try writeStderr(deps, "di provider: expected openpaths, gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
@@ -1440,11 +1440,11 @@ fn runNonInteractiveWithDeps(
             available_providers.definitions = startup.configured_providers.definitions;
             const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
                 try writeStderr(deps, switch (startup.provider) {
-                    .openpaths => "fx models: OpenPaths model catalog is unavailable\n",
-                    .gateway => "fx models: Gateway model catalog is unavailable\n",
-                    .codex => "fx models: Codex model catalog is unavailable\n",
-                    .grok => "fx models: Grok model catalog is unavailable\n",
-                    .configured => "fx models: Configured model catalog is unavailable\n",
+                    .openpaths => "di models: OpenPaths model catalog is unavailable\n",
+                    .gateway => "di models: Gateway model catalog is unavailable\n",
+                    .codex => "di models: Codex model catalog is unavailable\n",
+                    .grok => "di models: Grok model catalog is unavailable\n",
+                    .configured => "di models: Configured model catalog is unavailable\n",
                 });
                 return .handled_failure;
             };
@@ -2041,7 +2041,7 @@ fn runPasteSetup(
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
     const stored_interactively = secret_store.storeInteractive() catch {
-        try writeStderr(deps, "\nfx setup: API key was not saved\n");
+        try writeStderr(deps, "\ndi setup: API key was not saved\n");
         return false;
     };
     if (!stored_interactively) {
@@ -2051,7 +2051,7 @@ fn runPasteSetup(
             deps.write_stderr,
             deps.stderr_ctx,
         ) catch {
-            try writeStderr(deps, "\nfx setup: API key was not saved\n");
+            try writeStderr(deps, "\ndi setup: API key was not saved\n");
             return false;
         };
         defer secret.zeroAndFree(alloc, key);
@@ -2523,7 +2523,7 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "auth")) {
         if (rest.len != 2 or rest[1].len == 0) {
-            try writeStderr(deps, "usage: fx " ++ command_specs.mcp_auth_usage ++ "\n");
+            try writeStderr(deps, "usage: di " ++ command_specs.mcp_auth_usage ++ "\n");
             return .handled_failure;
         }
         var loaded = loadMcpCommandRuntime(alloc, cfg, deps) catch |err| {
@@ -2725,7 +2725,7 @@ fn writeMcpProfileMutationSuccess(
 fn writeMcpAddUsage(deps: RunDeps) !void {
     return writeStderr(
         deps,
-        "usage: fx mcp add NAME COMMAND [ARGS...] | fx mcp add --transport http NAME URL\n",
+        "usage: di mcp add NAME COMMAND [ARGS...] | di mcp add --transport http NAME URL\n",
     );
 }
 
@@ -2738,7 +2738,7 @@ fn writeMcpOperationFailure(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx mcp {s} failed: {s}.\n",
+        "di mcp {s} failed: {s}.\n",
         .{ operation, @errorName(err) },
     );
     try writeStderr(deps, out.written());
@@ -2765,7 +2765,7 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
+        "di: ~/.fx/mcp.json warning: {s}",
         .{@tagName(warning.cause)},
     );
     if (warning.key()) |key| {
@@ -3396,7 +3396,7 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
 fn writeModelModifierUsage(deps: RunDeps) !void {
     try writeStderr(
         deps,
-        "fx: --provider, --model, --effort, --fast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
+        "di: --provider, --model, --effort, --fast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `di ask`\n",
     );
 }
 
@@ -5523,7 +5523,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"di needs access to Vercel AI Gateway. Run di login to sign in, di setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5612,7 +5612,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"di needs access to Vercel AI Gateway. Run di login to sign in, di setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42}\n",
         capture.stdout.written(),
     );
 }

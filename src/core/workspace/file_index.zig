@@ -2539,6 +2539,17 @@ test "persisted file index paints a stale preview and the real scan replaces it"
         var file = try work_dir.createFile(zio, name, .{ .truncate = true });
         file.close(zio);
     }
+    for (0..256) |index| {
+        var path_storage: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&path_storage, "z-{d:0>3}.txt", .{index});
+        var file = try work_dir.createFile(zio, name, .{ .truncate = true });
+        file.close(zio);
+    }
+
+    // Give the fixture tree its own git identity: stray machine metadata
+    // (for example a leftover /tmp/.git) would otherwise be discovered as the
+    // authoritative worktree and suppress the fallback walk entirely.
+    try runGitForFileIndexTest(alloc, base, &.{ "git", "init", "--quiet" });
 
     const empty_environ = struct {
         var map: ?*std.process.Environ.Map = null;
@@ -2580,10 +2591,10 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     }
     const scanned_count = first.count();
     try std.testing.expectEqual(@as(usize, 1), adoptions);
-    try std.testing.expect(scanned_count >= 2);
+    try std.testing.expectEqual(true, scanned_count >= 2);
     var cached = (try file_index_cache.loadFrom(alloc, home, &roots)).?;
     defer cached.deinit(alloc);
-    try std.testing.expect(cached.candidates.len > 0);
+    try std.testing.expectEqual(true, cached.candidates.len > 0);
 
     // The tree changes between launches.
     {
@@ -2598,16 +2609,20 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     second.ensureScopeEpoch(alloc, scope, 2);
     adoptions = 0;
     var counts: [2]usize = .{ 0, 0 };
+    var sources: [2]bool = .{ false, false };
     deadline = io_mod.milliTimestamp() + 5000;
     while (io_mod.milliTimestamp() < deadline and adoptions < 2) {
         if (second.joinThreadIfDone(alloc)) {
             counts[adoptions] = second.count();
+            if (second.active_generation) |adopted| sources[adoptions] = adopted.from_cache;
             adoptions += 1;
         }
         if (adoptions == 2) break;
         sleepBlocking(1);
     }
     try std.testing.expectEqual(@as(usize, 2), adoptions);
+    try std.testing.expectEqual(true, sources[0]);
+    try std.testing.expectEqual(false, sources[1]);
     try std.testing.expectEqual(scanned_count, counts[0]);
     try std.testing.expectEqual(scanned_count + 1, counts[1]);
     try std.testing.expectEqual(.ready, second.currentState());

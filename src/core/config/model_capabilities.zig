@@ -16,7 +16,7 @@ pub const ResolvedProviderOptions = struct {
 };
 
 pub const ReasoningEffortOptions = struct {
-    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = undefined,
+    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = @splat(.auto),
     len: usize = 0,
 
     pub fn fromSlice(source: []const types.ReasoningEffort) ReasoningEffortOptions {
@@ -44,6 +44,8 @@ pub const GatewayMetadata = struct {
     supports_tool_use: bool = false,
     supports_vision: bool = false,
     supports_file_input: bool = false,
+    /// Tri-state catalog claim; null = no architecture/modalities data.
+    image_input_claim: ?bool = null,
     supports_web_search: bool = false,
     supports_explicit_caching: bool = false,
     supports_implicit_caching: bool = false,
@@ -92,10 +94,16 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_tool_use = metadata.supports_tool_use;
         capabilities.supports_vision = metadata.supports_vision;
         capabilities.supports_file_input = metadata.supports_file_input;
-        capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
-            .native
-        else
-            .non_native;
+        // Claim true/false decides; null defers to the provider default, then
+        // the vision+file heuristic.
+        if (metadata.image_input_claim) |claim| {
+            capabilities.image_input_support = if (claim) .native else .non_native;
+        } else if (capabilities.image_input_support == .unknown) {
+            capabilities.image_input_support = if (metadata.supports_vision and metadata.supports_file_input)
+                .native
+            else
+                .non_native;
+        }
         capabilities.supports_web_search = metadata.supports_web_search;
         capabilities.supports_explicit_caching = metadata.supports_explicit_caching;
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
@@ -246,6 +254,63 @@ test "image input support distinguishes unknown native and non native capability
         .supports_file_input = false,
     });
     try std.testing.expectEqual(ImageInputSupport.non_native, non_native.image_input_support);
+}
+
+test "declared image input claim resolves native independent of vision heuristics" {
+    const claimed = mergeCapabilities(.{}, .{ .image_input_claim = true });
+    try std.testing.expectEqual(ImageInputSupport.native, claimed.image_input_support);
+
+    const resolved = resolveCapabilities("xiaomi/mimo-v2.6-pro", .{ .image_input_claim = true });
+    try std.testing.expectEqual(ImageInputSupport.native, resolved.image_input_support);
+
+    const unclaimed = mergeCapabilities(.{}, .{});
+    try std.testing.expectEqual(ImageInputSupport.non_native, unclaimed.image_input_support);
+
+    const App = struct {
+        pub fn resolvedModelCapabilities(_: *@This(), _: []const u8) Capabilities {
+            return .{ .image_input_support = .native };
+        }
+    };
+    var app = App{};
+    try std.testing.expectEqual(
+        ImageInputSupport.native,
+        resolveForApp(App, &app, "xiaomi/mimo-v2.6-pro").image_input_support,
+    );
+}
+
+test "null image claim defers to the provider default like the openpaths sparse catalog" {
+    const openpaths_default = mergeCapabilities(
+        Capabilities{ .image_input_support = .native },
+        .{ .image_input_claim = null },
+    );
+    try std.testing.expectEqual(ImageInputSupport.native, openpaths_default.image_input_support);
+
+    const text_only_default = mergeCapabilities(
+        .{ .image_input_support = .non_native },
+        .{ .image_input_claim = null },
+    );
+    try std.testing.expectEqual(ImageInputSupport.non_native, text_only_default.image_input_support);
+
+    const heuristic = mergeCapabilities(.{}, .{
+        .image_input_claim = null,
+        .supports_vision = true,
+        .supports_file_input = true,
+    });
+    try std.testing.expectEqual(ImageInputSupport.native, heuristic.image_input_support);
+}
+
+test "false image claim overrides a native provider default" {
+    const overridden = mergeCapabilities(
+        .{ .image_input_support = .native },
+        .{ .image_input_claim = false },
+    );
+    try std.testing.expectEqual(ImageInputSupport.non_native, overridden.image_input_support);
+
+    const claimed = mergeCapabilities(
+        .{ .image_input_support = .non_native },
+        .{ .image_input_claim = true },
+    );
+    try std.testing.expectEqual(ImageInputSupport.native, claimed.image_input_support);
 }
 
 test "reasoning effort picker helpers prepend default and preserve Gateway order" {

@@ -3261,11 +3261,13 @@ test "image badge stays inside user card block without extra gap" {
 
     const prompt_row = try findRowContaining(&h, "describe this");
     const image_row = try findRowContaining(&h, "[Image 1]");
+    const detail_row = try findRowContaining(&h, "[Image: test-image.png");
     const assistant_row = try findRowContaining(&h, "assistant follows");
     try std.testing.expectEqual(prompt_row, image_row);
+    try std.testing.expectEqual(prompt_row + 1, detail_row);
     try std.testing.expect(assistant_row > prompt_row);
-    try std.testing.expectEqual(prompt_row + 2, assistant_row);
-    try expectRowEmpty(&h, prompt_row + 1);
+    try std.testing.expectEqual(prompt_row + 3, assistant_row);
+    try expectRowEmpty(&h, prompt_row + 2);
     const footer_row = try findFirstDividerRowAfter(&h, assistant_row);
     try std.testing.expect(footer_row == assistant_row + 1 or footer_row == assistant_row + 2);
     if (footer_row == assistant_row + 2) try expectRowEmpty(&h, assistant_row + 1);

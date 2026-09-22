@@ -157,9 +157,9 @@ pub const StartupState = struct {
     /// empty keeps the reviewer's compiled default.
     review_model: []u8 = &.{},
     first_call_tool_choice: types.ToolChoice = .auto,
-    statusline_context: bool = false,
-    statusline_session: bool = false,
-    statusline_workspace: bool = false,
+    statusline_context: bool = true,
+    statusline_session: bool = true,
+    statusline_workspace: bool = true,
     session_title_generation: bool = true,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
@@ -652,9 +652,9 @@ fn loadStartupStateFromOwnedWorkspace(
         }
         state.provider_order = owned_order;
     }
-    state.statusline_context = settings.statusline_context orelse false;
-    state.statusline_session = settings.statusline_session orelse false;
-    state.statusline_workspace = settings.statusline_workspace orelse false;
+    state.statusline_context = settings.statusline_context orelse true;
+    state.statusline_session = settings.statusline_session orelse true;
+    state.statusline_workspace = settings.statusline_workspace orelse true;
     state.session_title_generation = settings.session_titles orelse true;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
@@ -2299,7 +2299,7 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2375,7 +2375,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
@@ -2410,7 +2410,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2511,7 +2511,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2542,7 +2542,11 @@ test "credential onboarding can be skipped independently from Keychain" {
 }
 
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
-    var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    var file = try dir.createFile(io_mod.getIo(), sub_path, .{
+        .truncate = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
     defer file.close(io_mod.getIo());
+    try file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o600));
     try file.writeStreamingAll(io_mod.getIo(), text);
 }

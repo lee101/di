@@ -8,6 +8,7 @@ const xai_grok_models = @import("../gateway/xai_grok_models.zig");
 const xai_grok_permission_reviewer = @import("../gateway/xai_grok_permission_reviewer.zig");
 const openpaths = @import("../gateway/openpaths.zig");
 const provider_catalog = @import("../core/auth/provider_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
 
 pub const native = provider_set.Set{
     .configured_fn = @import("../gateway/chat_completions.zig").bundle,
@@ -32,8 +33,15 @@ pub const native = provider_set.Set{
     },
     .openpaths = .{
         .presentation = provider_catalog.find(.openpaths),
+        .fallback_model_capabilities_fn = openpathsModelCapabilities,
         .agent_stream = openpaths.agent_stream_provider,
         .cli_model_catalog = openpaths.cli_model_catalog_provider,
         .model_catalog = openpaths.model_catalog_provider,
+        .deferred_usage = openpaths.generation_usage_provider,
     },
 };
+
+// OpenAI-compatible passthrough: send images unless a model explicitly claims text-only.
+fn openpathsModelCapabilities(_: []const u8) model_capabilities.Capabilities {
+    return .{ .image_input_support = .native };
+}

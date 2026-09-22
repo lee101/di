@@ -1486,8 +1486,8 @@ pub const McpRuntime = struct {
                     .connect => {},
                 }
                 server.connection_lock.lockUncancelable(io_mod.getIo());
-                defer server.connection_lock.unlock(io_mod.getIo());
                 defer server.startup_state.store(.complete, .release);
+                defer server.connection_lock.unlock(io_mod.getIo());
                 connectServerCancellable(
                     self,
                     server,
@@ -3295,9 +3295,20 @@ fn connectServerCancellable(
             .lifecycle_cancel_flag = server.cancellation(),
         },
     ) catch |err| switch (err) {
+        error.Cancelled => error.Cancelled,
         error.McpRequestTimedOut => error.McpConnectionTimedOut,
-        else => err,
+        // The startup deadline is the connection timeout of record: once the
+        // budget is spent without a completed handshake the connection timed
+        // out even when the transport wrapped the terminal failure.
+        else => if (connectionStartupExpired(io_mod.getIo(), deadline))
+            error.McpConnectionTimedOut
+        else
+            err,
     };
+}
+
+fn connectionStartupExpired(io: std.Io, deadline: std.Io.Clock.Timestamp) bool {
+    return !std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io, .awake), .lt, deadline);
 }
 
 fn parseAndStoreTools(
@@ -6793,27 +6804,26 @@ test "MCP health reads only lock-free state during discovery" {
 test "McpRuntime publishes and calls ready servers while another server is connecting" {
     const alloc = std.testing.allocator;
 
-    const ready_server =
-        \\/"method":"server\/discover"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"; fflush(); next }
-        \\/"method":"initialize"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"awk\",\"version\":\"0\"}}}"; fflush(); next }
-        \\/"method":"tools\/list"/ { print "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo text\",\"inputSchema\":{\"type\":\"object\"}}]}}"; fflush() }
-        \\/"method":"tools\/call"/ { print "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ready worked\"}]}}"; fflush() }
+    const ready_script =
+        \\while IFS= read -r line; do case "$line" in *'"method":"server/discover"'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}';; *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"awk","version":"0"}}}';; *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object"}}]}}';; *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ready worked"}]}}';; esac; done
     ;
-    const ready_args = try alloc.alloc([]const u8, 1);
-    ready_args[0] = try alloc.dupe(u8, ready_server);
-    const pending_args = try alloc.alloc([]const u8, 1);
-    pending_args[0] = try alloc.dupe(u8, "{}");
+    const ready_args = try alloc.alloc([]const u8, 2);
+    ready_args[0] = try alloc.dupe(u8, "-c");
+    ready_args[1] = try alloc.dupe(u8, ready_script);
+    const pending_args = try alloc.alloc([]const u8, 2);
+    pending_args[0] = try alloc.dupe(u8, "-c");
+    pending_args[1] = try alloc.dupe(u8, "while IFS= read -r line; do :; done");
 
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "ready"),
-        .command = try alloc.dupe(u8, "awk"),
+        .command = try alloc.dupe(u8, "sh"),
         .args = ready_args,
     });
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "pending"),
-        .command = try alloc.dupe(u8, "awk"),
+        .command = try alloc.dupe(u8, "sh"),
         .args = pending_args,
     });
 
@@ -6862,27 +6872,27 @@ test "McpRuntime publishes and calls ready servers while another server is conne
 test "McpRuntime continues discovery after one server times out" {
     const alloc = std.testing.allocator;
 
-    const pending_args = try alloc.alloc([]const u8, 1);
-    pending_args[0] = try alloc.dupe(u8, "{}");
+    const pending_args = try alloc.alloc([]const u8, 2);
+    pending_args[0] = try alloc.dupe(u8, "-c");
+    pending_args[1] = try alloc.dupe(u8, "while IFS= read -r line; do :; done");
 
-    const ready_server =
-        \\/"method":"server\/discover"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"; fflush(); next }
-        \\/"method":"initialize"/ { print "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"awk\",\"version\":\"0\"}}}"; fflush(); next }
-        \\/"method":"tools\/list"/ { print "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo text\",\"inputSchema\":{\"type\":\"object\"}}]}}"; fflush() }
+    const ready_script =
+        \\while IFS= read -r line; do case "$line" in *'"method":"server/discover"'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}';; *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"awk","version":"0"}}}';; *'"method":"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object"}}]}}';; *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ready worked"}]}}';; esac; done
     ;
-    const ready_args = try alloc.alloc([]const u8, 1);
-    ready_args[0] = try alloc.dupe(u8, ready_server);
+    const ready_args = try alloc.alloc([]const u8, 2);
+    ready_args[0] = try alloc.dupe(u8, "-c");
+    ready_args[1] = try alloc.dupe(u8, ready_script);
 
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "pending"),
-        .command = try alloc.dupe(u8, "awk"),
+        .command = try alloc.dupe(u8, "sh"),
         .args = pending_args,
     });
     try runtime.addServer(.{
         .name = try alloc.dupe(u8, "ready"),
-        .command = try alloc.dupe(u8, "awk"),
+        .command = try alloc.dupe(u8, "sh"),
         .args = ready_args,
     });
 

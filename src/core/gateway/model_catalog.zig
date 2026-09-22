@@ -311,6 +311,11 @@ fn traceCatalogLoadOutcome(
     }
 }
 
+/// Upper bound on model ids kept per catalog, whether fetched live or restored
+/// from the on-disk cache. Providers reject larger listings outright; the cache
+/// truncates to this bound.
+pub const max_catalog_models: usize = 512;
+
 pub const ModelCatalogEntry = struct {
     id: []u8,
     model_type: []u8,
@@ -321,6 +326,9 @@ pub const ModelCatalogEntry = struct {
     supports_fast_mode: bool = false,
     has_vision: bool = false,
     has_file_input: bool = false,
+    /// Tri-state claim: true = input_modalities contains "image", false = array
+    /// without "image", null = no architecture/modalities data.
+    image_input_claim: ?bool = null,
     has_web_search: bool = false,
     has_explicit_caching: bool = false,
     has_implicit_caching: bool = false,
@@ -380,6 +388,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .supports_fast_mode = entry.supports_fast_mode,
         .has_vision = entry.has_vision,
         .has_file_input = entry.has_file_input,
+        .image_input_claim = entry.image_input_claim,
         .has_web_search = entry.has_web_search,
         .has_explicit_caching = entry.has_explicit_caching,
         .has_implicit_caching = entry.has_implicit_caching,

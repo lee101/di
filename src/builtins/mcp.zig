@@ -1447,6 +1447,13 @@ test "workspace MCP missing environment variable is actionable and secret free" 
     );
     defer alloc.free(settings);
     try writeTempFile(&tmp, "home/.fx/settings.json", settings);
+    // Settings state is read only when the .fx dir and its files are private.
+    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    defer fx_dir.close(io_mod.getIo());
+    try fx_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+    var settings_file = try fx_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
+    defer settings_file.close(io_mod.getIo());
+    try settings_file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o600));
     const home_path = try tmpDirPath(alloc, tmp.dir, "home");
     defer alloc.free(home_path);
     const environment = try TestHome.install(alloc, home_path);

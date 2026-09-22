@@ -24,6 +24,7 @@ const ModelMenuLayout = struct {
     first_item_row: u16 = header_rows,
     item_stride: u16 = item_rows,
     show_header: bool = true,
+    show_list: bool = false,
     state_row: ?u16 = null,
     status_row: ?u16 = null,
     row_count: u16 = 0,
@@ -33,7 +34,13 @@ const ModelMenuLayout = struct {
 
         const match_count = projection.filteredItemCount();
         const selected = if (match_count > 0) projection.selected_index % match_count else 0;
-        if (projection.load_state != .ready or match_count == 0) {
+        const show_list = projection.load_state == .ready or
+            model_cache_runtime.modelMenuCustomRowVisible(
+                projection.items,
+                projection.providerFilter(),
+                projection.query,
+            );
+        if (!show_list or match_count == 0) {
             const state_row: u16 = if (row_budget == 1)
                 0
             else if (row_budget == 2)
@@ -62,6 +69,7 @@ const ModelMenuLayout = struct {
                 .visible_items = 1,
                 .first_item_row = 0,
                 .show_header = false,
+                .show_list = true,
                 .row_count = 1,
             };
         }
@@ -71,6 +79,7 @@ const ModelMenuLayout = struct {
                 .selected = selected,
                 .visible_items = 1,
                 .first_item_row = 1,
+                .show_list = true,
                 .row_count = 2,
             };
         }
@@ -85,6 +94,7 @@ const ModelMenuLayout = struct {
             .visible_items = visible_items,
             .first_item_row = first_item_row,
             .item_stride = item_rows,
+            .show_list = true,
             .status_row = status_row,
             .row_count = first_item_row + visible_items + @intFromBool(show_status) * (status_gap_rows + 1),
         };
@@ -111,16 +121,15 @@ pub inline fn composeModelMenuRow(
 
     const layout = ModelMenuLayout.build(projection, row_count);
     if (layout.show_header and row_index == 0) return composeHeaderRow(alloc, projection, width);
-    if (projection.load_state == .ready and row_index == header_rows and row_index < layout.row_count - 1) {
+    if (layout.show_list and row_index == header_rows and row_index < layout.row_count - 1) {
+        // Heading gap row: only the merged-catalog summary may occupy it.
         if (mergedStatusSummary(alloc, projection.items)) |summary| {
             var owned = summary;
             defer owned.deinit(alloc);
             return composeDimmedRow(alloc, owned.items, width);
         }
-        const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
-        return composeDimmedRow(alloc, text, width);
     }
-    if (projection.load_state != .ready or layout.match_count == 0) {
+    if (!layout.show_list or layout.match_count == 0) {
         if (layout.state_row == row_index) return composeStateRow(alloc, projection, width);
         if (layout.status_row == row_index) {
             const text = loadedCatalogStatusText(projection.catalog_state) orelse return row;
@@ -150,6 +159,9 @@ pub inline fn composeModelMenuRow(
     const item = projection.itemAt(display_index) orelse return row;
 
     if (item_row == 0) {
+        if (item.custom) {
+            return composeCustomRow(alloc, item.*, display_index == layout.selected, width);
+        }
         return composeTitleRow(
             alloc,
             item.*,
@@ -159,6 +171,29 @@ pub inline fn composeModelMenuRow(
             width,
         );
     }
+    return row;
+}
+
+fn composeCustomRow(
+    alloc: Allocator,
+    item: model_cache_runtime.ModelMenuItem,
+    selected: bool,
+    width: u16,
+) !std.ArrayList(u8) {
+    var row: std.ArrayList(u8) = .empty;
+    errdefer row.deinit(alloc);
+    const indent_width: u16 = if (width <= 2) 0 else 2;
+    if (indent_width > 0) try row.appendSlice(alloc, "  ");
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
+
+    var titled: std.ArrayList(u8) = .empty;
+    defer titled.deinit(alloc);
+    try titled.appendSlice(alloc, "Use ");
+    try titled.appendSlice(alloc, item.id);
+
+    const prefix_width = display_width.visibleWidthIgnoringAnsi(row.items);
+    try row_text.appendSingleLineMiddleEllipsized(alloc, &row, titled.items, @as(usize, width) -| prefix_width);
+    try row.appendSlice(alloc, ui_render.reset_style);
     return row;
 }
 
@@ -489,7 +524,7 @@ fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]
         return switch (source) {
             .openpaths_api_key => "OpenPaths catalog: authenticated with OPENPATHS_API_KEY.",
             .openrouter_api_key => "OpenRouter catalog: authenticated with OPENROUTER_API_KEY.",
-            .fx_login => "Gateway catalog: authenticated with fx login.",
+            .fx_login => "Gateway catalog: authenticated with di login.",
             .ai_gateway_api_key => "Note: Gateway catalog is authenticated with an API key",
             .vercel_oidc_token => "Gateway catalog: authenticated with the Vercel session.",
             .stored_key => "Gateway catalog: authenticated with the stored API key.",
@@ -749,6 +784,45 @@ test "model menu places catalog note after an item gap and preserves the heading
     var status = try composeModelMenuRow(alloc, projection, 5, 120, rows);
     defer status.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, status.items, "Note: Gateway catalog is authenticated with an API key") != null);
+}
+
+test "model menu renders the Use query row for typed ids" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{.{
+        .id = @constCast("brand/new-model"),
+        .provider = "brand",
+        .capabilities = .{},
+        .custom = true,
+    }};
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .query = "brand/new-model",
+    };
+    const rows = menuRowCount(projection, 120, 10);
+    try std.testing.expectEqual(@as(u16, 3), rows);
+
+    var heading_gap = try composeModelMenuRow(alloc, projection, 1, 120, rows);
+    defer heading_gap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), heading_gap.items.len);
+
+    var row = try composeModelMenuRow(alloc, projection, 2, 120, rows);
+    defer row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, row.items, "Use brand/new-model") != null);
+
+    // The typed row keeps working while the catalog load has failed.
+    const failed: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .failed,
+        .items = &items,
+        .query = "brand/new-model",
+    };
+    const failed_rows = menuRowCount(failed, 120, 10);
+    try std.testing.expectEqual(@as(u16, 3), failed_rows);
+    var failed_row = try composeModelMenuRow(alloc, failed, 2, 120, failed_rows);
+    defer failed_row.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, failed_row.items, "Use brand/new-model") != null);
 }
 
 test "model menu status follows provenance and retryable failure precedence" {

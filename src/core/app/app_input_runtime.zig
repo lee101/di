@@ -2415,7 +2415,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyInlineSettingsModelSelection(app: *App) !void {
-            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse return;
+            const selected = (try app.model_cache.menu.enterSelectionAlloc(app.alloc)) orelse return;
             defer if (selected.id.len > 0) app.alloc.free(selected.id);
             if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
                 if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
@@ -2672,7 +2672,7 @@ pub fn Runtime(comptime App: type) type {
         fn submitModelMenuSelection(app: *App) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse {
+            const selected = (try app.model_cache.menu.enterSelectionAlloc(app.alloc)) orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
@@ -6158,21 +6158,12 @@ test "app_input_runtime stream Escape closes the model catalog without cancellin
 }
 
 test "app_input_runtime unselectable model catalog states consume Enter without submitting" {
-    const Case = enum { loading, failed, no_match };
-    for ([_]Case{ .loading, .failed, .no_match }) |case| {
+    for ([_]model_cache_runtime.ModelMenuLoadState{ .loading, .failed }) |load_state| {
         const alloc = std.testing.allocator;
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
-        switch (case) {
-            .loading, .failed => {
-                app.model_cache.menu.active = true;
-                app.model_cache.menu.load_state = if (case == .loading) .loading else .failed;
-            },
-            .no_match => {
-                try openRoutingModelMenu(&app, &.{"alpha/one"});
-                app.model_cache.menu.setQuery("missing");
-            },
-        }
+        app.model_cache.menu.active = true;
+        app.model_cache.menu.load_state = load_state;
 
         try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
 
@@ -6180,6 +6171,52 @@ test "app_input_runtime unselectable model catalog states consume Enter without 
         try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
         try std.testing.expect(app.last_command == null);
     }
+}
+
+test "app_input_runtime model menu Enter selects a typed id outside the catalog" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingModelMenu(&app, &.{"alpha/one"});
+    app.model_cache.menu.setQuery(alloc, "brand/new-model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("brand/new-model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
+    try std.testing.expectEqualStrings("brand/new-model", app.last_preference_model.items);
+}
+
+test "app_input_runtime model menu Enter rejects invalid typed ids" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    try openRoutingModelMenu(&app, &.{"alpha/one"});
+    app.model_cache.menu.setQuery(alloc, "bad id");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("test/model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
+    try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
+    try std.testing.expect(app.last_command == null);
+}
+
+test "app_input_runtime model menu Enter selects a typed id while catalog load failed" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.model_cache.menu.active = true;
+    app.model_cache.menu.load_state = .failed;
+    app.model_cache.menu.setQuery(alloc, "brand/new-model");
+
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("brand/new-model", app.selected_model.items);
+    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
 }
 
 test "app_input_runtime typing filters the active session catalog" {

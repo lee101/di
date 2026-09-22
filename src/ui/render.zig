@@ -196,6 +196,9 @@ pub const StatuslineItems = struct {
     context_used: u64 = 0,
     context_total: ?u32 = null,
     session_title: ?[]const u8 = null,
+    total_input_tokens: u64 = 0,
+    total_output_tokens: u64 = 0,
+    total_cost: f64 = 0,
 };
 
 /// Cell budget for the session title segment. The title is capped at 8 words
@@ -374,6 +377,57 @@ fn appendWorkspaceIdentity(
     appendStatusSegment(out, end, identity);
 }
 
+fn compactCountLabel(buf: []u8, value: u64) []const u8 {
+    if (value < 1_000) return std.fmt.bufPrint(buf, "{d}", .{value}) catch "";
+    if (value < 1_000_000) {
+        const tenths = (value + 50) / 100;
+        if (tenths < 10_000) {
+            return std.fmt.bufPrint(buf, "{d}.{d}k", .{ tenths / 10, tenths % 10 }) catch "";
+        }
+    }
+    const tenths = (value +| 50_000) / 100_000;
+    return std.fmt.bufPrint(buf, "{d}.{d}M", .{ tenths / 10, tenths % 10 }) catch "";
+}
+
+fn sessionTokensLabel(buf: []u8, input: u64, output: u64) []const u8 {
+    var input_buf: [32]u8 = undefined;
+    var output_buf: [32]u8 = undefined;
+    if (input > 0 and output > 0) {
+        return std.fmt.bufPrint(buf, "↑{s} ↓{s}", .{
+            compactCountLabel(&input_buf, input),
+            compactCountLabel(&output_buf, output),
+        }) catch "";
+    }
+    if (input > 0) return std.fmt.bufPrint(buf, "↑{s}", .{compactCountLabel(&input_buf, input)}) catch "";
+    return std.fmt.bufPrint(buf, "↓{s}", .{compactCountLabel(&output_buf, output)}) catch "";
+}
+
+fn sessionCostLabel(buf: []u8, cost: f64) []const u8 {
+    if (!std.math.isFinite(cost) or cost < 0) return "";
+    const mills_f = cost * 1_000.0;
+    if (mills_f >= 1e15) return "";
+    const mills: u64 = @intFromFloat(@round(mills_f));
+    return std.fmt.bufPrint(buf, "${d}.{d:0>3}", .{ mills / 1_000, mills % 1_000 }) catch "";
+}
+
+const ContextUsageLevel = enum { base, dim, warning, critical };
+
+fn contextUsageLevel(pct: u64) ContextUsageLevel {
+    if (pct >= 90) return .critical;
+    if (pct >= 70) return .warning;
+    if (pct >= 50) return .dim;
+    return .base;
+}
+
+fn contextLevelStyle(level: ContextUsageLevel) []const u8 {
+    return switch (level) {
+        .base => "",
+        .dim => dim_style,
+        .warning => warning_style,
+        .critical => red_style,
+    };
+}
+
 fn appendSessionStatusSegments(
     out: []u8,
     end: *usize,
@@ -395,13 +449,30 @@ fn appendSessionStatusSegments(
     if (statusline.session_title) |title| {
         appendStatusSegment(out, end, display_width.prefixByWidth(title, max_session_title_cells));
     }
+    if (statusline.total_input_tokens > 0 or statusline.total_output_tokens > 0) {
+        var tokens_buf: [72]u8 = undefined;
+        appendStatusSegment(out, end, sessionTokensLabel(
+            &tokens_buf,
+            statusline.total_input_tokens,
+            statusline.total_output_tokens,
+        ));
+    }
+    if (statusline.total_cost > 0) {
+        var cost_buf: [32]u8 = undefined;
+        appendStatusSegment(out, end, sessionCostLabel(&cost_buf, statusline.total_cost));
+    }
     if (statusline.context_used > 0) {
         if (statusline.context_total) |total| {
             const used_k = statusline.context_used / 1000;
             const total_k: u64 = @as(u64, total) / 1000;
             const pct = if (total > 0) (statusline.context_used * 100) / @as(u64, total) else 0;
-            var ctx_buf: [48]u8 = undefined;
-            appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
+            const style = contextLevelStyle(contextUsageLevel(pct));
+            var ctx_buf: [128]u8 = undefined;
+            if (style.len > 0) {
+                appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{s}{d}k/{d}k {d}%{s}", .{ style, used_k, total_k, pct, statusline_style }) catch "");
+            } else {
+                appendStatusSegment(out, end, std.fmt.bufPrint(&ctx_buf, "{d}k/{d}k {d}%", .{ used_k, total_k, pct }) catch "");
+            }
         } else {
             const used_k = statusline.context_used / 1000;
             var ctx_buf: [32]u8 = undefined;
@@ -1163,4 +1234,86 @@ test "buildSessionStatusLine reuses model effort and context formatting" {
         &buf,
     );
     try std.testing.expectEqualStrings("gemini-3.8-flash · high · 12k/100k 12%", line);
+}
+
+test "session totals render as compact token and cost segments" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
+        .total_input_tokens = 12_300,
+        .total_output_tokens = 456,
+        .total_cost = 0.012,
+    }, 80, &buf);
+    try std.testing.expectEqualStrings("ask · gpt-5 · ↑12.3k ↓456 · $0.012", line);
+}
+
+test "session token labels compact counts to one decimal k and M tiers" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("456", compactCountLabel(&buf, 456));
+    try std.testing.expectEqualStrings("1.0k", compactCountLabel(&buf, 1_000));
+    try std.testing.expectEqualStrings("12.3k", compactCountLabel(&buf, 12_345));
+    try std.testing.expectEqualStrings("950.0k", compactCountLabel(&buf, 950_000));
+    try std.testing.expectEqualStrings("1.0M", compactCountLabel(&buf, 999_999));
+    try std.testing.expectEqualStrings("1.2M", compactCountLabel(&buf, 1_234_567));
+    try std.testing.expectEqualStrings("↑12.3k ↓456", sessionTokensLabel(&buf, 12_300, 456));
+    try std.testing.expectEqualStrings("↑1.0k", sessionTokensLabel(&buf, 1_000, 0));
+    try std.testing.expectEqualStrings("↓456", sessionTokensLabel(&buf, 0, 456));
+}
+
+test "session cost label keeps three decimals and rejects invalid values" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("$0.000", sessionCostLabel(&buf, 0));
+    try std.testing.expectEqualStrings("$0.012", sessionCostLabel(&buf, 0.012));
+    try std.testing.expectEqualStrings("$1.500", sessionCostLabel(&buf, 1.5));
+    try std.testing.expectEqualStrings("$2.750", sessionCostLabel(&buf, 2.75));
+    try std.testing.expectEqualStrings("", sessionCostLabel(&buf, std.math.nan(f64)));
+    try std.testing.expectEqualStrings("", sessionCostLabel(&buf, -0.5));
+}
+
+test "context segment color escalates at fifty seventy ninety percent" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        used: u64,
+        expected_style: []const u8,
+    }{
+        .{ .used = 49_000, .expected_style = "" },
+        .{ .used = 50_000, .expected_style = dim_style },
+        .{ .used = 69_000, .expected_style = dim_style },
+        .{ .used = 70_000, .expected_style = warning_style },
+        .{ .used = 89_000, .expected_style = warning_style },
+        .{ .used = 90_000, .expected_style = red_style },
+        .{ .used = 120_000, .expected_style = red_style },
+    };
+    for (cases) |case| {
+        var buf: [128]u8 = undefined;
+        const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
+            .context_used = case.used,
+            .context_total = 100_000,
+        }, 256, &buf);
+        const pct = case.used / 1_000;
+        const expected = try std.fmt.allocPrint(
+            alloc,
+            "ask · gpt-5 · {s}{d}k/100k {d}%{s}",
+            .{
+                case.expected_style,
+                pct,
+                pct,
+                if (case.expected_style.len > 0) statusline_style else "",
+            },
+        );
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, line);
+    }
+    try std.testing.expectEqual(ContextUsageLevel.base, contextUsageLevel(49));
+    try std.testing.expectEqual(ContextUsageLevel.dim, contextUsageLevel(50));
+    try std.testing.expectEqual(ContextUsageLevel.warning, contextUsageLevel(70));
+    try std.testing.expectEqual(ContextUsageLevel.critical, contextUsageLevel(90));
+}
+
+test "context segment keeps the unknown window fallback unstyled" {
+    var buf: [128]u8 = undefined;
+    const line = buildHintLine(false, true, "openai/gpt-5", .ask, false, .auto, false, .{
+        .context_used = 950_000,
+        .total_input_tokens = 12_300,
+    }, 256, &buf);
+    try std.testing.expectEqualStrings("ask · gpt-5 · ↑12.3k · 950k", line);
 }
