@@ -1,15 +1,6 @@
-```
- ⠀⠀⠀⠀⠀⠀⣠⣾⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀
- ⠀⠀⠀⠀⠀⢰⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
- ⠀⠀⠀⣠⣶⣿⣿⣷⣶⡶⣶⣶⣆⠀⠀⠀⣴⣶⣶⠆
- ⠀⠀⠀⠉⢹⣿⣿⠉⠉⠀⠘⢿⣿⣧⣀⣾⣿⡿⠃⠀             Tiny, open, embeddable, native coding agent.
- ⠀⠀⠀⠀⣼⣿⡏⠀⠀⠀⠀⠀⠻⣿⣿⣿⠟⠀⠀⠀
- ⠀⠀⠀⢀⣿⣿⠃⠀⠀⠀⠀⢠⣦⠘⢿⣿⣷⡀⠀⠀             curl -fsSL https://fx.sh/setup.sh | bash
- ⠀⠀⠀⣸⣿⡟⠀⠀⠀⠀⣰⣿⣿⠗⠀⠻⣿⣿⣄⠀
- ⠀⠀⠀⣿⣿⠇⠀⠀⠀⠾⠿⠿⠋⠀⠀⠀⠘⠿⠿⠦             ⚠ Status: Experimental. Use at your own risk.
-  ⠀⣸⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
- ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-```
+<p align="center">
+  <img src="art/di-roman-ii.png" width="240" alt="di Roman numeral II mark">
+</p>
 
 fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
@@ -26,13 +17,43 @@ fx is a coding agent CLI written in Zig: a small native binary that is open sour
   <a href="https://github.com/vercel-labs/fx/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/vercel-labs/fx.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
 </p>
 
-## Install
+## Build
 
 ```bash
-curl -fsSL https://fx.sh/setup.sh | bash
+git clone https://github.com/lee101/di.git
+cd di
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/di
 ```
 
 ## Get started
+
+di detects available credentials at startup. With `OPENPATHS_API_KEY` or
+`OPENROUTER_API_KEY` in the environment, it selects that compatible transport
+and works immediately without a setup command:
+
+```bash
+export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
+di
+```
+
+The default OpenPaths model is `openpaths/stealth/ox-alpha`. When that model is
+unavailable, di circuit-breaks to `deepseek-v4-flash-vision-exp` for the rest
+of the turn and shows a recovered banner.
+
+OpenRouter `:free` variants and the `openrouter/free` router still require an
+`OPENROUTER_API_KEY`; “free” describes inference price, not anonymous API
+access. Likewise, a ChatGPT/Codex subscription authorizes only the models in
+its authenticated Codex catalog. To select a DeepSeek or other third-party
+row, provide an OpenPaths, OpenRouter, or AI Gateway credential that advertises
+that model. di switches the route automatically when the model is selected—it
+does not copy one provider's bearer token to another provider.
+
+`/model` is a unified searchable catalog. It merges models available through
+OpenPaths, OpenRouter, Vercel AI Gateway, an eligible ChatGPT/Codex
+subscription, and an eligible Grok subscription. Selecting a row also selects
+the credential and transport that advertised it, so model choice is the normal
+workflow rather than a separate provider-configuration exercise.
 
 Sign in with one of:
 
@@ -45,14 +66,81 @@ Then start the interactive shell from a project:
 
 ```bash
 cd your_project
-fx
+di
 ```
 
 Or make a one-shot request:
 
 ```bash
-fx ask "explain the changes in this repository"
+di ask "explain the changes in this repository"
 ```
+
+### Compatibility state
+
+This first rebranded release intentionally reads the existing `~/.fx` profile
+and `FX_*` environment variables. That preserves prior sessions, skills, and
+ChatGPT/Codex login state for people moving from fx. New provider keys use
+their standard names: `OPENPATHS_API_KEY`, `OPENROUTER_API_KEY`, and
+`AI_GATEWAY_API_KEY`.
+
+## di infinity
+
+di infinity is the infinite run harness: one `di ask` invocation that keeps working across turns until you interrupt it. After every completed turn, the saved session receives a generated follow-up prompt built from the latest work summary, so progress compounds instead of stopping at the first answer.
+
+```bash
+# keep executing the next logical implementation steps, forever
+di ask --auto-next-steps --yolo "fix the failing tests and improve the implementation"
+
+# finish the current plan, then brainstorm and ship improvements, forever
+di ask --auto-next-idea --yolo "polish the terminal renderer"
+
+# both: alternate between next steps and next ideas until interrupted
+di ask --auto-next-steps --auto-next-idea --yolo "harden the gateway client"
+```
+
+How the cycle runs:
+
+- `--auto-next-steps`: after each turn, breaks the overall goal into concrete next steps and executes them in order, running relevant tests along the way.
+- `--auto-next-idea`: after the current plan is done, shifts into ideation mode, brainstorms at least three concrete improvements, picks the highest-impact one, and starts executing immediately.
+- Together they form an unbounded loop; every third single-flag turn also re-reviews recent work against the original objective before acting.
+- Failed turns retry automatically with exponential backoff (1s doubling to 16s), resuming the same saved session. Non-retryable failures exit nonzero.
+- Stop anytime with Ctrl+C. Sessions are always saved, so `di ask --resume last` picks the harness back up later.
+
+Autonomous mode requires session saving and cannot be combined with `--no-save`. Pair it with `--json` to get one parseable result object per turn on stdout.
+
+## di improves di
+
+di can act as a subagent on its own repository. Every iteration starts from a
+clean tree, runs one autonomous `di ask` turn, then gates the result with a
+ReleaseSafe build and the full test suite before committing and pushing.
+
+```bash
+export OPENPATHS_API_KEY=...
+scripts/self-improve.sh                          # one pass, default model muse-spark-1.3-contributor
+scripts/self-improve.sh -n 5 --valgrind          # five passes, valgrind gate too
+scripts/self-improve.sh -m deepseek/deepseek-v4-flash-vision-exp -- "make /model list every catalog"
+scripts/self-improve.sh --merge-upstream         # merge vercel-labs/fx main; di resolves conflicts
+```
+
+Iterations that fail to build or introduce a new failing test are reverted, so
+the branch only ever gains passing commits. The test gate compares against a
+baseline captured from the clean tree, so pre-existing failures on a machine do
+not block progress. `--no-push` keeps commits local; `--remote` and
+`--upstream` select the git remotes.
+
+## Valgrind
+
+```bash
+scripts/valgrind.sh                       # offline CLI surface under memcheck
+scripts/valgrind.sh --ask "say hi"        # plus one live ask turn
+scripts/valgrind.sh --tests model_fallback   # unit tests matching a filter under memcheck
+```
+
+The script builds a Debug binary with symbols, reports the memcheck error
+summary per command, and exits nonzero on definite leaks or invalid accesses.
+`zig build test -Dtest-filter=NAME` runs a subset of tests without valgrind.
+
+di starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to di's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
 
 Inside the shell, run `/help` to browse interactive commands.
 
@@ -97,13 +185,13 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
-## Embed fx
+## Embed di
 
-fx builds as a native binary or WebAssembly. Applications embedding fx can provide network transport, session storage, configuration, permission handling, and terminal I/O.
+di builds as a native binary or WebAssembly. Applications embedding di can provide network transport, session storage, configuration, permission handling, and terminal I/O. The experimental JavaScript SDK keeps its existing `fx-*` artifact names for upstream compatibility.
 
 | Surface | Use |
 | --- | --- |
-| `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
+| `di acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
 
@@ -128,13 +216,13 @@ live message test.
 
 ## Build from source
 
-Building fx requires [Zig 0.16.0+](https://ziglang.org/download/):
+Building di requires [Zig 0.16.0+](https://ziglang.org/download/):
 
 ```bash
-git clone https://github.com/vercel-labs/fx.git
-cd fx
+git clone https://github.com/lee101/di.git
+cd di
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/fx
+./zig-out/bin/di
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.

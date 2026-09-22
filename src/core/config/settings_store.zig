@@ -1619,7 +1619,7 @@ fn putModelPreference(
         .gateway => "model",
         .codex => "codex_model",
         .grok => "grok_model",
-        .configured => return changed,
+        .openpaths, .configured => return changed,
     };
     if (root.contains(legacy_key)) {
         _ = root.orderedRemove(legacy_key);

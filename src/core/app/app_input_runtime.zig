@@ -2415,11 +2415,18 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn applyInlineSettingsModelSelection(app: *App) !void {
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse return;
-            defer app.alloc.free(selected);
+            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse return;
+            defer if (selected.id.len > 0) app.alloc.free(selected.id);
+            if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
+                if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                    app.model_cache.closeMenu();
+                    app.shell.render_requests.request(.footer);
+                    return;
+                }
+            }
             try session_commands.Commands(App).selectModelFromPicker(
                 app,
-                selected,
+                selected.id,
                 app.effort,
                 app.fast_mode,
             );
@@ -2665,11 +2672,11 @@ pub fn Runtime(comptime App: type) type {
         fn submitModelMenuSelection(app: *App) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
-            const selected = (try app.model_cache.menu.selectedModelAlloc(app.alloc)) orelse {
+            const selected = (try app.model_cache.menu.selectedItemAlloc(app.alloc)) orelse {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
-            defer app.alloc.free(selected);
+            defer if (selected.id.len > 0) app.alloc.free(selected.id);
 
             if (app.input_runtime.model_picker_draft != null) {
                 // Opened via Ctrl+P: Enter uses the model as-is (current effort
@@ -2678,9 +2685,15 @@ pub fn Runtime(comptime App: type) type {
                 // inline effort and fast stages. closeModelMenu owns the close,
                 // composer cleanup, and draft restore, including when applying
                 // the model fails.
+                if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
+                    if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                        _ = closeModelMenu(app, true);
+                        return true;
+                    }
+                }
                 session_commands.Commands(App).selectModelFromPicker(
                     app,
-                    selected,
+                    selected.id,
                     app.effort,
                     app.fast_mode,
                 ) catch |err| {
@@ -2693,8 +2706,14 @@ pub fn Runtime(comptime App: type) type {
 
             // Without a stashed draft the restore inside closeModelMenu is a
             // no-op, so the /model flow shares the same close policy.
+            if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
+                if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                    _ = closeModelMenu(app, true);
+                    return true;
+                }
+            }
             _ = closeModelMenu(app, true);
-            try completion_rt.beginExactModelSelection(app, selected);
+            try completion_rt.beginExactModelSelection(app, selected.id);
             return true;
         }
 
@@ -10993,7 +11012,7 @@ test "app_input_runtime active Ctrl-C cancels stream and arms exit window" {
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can di do differently?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
@@ -11018,7 +11037,7 @@ test "automatic compaction cancellation is silent only while compaction is activ
         try std.testing.expect(app.worker.cancel_requested);
         var rendered = try app.shell.prepareTranscriptSource(alloc, null);
         defer rendered.deinit(alloc);
-        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+        try std.testing.expectEqual(settled, std.mem.find(u8, rendered.bytes, "What can di do differently?") != null);
         try std.testing.expectEqualStrings("", app.notice_body.items);
     }
 }
@@ -11050,7 +11069,7 @@ test "app_input_runtime active tool Escape presents final cancellation immediate
     var rendered = try app.shell.prepareTranscriptSource(alloc, null);
     defer rendered.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelled") != null);
-    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can fx do differently?") != null);
+    try std.testing.expect(std.mem.find(u8, rendered.bytes, "What can di do differently?") != null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "Cancelling") == null);
     try std.testing.expectEqual(@as(usize, 1), app.shell.activeToolActivityCount());
@@ -11073,7 +11092,7 @@ test "app_input_runtime second Ctrl-C after active cancellation exits without du
     defer rendered.deinit(alloc);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, rendered.bytes, "What can fx do differently?"),
+        std.mem.count(u8, rendered.bytes, "What can di do differently?"),
     );
     try std.testing.expect(std.mem.find(u8, rendered.bytes, "System:") == null);
 }

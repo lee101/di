@@ -176,7 +176,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .warning,
                     .body = switch (provider) {
-                        .gateway => credentials.missing_interactive_credential_message,
+                        .gateway, .openpaths => credentials.missing_interactive_credential_message,
                         .codex => credentials.missing_chatgpt_interactive_credential_message,
                         .grok => credentials.missing_grok_interactive_credential_message,
                         .configured => "Configured provider authentication is unavailable. Check settings.json and its environment variable.",
@@ -356,7 +356,7 @@ pub fn Runtime(comptime App: type) type {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
-                        .body = "Could not complete fx logout. The current source is unchanged.",
+                        .body = "Could not complete di logout. The current source is unchanged.",
                     });
                     return;
                 },
@@ -520,7 +520,7 @@ pub fn Runtime(comptime App: type) type {
         fn applyLogoutResult(app: *App, result: login_flow.LogoutResult) !void {
             // Logging out is an explicit rejection of that credential, so a
             // remembered pointer to it would silently reactivate on next login.
-            // A remembered source always wins resolution, so an active fx login
+            // A remembered source always wins resolution, so an active di login
             // is the only way one can be remembered; clearing otherwise is a
             // no-op against a store that holds nothing.
             if (app.auth.credentialSource() == .fx_login) forgetCredentialSource(app);
@@ -529,7 +529,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .warning,
-                    .body = "Could not confirm durable fx logout. The active source was recalculated.",
+                    .body = "Could not confirm durable di logout. The active source was recalculated.",
                 }
             else if (result.session_deleted)
                 .{
@@ -541,7 +541,7 @@ pub fn Runtime(comptime App: type) type {
                 .{
                     .topic = "auth",
                     .tone = .neutral,
-                    .body = "No fx login session found.",
+                    .body = "No di login session found.",
                 });
             if (result.remote_revocation_failed) {
                 try writeAuthNotice(app, .{
@@ -1226,7 +1226,7 @@ pub fn Runtime(comptime App: type) type {
                     switch (target) {
                         .codex => try beginCodexSignInForProviderSwitch(app),
                         .grok => try beginGrokSignInForProviderSwitch(app),
-                        .gateway, .configured => {},
+                        .gateway, .openpaths, .configured => {},
                     }
                 }
                 if (target == .gateway or !request.allow_login) {
@@ -1414,6 +1414,147 @@ pub fn Runtime(comptime App: type) type {
             return .ready;
         }
 
+        /// Activates `target` with `model`, resolving the credential from
+        /// `preferred_source` first. Used by the model menu and /model when a
+        /// selection is served by a different credential than the active one.
+        /// Returns true when the provider or credential changed.
+        pub fn switchToModel(
+            app: *App,
+            target: model_provider.ProviderId,
+            preferred_source: ?credentials.Source,
+            model: []const u8,
+            origin_label: []const u8,
+        ) !bool {
+            if (comptime !provider_runtime.supported(App) or
+                !@hasDecl(App, "fetchProviderCatalog") or
+                !@hasDecl(@TypeOf(app.model_cache), "adoptOwnedCatalog"))
+            {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Provider switching is unavailable in this host.",
+                }, true);
+                return false;
+            }
+            if (comptime host_target.is_wasm) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Provider switching is unavailable in this WASM session.",
+                }, true);
+                return false;
+            }
+            if (app.stream.active or app.worker.queuedPromptCount() > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = "Cannot switch models while active or queued work finishes.",
+                }, true);
+                return false;
+            }
+
+            const resolution = credentials.resolveForProvider(
+                app.alloc,
+                app.auth.oauthTransport(),
+                app.auth.secretStore(),
+                .refresh_if_needed,
+                target,
+                preferred_source,
+            ) catch |err| {
+                debug_trace.logf("provider", "model route credential failed target={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not prepare the credential for that model's source. The current model is unchanged.",
+                }, true);
+                return false;
+            };
+            var credential = resolution.credential orelse {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .warning,
+                    .body = credentials.missing_interactive_credential_message,
+                }, true);
+                return false;
+            };
+            defer credential.deinit(app.alloc);
+            if (!model_provider.authorizesCredential(target, credential.source)) {
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "The available credential cannot authorize that model's source. The current model is unchanged.",
+                }, true);
+                return false;
+            }
+
+            const access = credentials.catalogAccessForCredentialAndAccount(
+                credential.source,
+                credential.token,
+                credential.gatewayTeam(),
+                credential.accountId(),
+            );
+            const fetched = app.fetchProviderCatalog(target, access) catch |err| {
+                debug_trace.logf("provider", "model route catalog failed target={t} err={s}", .{ target, @errorName(err) });
+                try app.writeDomainNotice(.{
+                    .topic = "provider",
+                    .tone = .@"error",
+                    .body = "Could not load that model's catalog. The current model is unchanged.",
+                }, true);
+                return false;
+            };
+            var catalog = switch (fetched) {
+                .catalog => |catalog| catalog,
+                .failure => |failure| {
+                    debug_trace.logf("provider", "model route catalog rejected target={t} category={t}", .{ target, failure.category });
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = "That model's catalog could not be validated. The current model is unchanged.",
+                    }, true);
+                    return false;
+                },
+            };
+            defer model_catalog.freeModelCatalog(app.alloc, &catalog);
+
+            var owned_model = try app.alloc.dupe(u8, model);
+            errdefer app.alloc.free(owned_model);
+
+            app.model_cache.adoptOwnedCatalog(access, &catalog);
+            app.provider_selection.adoptOwned(target, &owned_model);
+            _ = app.auth.adoptCredential(app.alloc, &credential);
+            reconcileGatewayCredential(app);
+
+            if (comptime @hasDecl(App, "persistRuntimePreferences")) {
+                var persistence = app.persistRuntimePreferences(.{
+                    .provider = target,
+                    .model = provider_runtime.model(app),
+                });
+                defer persistence.deinit(app.alloc);
+                if (persistence.settings_error != null or persistence.session_error != null) {
+                    debug_trace.logf("provider", "model switch persistence failed", .{});
+                }
+            } else {
+                var persistence = config_runtime.attemptUserPreferences(app.alloc, .{
+                    .provider = target,
+                    .model_preference = .{
+                        .provider = target,
+                        .model = provider_runtime.model(app),
+                    },
+                });
+                defer persistence.deinit(app.alloc);
+            }
+
+            const body = try std.fmt.allocPrint(
+                app.alloc,
+                "Switched to {s} via {s}.",
+                .{ provider_runtime.model(app), origin_label },
+            );
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = body }, true);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn beginTeamPicker(app: *App) !void {
             if (!app.auth.pickerView().fx_login_session_available) return;
             try app.flushBeforeBlockingExternalWork();
@@ -1424,7 +1565,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.NoSession => "The fx login session is no longer available. Sign in to change teams.",
+                        error.NoSession => "The di login session is no longer available. Sign in to change teams.",
                         error.NoTeams => "No Vercel teams are available for this account.",
                         else => "Could not load Vercel teams. The current team is unchanged.",
                     },
@@ -1526,7 +1667,7 @@ pub fn Runtime(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = switch (err) {
-                        error.SessionChanged, error.NoSession => "The fx login session changed before the team could be saved.",
+                        error.SessionChanged, error.NoSession => "The di login session changed before the team could be saved.",
                         else => "Could not change the Vercel team. The current team is unchanged.",
                     },
                 }, true);
@@ -1576,7 +1717,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeDomainNotice(.{
                     .topic = "auth",
                     .tone = .@"error",
-                    .body = "Changed the Vercel team, but the fx login credential could not be loaded.",
+                    .body = "Changed the Vercel team, but the di login credential could not be loaded.",
                 }, true);
                 return false;
             }
@@ -1834,6 +1975,8 @@ pub fn Runtime(comptime App: type) type {
                 .grok_subscription => try beginGrokSignIn(app),
                 .vercel_oidc_token,
                 .ai_gateway_api_key,
+                .openpaths_api_key,
+                .openrouter_api_key,
                 .stored_key,
                 .host_managed,
                 .configured,
@@ -2012,7 +2155,7 @@ pub fn Runtime(comptime App: type) type {
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
                 }
             else switch (err) {
-                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },
+                error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "di login is not configured yet. The current credential is unchanged." },
                 error.AccessDenied => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in was denied. The current credential is unchanged." },
                 error.ExpiredToken, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "The Vercel sign-in code expired. The current credential is unchanged; run /login to try again." },
                 else => .{ .topic = "auth", .tone = .@"error", .body = "Vercel sign-in failed. The current credential is unchanged." },
@@ -2230,7 +2373,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
-                .gateway, .configured => unreachable,
+                .openpaths, .gateway, .configured => unreachable,
             }
 
             try std.testing.expectEqual(@as(usize, 0), app.auth.start_count);
@@ -3087,7 +3230,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqualStrings(expected, app.transcript.items);
 }
 
-test "team change from an environment source activates and remembers fx login" {
+test "team change from an environment source activates and remembers di login" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.select_result = true;
@@ -3301,7 +3444,7 @@ test "logout durability failure still reconciles live auth" {
 
     try std.testing.expectEqual(@as(usize, 1), app.auth.logout_reconcile_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable fx logout.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Could not confirm durable di logout.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, login_flow.remote_revocation_warning) != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "current source is unchanged") == null);
 }
@@ -3312,7 +3455,7 @@ test "prompt credential refresh failure is recoverable and detail-free" {
     app.auth.refresh_error = error.OAuthRequestFailed;
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login credential refresh failed.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "di login credential refresh failed.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to retry.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Choose another source") == null);
@@ -3342,7 +3485,7 @@ test "permanent prompt credential failure is one repair episode" {
     );
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, app.transcript.items, "fx login sign-in expired."),
+        std.mem.count(u8, app.transcript.items, "di login sign-in expired."),
     );
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
 }
@@ -3366,7 +3509,7 @@ test "prompt credential admission rejects a credential that remains unavailable"
 
     try std.testing.expect(!try Runtime(TestApp).preparePromptCredential(&app));
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "di login sign-in expired.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "press enter to sign in again.") != null);
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
     try std.testing.expect(!app.auth.picker_opened);
@@ -3476,7 +3619,7 @@ test "compaction credential failure preserves the first ordinary recovery notice
     try std.testing.expect(!try runtime.recoverCredentialFailure(&app, .fx_login, error.OAuthRequestFailed));
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     try std.testing.expectEqualStrings(
-        "fx login credential refresh failed.\npress enter to retry. Your prompt is saved.",
+        "di login credential refresh failed.\npress enter to retry. Your prompt is saved.",
         app.transcript.items,
     );
     try std.testing.expectEqualStrings("keep this ordinary prompt", app.submission.pending.?.draft.prompt);

@@ -25,6 +25,16 @@ pub const entries = [_]Entry{
         .login_source = .fx_login,
     },
     .{
+        .id = .openpaths,
+        .slug = "openpaths",
+        .aliases = &.{"openrouter"},
+        .name = "OpenPaths",
+        .route_name = "OpenPaths",
+        .description = "OPENPATHS_API_KEY or OPENROUTER_API_KEY",
+        .subscription = false,
+        .login_source = .openpaths_api_key,
+    },
+    .{
         .id = .codex,
         .slug = "codex",
         .name = "Codex",

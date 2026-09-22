@@ -29,6 +29,8 @@ pub const CredentialRefreshMode = enum {
 };
 
 const credential_source_order = [_]credentials.Source{
+    .openpaths_api_key,
+    .openrouter_api_key,
     .vercel_oidc_token,
     .ai_gateway_api_key,
     .fx_login,
@@ -363,7 +365,7 @@ pub fn requestedSource(
     provider: model_provider.ProviderId,
     preferred: ?credentials.Source,
 ) ?credentials.Source {
-    if (provider != .gateway) return provider_catalog.find(provider).login_source;
+    if (provider != .gateway and provider != .openpaths) return provider_catalog.find(provider).login_source;
     return if (model_provider.authorizesCredential(provider, preferred)) preferred else null;
 }
 
@@ -1464,6 +1466,8 @@ pub const StatusSnapshot = struct {
         return switch (required_source) {
             .vercel_oidc_token => "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected.",
             .ai_gateway_api_key => "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected.",
+            .openpaths_api_key => "OPENPATHS_API_KEY is selected but unavailable. Set OPENPATHS_API_KEY before starting fx; no other credential was selected.",
+            .openrouter_api_key => "OPENROUTER_API_KEY is selected but unavailable. Set OPENROUTER_API_KEY before starting fx; no other credential was selected.",
             .stored_key => switch (surface) {
                 .cli => "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected.",
                 .interactive => "A stored API key is selected but unavailable. Run /provider to choose an available credential; no other credential was selected.",
@@ -3282,13 +3286,13 @@ test "auth failure snapshot keeps refresh failures distinct from HTTP rejection"
 
     const message = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(message);
-    try std.testing.expectEqualStrings("fx login credential refresh failed", message);
+    try std.testing.expectEqualStrings("di login credential refresh failed", message);
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("fx login", parsed.value.object.get("source").?.string);
+    try std.testing.expectEqualStrings("di login", parsed.value.object.get("source").?.string);
     try std.testing.expectEqualStrings("credential_refresh_failed", parsed.value.object.get("reason").?.string);
     try std.testing.expect(parsed.value.object.get("http_status") == null);
 
@@ -3846,7 +3850,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const fresh_detail = try fresh.formatDoctorDetail(alloc);
     defer alloc.free(fresh_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; refreshable=true; team=vercel-labs",
+        "di login is configured; refreshable=true; team=vercel-labs",
         fresh_detail,
     );
 
@@ -3854,7 +3858,7 @@ test "auth status snapshot reports an expired session without claiming it is unr
     const stale_detail = try stale.formatDoctorDetail(alloc);
     defer alloc.free(stale_detail);
     try std.testing.expectEqualStrings(
-        "fx login is configured; session expired; refreshable=true; team=vercel-labs",
+        "di login is configured; session expired; refreshable=true; team=vercel-labs",
         stale_detail,
     );
 
@@ -4184,7 +4188,7 @@ const LogoutFixture = struct {
     }
 };
 
-test "logout replaces an active fx login with the next available source" {
+test "logout replaces an active di login with the next available source" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
@@ -4258,7 +4262,7 @@ test "logout clears the active login and re-enables auth selection when no sourc
     try std.testing.expect(!runtime.view().onboarding_skipped);
 }
 
-test "logout reconciliation adopts a newer concurrent fx login" {
+test "logout reconciliation adopts a newer concurrent di login" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);

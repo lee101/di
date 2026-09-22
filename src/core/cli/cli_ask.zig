@@ -353,6 +353,8 @@ const AskOptions = struct {
     no_save: bool = false,
     no_color: bool = false,
     continue_recovery: bool = false,
+    auto_next_steps: bool = false,
+    auto_next_idea: bool = false,
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -887,7 +889,7 @@ const AskContext = struct {
                 "event=ask_session_store_unavailable error={s}",
                 .{@errorName(err)},
             );
-            try self.writeStderr("fx ask: warning: session persistence unavailable; error=");
+            try self.writeStderr("di ask: warning: session persistence unavailable; error=");
             try self.writeStderr(@errorName(err));
             try self.writeStderr("; continuing without saving\n");
             return;
@@ -1262,7 +1264,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
             }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: missing prompt\n");
+            try deps.write_stderr(deps.stderr_ctx, "di ask: missing prompt\n");
             try writeAskUsage(deps, cfg.command_usage);
             return 1;
         },
@@ -1273,7 +1275,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
             }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: --no-save cannot be used with --resume or --resume-id\n");
+            try deps.write_stderr(deps.stderr_ctx, "di ask: --no-save cannot be used with --resume or --resume-id\n");
             try writeAskUsage(deps, cfg.command_usage);
             return 1;
         },
@@ -1284,7 +1286,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
             }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt exceeds the local input safety limit\n");
+            try deps.write_stderr(deps.stderr_ctx, "di ask: prompt exceeds the local input safety limit\n");
             return 1;
         },
         error.PromptInputReadFailed => {
@@ -1294,7 +1296,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
             }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: failed to read prompt from stdin\n");
+            try deps.write_stderr(deps.stderr_ctx, "di ask: failed to read prompt from stdin\n");
             return 1;
         },
         error.InvalidAskArgs => {
@@ -1314,7 +1316,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 try deps.write_stdout(deps.stdout_ctx, json);
                 return 1;
             }
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
+            try deps.write_stderr(deps.stderr_ctx, "di ask: prompt must be valid UTF-8 and contain no NUL bytes\n");
             return 1;
         },
         else => return err,
@@ -1340,60 +1342,188 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         deps.stdout_is_tty(deps.stdout_ctx),
         options.no_color,
     );
-    const result = runPromptInternal(alloc, options.prompt, options.permission_override, effective_cfg, .{
-        .output_mode = output_mode,
-        .prompt_permissions = options.prompt_permissions,
-        .images = if (options.images.items.len > 0) options.images.items else &.{},
-        .command_timeout_ms = options.timeout_ms,
-        .save_session = !options.no_save,
-        .resume_target = options.resume_target,
-        .color_enabled = !options.no_color,
-        .continue_recovery = options.continue_recovery,
-        .model_override = options.model_override,
-        .effort_override = options.effort_override,
-        .fast_override = options.fast_override,
-        .provider_order_override = options.provider_order_override,
-        .provider_strict_override = options.provider_strict_override,
-        .deps = deps,
-    }) catch |err| {
+    var current_prompt = try alloc.dupe(u8, options.prompt);
+    defer alloc.free(current_prompt);
+    var follow_up_session_id: ?[]u8 = null;
+    defer if (follow_up_session_id) |session_id| alloc.free(session_id);
+
+    var first_turn = true;
+    var autonomous_turn: usize = 0;
+    var retry_attempt: usize = 0;
+    while (true) {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        if (err == error.OutOfMemory) return err;
-        if (err == error.OneOffSessionNotResumable and !options.json_output) {
-            try deps.write_stderr(
-                deps.stderr_ctx,
-                "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
-            );
+        const resume_target = if (first_turn)
+            options.resume_target
+        else
+            ResumeTarget{ .id = follow_up_session_id.? };
+        const images = if (first_turn and options.images.items.len > 0) options.images.items else &.{};
+        const continue_recovery = first_turn and options.continue_recovery;
+        const result = runPromptInternal(alloc, current_prompt, options.permission_override, effective_cfg, .{
+            .output_mode = output_mode,
+            .prompt_permissions = options.prompt_permissions,
+            .images = images,
+            .command_timeout_ms = options.timeout_ms,
+            .save_session = !options.no_save,
+            .resume_target = resume_target,
+            .color_enabled = !options.no_color,
+            .continue_recovery = continue_recovery,
+            .model_override = options.model_override,
+            .effort_override = options.effort_override,
+            .fast_override = options.fast_override,
+            .provider_order_override = options.provider_order_override,
+            .provider_strict_override = options.provider_strict_override,
+            .deps = deps,
+        }) catch |err| {
+            if (interrupt_scope.requested() or err == error.Cancelled) return headless_interrupt.exitCode();
+            if (err == error.OutOfMemory) return err;
+            if (!options.auto_next_steps and !options.auto_next_idea) {
+                if (err == error.OneOffSessionNotResumable and !options.json_output) {
+                    try deps.write_stderr(
+                        deps.stderr_ctx,
+                        "di ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
+                    );
+                    return 1;
+                }
+                if (!options.json_output) {
+                    const notice = askErrorNotice(err) orelse return err;
+                    try deps.write_stderr(deps.stderr_ctx, "di ask: ");
+                    try deps.write_stderr(deps.stderr_ctx, notice);
+                    try deps.write_stderr(deps.stderr_ctx, "\n");
+                    return 1;
+                }
+                const json = try renderErrorJsonResult(alloc, @errorName(err));
+                defer alloc.free(json);
+                try deps.write_stdout(deps.stdout_ctx, json);
+                return 1;
+            }
+
+            retry_attempt += 1;
+            try writeAutonomousRetryNotice(deps, retry_attempt, @errorName(err));
+            io_mod.sleep(autonomousRetryDelayNs(retry_attempt));
+            continue;
+        };
+        defer result.deinit(alloc);
+
+        if (result.interrupted or interrupt_scope.requested()) {
+            const exit_code = headless_interrupt.exitCode();
+            return exit_code;
+        }
+
+        if (options.json_output) {
+            const json = try renderFinalJsonResult(alloc, result);
+            defer alloc.free(json);
+            if (interrupt_scope.requested()) {
+                return headless_interrupt.exitCode();
+            }
+            try deps.write_stdout(deps.stdout_ctx, json);
+        }
+
+        if (!options.auto_next_steps and !options.auto_next_idea) {
+            const exit_code = result.exit_code;
+            return if (interrupt_scope.requested()) headless_interrupt.exitCode() else exit_code;
+        }
+
+        if (result.exit_code != 0) {
+            if (!autonomousResultCanRetry(result)) {
+                const exit_code = result.exit_code;
+                return exit_code;
+            }
+            const has_session = result.session_id.len > 0;
+            if (has_session) {
+                if (follow_up_session_id) |session_id| alloc.free(session_id);
+                follow_up_session_id = try alloc.dupe(u8, result.session_id);
+            }
+            retry_attempt += 1;
+            const retry_prompt = try buildAutonomousRetryPrompt(alloc, result.assistant_output, retry_attempt);
+            alloc.free(current_prompt);
+            current_prompt = retry_prompt;
+            try writeAutonomousRetryNotice(deps, retry_attempt, result.error_code orelse "turn failed");
+            io_mod.sleep(autonomousRetryDelayNs(retry_attempt));
+            first_turn = !has_session;
+            continue;
+        }
+
+        retry_attempt = 0;
+        if (result.session_id.len == 0) {
+            try deps.write_stderr(deps.stderr_ctx, "di ask: autonomous mode requires a resumable saved session\n");
             return 1;
         }
-        if (!options.json_output) {
-            const notice = askErrorNotice(err) orelse return err;
-            try deps.write_stderr(deps.stderr_ctx, "fx ask: ");
-            try deps.write_stderr(deps.stderr_ctx, notice);
-            try deps.write_stderr(deps.stderr_ctx, "\n");
-            return 1;
-        }
-        const json = try renderErrorJsonResult(alloc, @errorName(err));
-        defer alloc.free(json);
-        try deps.write_stdout(deps.stdout_ctx, json);
-        return 1;
-    };
-    defer result.deinit(alloc);
-
-    if (result.interrupted or interrupt_scope.requested()) {
-        return headless_interrupt.exitCode();
+        if (follow_up_session_id) |session_id| alloc.free(session_id);
+        follow_up_session_id = try alloc.dupe(u8, result.session_id);
+        autonomous_turn += 1;
+        const next_prompt = try buildAutonomousFollowUpPrompt(
+            alloc,
+            options.auto_next_steps,
+            options.auto_next_idea,
+            autonomous_turn,
+            result.assistant_output,
+        );
+        alloc.free(current_prompt);
+        current_prompt = next_prompt;
+        first_turn = false;
     }
+}
 
-    if (options.json_output) {
-        const json = try renderFinalJsonResult(alloc, result);
-        defer alloc.free(json);
-        if (interrupt_scope.requested()) return headless_interrupt.exitCode();
-        try deps.write_stdout(deps.stdout_ctx, json);
+fn autonomousRetryDelayNs(attempt: usize) u64 {
+    const capped_attempt = @min(attempt, 5);
+    return (@as(u64, 1) << @intCast(capped_attempt - 1)) * 1_000_000_000;
+}
+
+fn writeAutonomousRetryNotice(deps: RunDeps, attempt: usize, reason: []const u8) !void {
+    var notice: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&notice, "[auto] retrying autonomous turn {d} ({s})\n", .{ attempt, reason }) catch
+        "[auto] retrying autonomous turn\n";
+    try deps.write_stderr(deps.stderr_ctx, text);
+}
+
+fn autonomousResultCanRetry(result: PromptRunResult) bool {
+    const error_code = result.error_code orelse return true;
+    return !std.mem.eql(u8, error_code, "MissingCredentials") and
+        !std.mem.eql(u8, error_code, "NonInteractivePermissionRequired");
+}
+
+fn buildAutonomousRetryPrompt(alloc: Allocator, summary: []const u8, attempt: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print(
+        "You are in AUTONOMOUS MODE. The previous attempt did not complete successfully. Inspect the current state, diagnose the failure, and retry the work now. This is retry {d}; do not ask for confirmation. Run focused verification before stopping.",
+        .{attempt},
+    );
+    if (std.mem.trim(u8, summary, " \t\r\n").len > 0) {
+        try out.writer.writeAll("\n\nThe previous attempt's output was:\n\n");
+        try out.writer.writeAll(summary);
     }
+    return out.toOwnedSlice();
+}
 
-    return if (interrupt_scope.requested())
-        headless_interrupt.exitCode()
-    else
-        result.exit_code;
+fn buildAutonomousFollowUpPrompt(
+    alloc: Allocator,
+    auto_next_steps: bool,
+    auto_next_idea: bool,
+    turn: usize,
+    summary: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("You are in AUTONOMOUS MODE. Do not ask for permission or confirmation.\n\n");
+    if (auto_next_steps) {
+        try out.writer.writeAll(
+            "Continue working autonomously on the current objectives. Break the overall goal into concrete next steps, execute them carefully in order, and run relevant tests as needed.\n\n",
+        );
+    }
+    if (auto_next_idea) {
+        try out.writer.writeAll(
+            "After finishing the current plan, shift into ideation mode and brainstorm at least three concrete improvements for this project. Pick the highest-impact idea and start executing it immediately.\n\n",
+        );
+    }
+    if (auto_next_steps and auto_next_idea) {
+        try out.writer.writeAll("Repeat this cycle indefinitely until a human interrupts you.\n\n");
+    } else if (turn % 3 == 0) {
+        try out.writer.writeAll("Review the recent work and original objective before choosing the next action. Keep the work focused and verify it.\n\n");
+    }
+    try out.writer.writeAll("Use the latest summary of work below as context when outlining your follow-up actions:\n\n");
+    try out.writer.writeAll(if (std.mem.trim(u8, summary, " \t\r\n").len > 0) summary else "No summary was produced; inspect the current repository state and continue.");
+    return out.toOwnedSlice();
 }
 
 fn preflightAskImages(
@@ -1424,7 +1554,7 @@ fn preflightAskImages(
             } else {
                 var message: std.Io.Writer.Allocating = .init(alloc);
                 defer message.deinit();
-                try message.writer.print("fx ask: failed to attach image \"{s}\": {s}\n", .{ image_path, reason });
+                try message.writer.print("di ask: failed to attach image \"{s}\": {s}\n", .{ image_path, reason });
                 try deps.write_stderr(deps.stderr_ctx, message.written());
             }
             return false;
@@ -1473,7 +1603,7 @@ fn missingCredentialResult(
         .required_source = auth_runtime.requestedSource(provider, preferred),
     };
     const message = status.missingHelp(.cli).?;
-    try options.deps.write_stderr(options.deps.stderr_ctx, "fx ask: ");
+    try options.deps.write_stderr(options.deps.stderr_ctx, "di ask: ");
     try options.deps.write_stderr(options.deps.stderr_ctx, message);
     try options.deps.write_stderr(options.deps.stderr_ctx, "\n");
     return .{
@@ -1540,7 +1670,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
         try notice_writer.writer.print(
-            "fx ask: config {s}: {s}",
+            "di ask: config {s}: {s}",
             .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
@@ -1813,14 +1943,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         );
         defer health_snapshot.deinit(alloc);
         for (health_snapshot.configuration_issues) |issue| {
-            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr("di ask: ");
             try ctx.writeStderr(issue.message);
             try ctx.writeStderr("\n");
         }
         const project_names = try mcp.pendingWorkspaceNames(alloc);
         defer mcp_contract.freeOwnedStrings(alloc, project_names);
         if (project_names.len > 0) {
-            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
+            try ctx.writeStderr("di ask: skipped unapproved project MCP servers: ");
             for (project_names, 0..) |name, index| {
                 if (index > 0) try ctx.writeStderr(", ");
                 try ctx.writeStderr(name);
@@ -1840,7 +1970,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             @intCast(@max(io_mod.milliTimestamp(), 0)),
         )) |failure| {
             defer alloc.free(failure);
-            try ctx.writeStderr("fx ask: ");
+            try ctx.writeStderr("di ask: ");
             try ctx.writeStderr(failure);
             try ctx.writeStderr("\n");
             return failPromptRunResult(error.McpRequiredServerUnavailable);
@@ -2549,20 +2679,20 @@ fn finishCliPermissionOutcome(
     switch (outcome.requirement orelse .approval_required) {
         .configured_rule => try writeBlockedActionGuidance(
             ctx,
-            "fx ask: permission required by configured rule",
+            "di ask: permission required by configured rule",
             label,
             "noninteractive_permission_prompt_unavailable",
-            "fx ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
+            "di ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
         ),
         .approval_required => try writeBlockedActionGuidance(
             ctx,
-            "fx ask: permission required for tool execution in noninteractive mode",
+            "di ask: permission required for tool execution in noninteractive mode",
             label,
             "noninteractive_permission_prompt_unavailable",
             if (permission_mode == .auto)
-                "fx ask: human approval is required for this action; use the interactive shell to approve it, or add a narrow matching permission rule\n"
+                "di ask: human approval is required for this action; use the interactive shell to approve it, or add a narrow matching permission rule\n"
             else
-                "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
+                "di ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
         ),
     }
     try recordToolCallRejected(
@@ -2605,9 +2735,9 @@ fn writeBlockedActionGuidance(
     hint: []const u8,
 ) !void {
     try ctx.writeLine(headline);
-    try ctx.writeStderr("fx ask: blocked action: ");
+    try ctx.writeStderr("di ask: blocked action: ");
     try ctx.writeStderr(label);
-    try ctx.writeStderr("\nfx ask: reason=");
+    try ctx.writeStderr("\ndi ask: reason=");
     try ctx.writeStderr(reason);
     try ctx.writeStderr("\n");
     try ctx.writeStderr(hint);
@@ -2655,7 +2785,7 @@ fn emitAskNotificationBell(raw: *anyopaque) void {
     ctx.writeStderr("\x07") catch |err| {
         debug_trace.logf(
             "notifications",
-            "fx ask terminal bell write failed err={s}",
+            "di ask terminal bell write failed err={s}",
             .{@errorName(err)},
         );
     };
@@ -3523,7 +3653,7 @@ fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u
     else
         try gateway_error_format.formatHttpErrorMessage(ctx.alloc, status, detail);
     defer ctx.alloc.free(message);
-    try ctx.writeStderr("fx ask: ");
+    try ctx.writeStderr("di ask: ");
     try ctx.writeStderr(message);
     try ctx.writeStderr("\n");
     if (ctx.output_mode.capturesJson()) {
@@ -3961,6 +4091,10 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {
             if (opts.continue_recovery) return error.InvalidAskArgs;
             opts.continue_recovery = true;
+        } else if (std.mem.eql(u8, arg, "--auto-next-steps")) {
+            opts.auto_next_steps = true;
+        } else if (std.mem.eql(u8, arg, "--auto-next-idea")) {
+            opts.auto_next_idea = true;
         } else if (arg.len > 1 and arg[0] == '-') {
             return error.InvalidAskArgs;
         } else {
@@ -3982,6 +4116,7 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
     }
     if (!text_utils.isModelSafeText(opts.prompt)) return error.InvalidPromptText;
     if (opts.no_save and opts.resume_target != null) return error.NoSaveResumeConflict;
+    if (opts.no_save and (opts.auto_next_steps or opts.auto_next_idea)) return error.InvalidAskArgs;
 
     return opts;
 }
@@ -4004,7 +4139,7 @@ fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
             var message: std.Io.Writer.Allocating = .init(alloc);
             defer message.deinit();
             try message.writer.print(
-                "fx ask: failed to save full access acknowledgment: {s}\n",
+                "di ask: failed to save full access acknowledgment: {s}\n",
                 .{@errorName(failure.err)},
             );
             try options.deps.write_stderr(options.deps.stderr_ctx, message.written());
@@ -5190,7 +5325,7 @@ test "Ask MCP adapters revalidate scoped authority before catalog access" {
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
 
-test "fx ask deps validate malformed registered calls" {
+test "di ask deps validate malformed registered calls" {
     const alloc = std.testing.allocator;
     var stdout_capture = TestCapture{};
     defer stdout_capture.deinit(alloc);
@@ -5360,7 +5495,7 @@ test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {
     try std.testing.expect(tool_ctx.permission_reviewer_provider == null);
 }
 
-test "fx ask finalization fails every failed turn" {
+test "di ask finalization fails every failed turn" {
     const cases = [_]struct {
         outcome: types.TurnPresentationOutcome,
         disposition: ?types.ProviderCompletionDisposition,
@@ -5388,7 +5523,7 @@ test "fx ask finalization fails every failed turn" {
     }
 }
 
-test "fx ask deps reject malformed native web_search calls" {
+test "di ask deps reject malformed native web_search calls" {
     const alloc = std.testing.allocator;
     var stdout_capture = TestCapture{};
     defer stdout_capture.deinit(alloc);
@@ -5421,8 +5556,9 @@ test "parse options preserves active ask flags and operands" {
         "--prompt-permissions",
         "--quiet",
         "--verbose",
-        "--no-save",
         "--no-color",
+        "--auto-next-steps",
+        "--auto-next-idea",
         "--timeout",
         "123",
         "hello",
@@ -5435,7 +5571,6 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expect(options.prompt_permissions);
     try std.testing.expect(options.quiet);
     try std.testing.expect(options.verbose);
-    try std.testing.expect(options.no_save);
     try std.testing.expect(options.no_color);
     try std.testing.expectEqual(@as(?usize, 123 * std.time.ms_per_s), options.timeout_ms);
     try std.testing.expectEqualStrings("second", options.system_prompt_override.?);
@@ -5443,6 +5578,40 @@ test "parse options preserves active ask flags and operands" {
     try std.testing.expectEqualStrings("a.png", options.image_paths.items[0]);
     try std.testing.expectEqual(@as(usize, 0), options.images.items.len);
     try std.testing.expectEqualStrings("hello world", options.prompt);
+    try std.testing.expect(options.auto_next_steps);
+    try std.testing.expect(options.auto_next_idea);
+}
+
+test "autonomous follow-up prompts combine steps and ideas" {
+    const prompt = try buildAutonomousFollowUpPrompt(
+        std.testing.allocator,
+        true,
+        true,
+        1,
+        "Implemented the first change.",
+    );
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "AUTONOMOUS MODE") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "concrete next steps") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "at least three concrete improvements") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Repeat this cycle indefinitely") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "Implemented the first change.") != null);
+}
+
+test "autonomous retry prompt preserves the previous summary" {
+    const prompt = try buildAutonomousRetryPrompt(std.testing.allocator, "The test command failed.", 2);
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expect(std.mem.find(u8, prompt, "retry 2") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "The test command failed.") != null);
+}
+
+test "autonomous mode rejects no-save sessions" {
+    const options = parseOptionsWithStdin(
+        std.testing.allocator,
+        &.{ "--no-save", "--auto-next-steps", "hello" },
+        .tty,
+    );
+    try std.testing.expectError(error.InvalidAskArgs, options);
 }
 
 test "parse options accepts full access aliases and rejects permission flag conflicts" {
@@ -5620,7 +5789,7 @@ test "headless yolo warning precedes startup configuration diagnostics" {
         u8,
         stderr_capture.bytes.items,
         permissions.yolo_warning_text ++ "\n" ++
-            "fx ask: config user: malformed_settings\n",
+            "di ask: config user: malformed_settings\n",
     ));
 }
 
@@ -5990,7 +6159,7 @@ test "stdin read failure has distinct text and JSON output contracts" {
     );
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
     try std.testing.expectEqualStrings(
-        "fx ask: failed to read prompt from stdin\n",
+        "di ask: failed to read prompt from stdin\n",
         stderr_capture.bytes.items,
     );
 
@@ -6049,7 +6218,7 @@ test "cli ask admits default-safe web_search without a rule" {
     try std.testing.expectEqual(ToolPermissionDecision.once, (try requestToolPermissionOutcome(&ctx, arena, call, .auto, &.{}, &.{})).decision);
 }
 
-test "fx ask default user commands require configured authority or review" {
+test "di ask default user commands require configured authority or review" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6095,7 +6264,7 @@ test "fx ask default user commands require configured authority or review" {
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_unavailable, automatic.denial_reason.?);
 }
 
-test "fx ask automatic review observes worker cancellation" {
+test "di ask automatic review observes worker cancellation" {
     const Provider = struct {
         fn review(
             _: ?*anyopaque,
@@ -6670,7 +6839,7 @@ test "fx ask auto mode applies automatic clear and caution without a prompt" {
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
-test "fx ask terminal permission prompt approves and denies run_command" {
+test "di ask terminal permission prompt approves and denies run_command" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6719,7 +6888,7 @@ test "fx ask terminal permission prompt approves and denies run_command" {
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
-test "fx ask permission attention fires once after a prompt is published" {
+test "di ask permission attention fires once after a prompt is published" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6762,7 +6931,7 @@ test "fx ask permission attention fires once after a prompt is published" {
     try std.testing.expectEqual(@as(usize, 1), capture.calls);
 }
 
-test "fx ask bell writes only to TTY stderr" {
+test "di ask bell writes only to TTY stderr" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -6784,7 +6953,7 @@ test "fx ask bell writes only to TTY stderr" {
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
-test "fx ask registers notification handlers only when configured" {
+test "di ask registers notification handlers only when configured" {
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(std.testing.allocator);
     var stderr_capture: TestCapture = .{};
@@ -6813,7 +6982,7 @@ test "fx ask registers notification handlers only when configured" {
     try std.testing.expect(enabled.lifecycle_view.hasAttentionRequired());
 }
 
-test "fx ask captured and quiet permission paths bypass terminal prompt" {
+test "di ask captured and quiet permission paths bypass terminal prompt" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6852,7 +7021,7 @@ test "fx ask captured and quiet permission paths bypass terminal prompt" {
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "noninteractive_permission_prompt_unavailable") != null);
 }
 
-test "fx ask permission prompt policy requires explicit captured-mode opt in and TTY stdin" {
+test "di ask permission prompt policy requires explicit captured-mode opt in and TTY stdin" {
     const Case = struct {
         output_mode: OutputMode,
         prompt_permissions: bool,
@@ -6883,7 +7052,7 @@ test "fx ask permission prompt policy requires explicit captured-mode opt in and
     }
 }
 
-test "fx ask captured permission prompt opt in uses the existing prompter" {
+test "di ask captured permission prompt opt in uses the existing prompter" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -6931,7 +7100,7 @@ test "fx ask captured permission prompt opt in uses the existing prompter" {
     try std.testing.expectEqual(@as(usize, 2), prompt.calls);
 }
 
-test "fx ask terminal permission prompt propagates prompt hook errors" {
+test "di ask terminal permission prompt propagates prompt hook errors" {
     const FailingPrompt = struct {
         fn prompt(
             _: ?*anyopaque,
@@ -6966,7 +7135,7 @@ test "fx ask terminal permission prompt propagates prompt hook errors" {
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "noninteractive_permission_prompt_unavailable") == null);
 }
 
-test "fx ask prepared file mutation callback preserves terminal permission prompt" {
+test "di ask prepared file mutation callback preserves terminal permission prompt" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7037,7 +7206,7 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
 }
 
-test "fx ask auto mode uses automatic allow for external prepared file mutation" {
+test "di ask auto mode uses automatic allow for external prepared file mutation" {
     const FakeClassifier = struct {
         calls: usize = 0,
         root_text: []const u8 = "",
@@ -7113,7 +7282,7 @@ test "fx ask auto mode uses automatic allow for external prepared file mutation"
     try std.testing.expectEqualStrings(target_path, authorization.input.path());
 }
 
-test "fx ask preserves CLI headless blocker diagnostics" {
+test "di ask preserves CLI headless blocker diagnostics" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7153,10 +7322,10 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     ));
     const expected_configured_stderr = try std.fmt.allocPrint(
         arena,
-        "fx ask: permission required by configured rule\n" ++
-            "fx ask: blocked action: {s}\n" ++
-            "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
-            "fx ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
+        "di ask: permission required by configured rule\n" ++
+            "di ask: blocked action: {s}\n" ++
+            "di ask: reason=noninteractive_permission_prompt_unavailable\n" ++
+            "di ask: rerun in the interactive shell to approve this action, or add a narrow matching permission rule before retrying\n",
         .{configured_label},
     );
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
@@ -7183,10 +7352,10 @@ test "fx ask preserves CLI headless blocker diagnostics" {
     ));
     const expected_approval_stderr = try std.fmt.allocPrint(
         arena,
-        "fx ask: permission required for tool execution in noninteractive mode\n" ++
-            "fx ask: blocked action: {s}\n" ++
-            "fx ask: reason=noninteractive_permission_prompt_unavailable\n" ++
-            "fx ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
+        "di ask: permission required for tool execution in noninteractive mode\n" ++
+            "di ask: blocked action: {s}\n" ++
+            "di ask: reason=noninteractive_permission_prompt_unavailable\n" ++
+            "di ask: rerun with --auto to review this exact action automatically, or use the interactive shell to approve it\n",
         .{approval_label},
     );
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
@@ -7511,7 +7680,7 @@ test "fx ask renders one-off resume denial in text and JSON modes" {
         } else {
             try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
             try std.testing.expectEqualStrings(
-                "fx ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
+                "di ask: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n",
                 stderr_capture.bytes.items,
             );
         }
@@ -7633,7 +7802,7 @@ test "saved ask classifies unsafe store failure by request mode" {
     try fresh_ctx.initializeSessionStores();
 
     try std.testing.expectEqualStrings(
-        "fx ask: warning: session persistence unavailable; error=SessionPathUnsafe; continuing without saving\n",
+        "di ask: warning: session persistence unavailable; error=SessionPathUnsafe; continuing without saving\n",
         stderr_capture.bytes.items,
     );
     try expectAskSessionStoresUnavailable(&fresh_ctx);
@@ -8223,7 +8392,7 @@ test "cli json records built in web_search completion" {
     try std.testing.expectEqual(@as(i64, 42), web_search.get("duration_ms").?.integer);
 }
 
-test "fx ask JSON captures HTTP 413 prompt-too-long blocker" {
+test "di ask JSON captures HTTP 413 prompt-too-long blocker" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8238,7 +8407,7 @@ test "fx ask JSON captures HTTP 413 prompt-too-long blocker" {
     );
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "fx ask: HTTP 413: provider payload rejected") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "di ask: HTTP 413: provider payload rejected") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
     defer parsed.deinit();
@@ -8249,7 +8418,7 @@ test "fx ask JSON captures HTTP 413 prompt-too-long blocker" {
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("exit_code").?.integer);
 }
 
-test "fx ask formats restricted-provider HTTP errors without raw JSON" {
+test "di ask formats restricted-provider HTTP errors without raw JSON" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8264,7 +8433,7 @@ test "fx ask formats restricted-provider HTTP errors without raw JSON" {
     );
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "fx ask: API access denied · HTTP 403 · Provider: wafer") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "di ask: API access denied · HTTP 403 · Provider: wafer") != null);
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "{\"error\"") == null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
@@ -8275,7 +8444,7 @@ test "fx ask formats restricted-provider HTTP errors without raw JSON" {
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("exit_code").?.integer);
 }
 
-test "fx ask text and JSON share the selected auth failure facts" {
+test "di ask text and JSON share the selected auth failure facts" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -8291,7 +8460,7 @@ test "fx ask text and JSON share the selected auth failure facts" {
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings(
-        "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
+        "di ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
         stderr_capture.bytes.items,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
@@ -8552,7 +8721,7 @@ test "indeterminate saved auth cleanup keeps the primary result and session id" 
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(probe.borrowers_detached);
     try std.testing.expectEqualStrings(
-        "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
+        "di ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
         stderr_capture.bytes.items,
     );
     var parsed = try std.json.parseFromSlice(
@@ -8578,7 +8747,7 @@ test "indeterminate saved auth cleanup keeps the primary result and session id" 
     try std.testing.expectEqual(@as(usize, 0), loaded.history.len);
 }
 
-test "fx ask JSON records permission-denied tool calls as error status" {
+test "di ask JSON records permission-denied tool calls as error status" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8784,7 +8953,7 @@ test "fx ask JSON permission-denied capture is best effort under allocation fail
     try std.testing.expectEqual(@as(usize, 0), ctx.tool_call_records.items.len);
 }
 
-test "fx ask JSON captures parallel tool results without corrupting records" {
+test "di ask JSON captures parallel tool results without corrupting records" {
     const alloc = std.heap.c_allocator;
     const thread_count = 16;
     const calls_per_thread = 256;
@@ -8922,7 +9091,7 @@ fn checkAskJsonCaptureAllocationFailures(alloc: Allocator) !void {
     );
 }
 
-test "fx ask JSON capture cleans up every allocation failure" {
+test "di ask JSON capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         checkAskJsonCaptureAllocationFailures,
@@ -8930,7 +9099,7 @@ test "fx ask JSON capture cleans up every allocation failure" {
     );
 }
 
-test "fx ask JSON records ask_user_question text for matching assertions" {
+test "di ask JSON records ask_user_question text for matching assertions" {
     const alloc = std.testing.allocator;
     const records = try alloc.alloc(ToolCallRecord, 1);
     records[0] = .{
@@ -8954,7 +9123,7 @@ test "fx ask JSON records ask_user_question text for matching assertions" {
     try std.testing.expectEqualStrings("What is your GitHub handle?", tool_call.get("question").?.string);
 }
 
-test "fx ask JSON clips ask_user_question text at a UTF-8 boundary" {
+test "di ask JSON clips ask_user_question text at a UTF-8 boundary" {
     const alloc = std.testing.allocator;
     var question_bytes: [257]u8 = undefined;
     @memset(question_bytes[0..255], 'a');
@@ -9011,7 +9180,7 @@ test "json run with missing API key prints diagnostic then final object" {
     const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyStartup));
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expectEqualStrings("fx ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
+    try std.testing.expectEqualStrings("di ask: " ++ credentials.missing_credential_message ++ "\n", stderr_capture.bytes.items);
     try std.testing.expectEqualStrings(
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"MissingCredentials\"}\n",
         stdout_capture.bytes.items,
@@ -9227,7 +9396,7 @@ test "fx ask forwards its catalog and deduplicates repeated discovery warnings" 
     );
 }
 
-test "fx ask carries resolved auto mode and initial registry context into the queued prompt" {
+test "di ask carries resolved auto mode and initial registry context into the queued prompt" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -9249,7 +9418,7 @@ test "fx ask carries resolved auto mode and initial registry context into the qu
     );
 }
 
-test "default fx ask passes canonical image paths as initial context targets" {
+test "default di ask passes canonical image paths as initial context targets" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9287,7 +9456,7 @@ test "default fx ask passes canonical image paths as initial context targets" {
     try std.testing.expect(TestContextRegistryFixture.targets_match);
 }
 
-test "default fx ask omits disabled registry context without gathering" {
+test "default di ask omits disabled registry context without gathering" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -9305,7 +9474,7 @@ test "default fx ask omits disabled registry context without gathering" {
     try std.testing.expectEqual(@as(usize, 0), TestContextRegistryFixture.gather_calls);
 }
 
-test "default fx ask preserves project context gathering error mappings" {
+test "default di ask preserves project context gathering error mappings" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -9375,7 +9544,7 @@ test "quiet suppresses streaming while quiet json captures final output" {
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
-test "fx ask JSON recovery keeps stdout structured and reports progress on stderr" {
+test "di ask JSON recovery keeps stdout structured and reports progress on stderr" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);
@@ -9459,7 +9628,7 @@ test "fx ask JSON preserves partial output on prompt failure" {
     try std.testing.expectEqualStrings("", stderr_capture.bytes.items);
 }
 
-test "fx ask raw output still propagates prompt failure" {
+test "di ask raw output still propagates prompt failure" {
     const alloc = std.testing.allocator;
     var stdout_capture: TestCapture = .{};
     defer stdout_capture.deinit(alloc);

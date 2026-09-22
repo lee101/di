@@ -55,6 +55,7 @@ pub const Set = struct {
     gateway: Bundle,
     codex: Bundle,
     grok: Bundle,
+    openpaths: Bundle = .{},
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
     configured_fn: ?*const fn (*const @import("../config/configured_provider.zig").Definition) Bundle = null,
 
@@ -63,6 +64,7 @@ pub const Set = struct {
             .gateway => self.gateway,
             .codex => self.codex,
             .grok => self.grok,
+            .openpaths => self.openpaths,
             .configured => blk: {
                 const factory = self.configured_fn orelse break :blk .{};
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = self.definitions };
@@ -77,6 +79,7 @@ pub const Set = struct {
             .gateway = self.gateway.deferred_usage,
             .codex = self.codex.deferred_usage,
             .grok = self.grok.deferred_usage,
+            .openpaths = self.openpaths.deferred_usage,
         };
     }
 };
@@ -170,6 +173,9 @@ test "provider set selects each provider's complete route" {
     try std.testing.expect(providers.select(.codex).model_catalog.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(providers.select(.grok).permission_reviewer.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
     try std.testing.expect(providers.select(.codex).agent_stream_or_unavailable().context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    providers.openpaths = gateway;
+    try std.testing.expect(providers.select(.openpaths).agent_stream.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
+    try std.testing.expect(providers.select(.openpaths).deferred_usage != null);
 
     providers.codex.model_catalog = null;
     try std.testing.expect(providers.select(.codex).model_catalog == null);

@@ -1,0 +1,16 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build output and unit-test fixture tokens"
+paths = [
+  '''^\.zig-cache/''',
+  '''^zig-out/''',
+]
+regexTarget = "line"
+regexes = [
+  '''abcdefghijklmnop''',
+  '''invalid-utf8-proof-key''',
+  '''PROBE_TOKEN=0123456789abcdef''',
+  '''TOOL_DATA_TOKEN=0123456789abcdef01234567''',
+]

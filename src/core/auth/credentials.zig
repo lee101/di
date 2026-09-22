@@ -58,6 +58,8 @@ pub const CatalogPublicOnly = union(enum) {
 pub const CatalogPublicOnlyReason = std.meta.Tag(CatalogPublicOnly);
 
 pub const CatalogAuthenticatedSource = enum {
+    openpaths_api_key,
+    openrouter_api_key,
     vercel_oidc_token,
     ai_gateway_api_key,
     fx_login,
@@ -67,6 +69,8 @@ pub const CatalogAuthenticatedSource = enum {
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
+            .openpaths_api_key => .openpaths_api_key,
+            .openrouter_api_key => .openrouter_api_key,
             .vercel_oidc_token => .vercel_oidc_token,
             .ai_gateway_api_key => .ai_gateway_api_key,
             .fx_login => .fx_login,
@@ -215,6 +219,8 @@ pub fn catalogAccessForCredentialAndAccount(
     const selected_source = source orelse return .{ .public_only = .no_credential };
     if (selected_source == .host_managed) return .host_managed;
     const authenticated_source: CatalogAuthenticatedSource = switch (selected_source) {
+        .openpaths_api_key => .openpaths_api_key,
+        .openrouter_api_key => .openrouter_api_key,
         .vercel_oidc_token => .vercel_oidc_token,
         .ai_gateway_api_key => .ai_gateway_api_key,
         .stored_key => .stored_key,
@@ -234,18 +240,20 @@ pub fn catalogAccessForCredentialAndAccount(
         .authenticated = .{
             .source = authenticated_source,
             .credential = credential,
-            .team_context = if (authenticated_source == .chatgpt_subscription or authenticated_source == .grok_subscription) null else team_context,
+            .team_context = if (authenticated_source == .chatgpt_subscription or
+                authenticated_source == .grok_subscription or
+                authenticated_source == .openpaths_api_key or
+                authenticated_source == .openrouter_api_key) null else team_context,
             .account_id = if (authenticated_source == .grok_subscription) account_id else null,
         },
     };
 }
-
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
 pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
-/// fx login session is refreshed first.
+/// di login session is refreshed first.
 pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
@@ -339,7 +347,7 @@ pub const StoredKeyReadStatus = enum {
     unavailable,
 };
 
-/// Why the fx login produced no credential. Only meaningful once resolution has
+/// Why the di login produced no credential. Only meaningful once resolution has
 /// reached the fx-login step and it stayed silent. `unavailable` means the
 /// session could not be loaded or its refresh failed, which is different from
 /// having no session at all: the login exists and may still be repairable.
@@ -380,6 +388,23 @@ pub fn resolveForProvider(
     provider: model_provider.ProviderId,
     preferred: ?Source,
 ) !Resolution {
+    if (provider == .openpaths) {
+        const ordered = [_]Source{ .openpaths_api_key, .openrouter_api_key };
+        if (preferred) |source| {
+            for (ordered) |candidate| {
+                if (candidate != source) continue;
+                if (try loadSource(alloc, transport, secret_store, source)) |credential| {
+                    return .{ .credential = credential };
+                }
+            }
+        }
+        for (ordered) |source| {
+            if (try loadSource(alloc, transport, secret_store, source)) |credential| {
+                return .{ .credential = credential };
+            }
+        }
+        return .{};
+    }
     if (provider == .configured) {
         var registry = try @import("../config/config_runtime.zig").loadConfiguredProviders(alloc);
         defer registry.deinit(alloc);
@@ -496,7 +521,7 @@ fn loadFxLoginForPrecedence(
     };
 }
 
-/// `loadSource` always refreshes an expired fx login, which `.stored` mode
+/// `loadSource` always refreshes an expired di login, which `.stored` mode
 /// forbids: a diagnostic must not rewrite the session file or make an OAuth
 /// request. Honour the mode for the preferred source too.
 fn loadPreferredSource(
@@ -530,6 +555,8 @@ pub fn loadSource(
     source: Source,
 ) !?Credential {
     return switch (source) {
+        .openpaths_api_key => loadEnvCredential(alloc, "OPENPATHS_API_KEY", source),
+        .openrouter_api_key => loadEnvCredential(alloc, "OPENROUTER_API_KEY", source),
         .vercel_oidc_token => loadEnvCredential(alloc, "VERCEL_OIDC_TOKEN", source),
         .ai_gateway_api_key => loadEnvCredential(alloc, "AI_GATEWAY_API_KEY", source),
         .fx_login => loadFxLoginCredential(alloc, transport),
@@ -547,6 +574,8 @@ pub fn sourceExists(
 ) !bool {
     try requireSourceStorage(source);
     return switch (source) {
+        .openpaths_api_key => nonEmptyEnvValue("OPENPATHS_API_KEY") != null,
+        .openrouter_api_key => nonEmptyEnvValue("OPENROUTER_API_KEY") != null,
         .vercel_oidc_token => nonEmptyEnvValue("VERCEL_OIDC_TOKEN") != null,
         .ai_gateway_api_key => nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null,
         .fx_login => blk: {
@@ -604,6 +633,14 @@ pub fn sourcePresence(
         else
             .missing,
         .ai_gateway_api_key => if (nonEmptyEnvValue("AI_GATEWAY_API_KEY") != null)
+            .present
+        else
+            .missing,
+        .openpaths_api_key => if (nonEmptyEnvValue("OPENPATHS_API_KEY") != null)
+            .present
+        else
+            .missing,
+        .openrouter_api_key => if (nonEmptyEnvValue("OPENROUTER_API_KEY") != null)
             .present
         else
             .missing,
@@ -906,9 +943,11 @@ fn credentialRefreshAfterMs(expires_at_ms: i64, refreshed_at_ms: ?i64) i64 {
 
 pub fn sourceLabel(source: Source) []const u8 {
     return switch (source) {
+        .openpaths_api_key => "OPENPATHS_API_KEY",
+        .openrouter_api_key => "OPENROUTER_API_KEY",
         .vercel_oidc_token => "VERCEL_OIDC_TOKEN",
         .ai_gateway_api_key => "AI_GATEWAY_API_KEY",
-        .fx_login => "fx login",
+        .fx_login => "di login",
         .stored_key => "stored API key (" ++ stored_key_backend_label ++ ")",
         .chatgpt_subscription => "Codex subscription",
         .grok_subscription => "Grok subscription",
@@ -930,8 +969,8 @@ test "stored key label discloses the backend that answered" {
 }
 
 test "missing credential messages use surface commands in preferred order" {
-    const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
+    const cli_login = std.mem.find(u8, missing_credential_message, "di login").?;
+    const cli_setup = std.mem.find(u8, missing_credential_message, "di setup").?;
     const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
     try std.testing.expect(cli_login < cli_setup);
@@ -995,7 +1034,7 @@ test "catalog access isolates public and authenticated provider credentials" {
     try std.testing.expect(rejected.teamContext() == null);
 }
 
-test "selected fx login authorizes its team model catalog" {
+test "selected di login authorizes its team model catalog" {
     var login = Credential{
         .token = try std.testing.allocator.dupe(u8, "login-token"),
         .source = .fx_login,
@@ -1010,7 +1049,7 @@ test "selected fx login authorizes its team model catalog" {
     try std.testing.expectEqualStrings("team_123", access.teamContext().?);
 }
 
-test "fx login catalog access requires a fresh credential and selected team" {
+test "di login catalog access requires a fresh credential and selected team" {
     var login = Credential{
         .token = try std.testing.allocator.dupe(u8, "login-token"),
         .source = .fx_login,
@@ -1255,7 +1294,7 @@ test "a remembered choice outranks the environment" {
     try std.testing.expectEqualStrings("api-key", credential.token);
 }
 
-test "a remembered fx login never refreshes in stored mode" {
+test "a remembered di login never refreshes in stored mode" {
     const alloc = std.testing.allocator;
     const env = try CredentialTestEnv.install(alloc, &.{});
     defer env.deinit();
@@ -1461,7 +1500,7 @@ test "a failed fx-login refresh is still reported when nothing else resolves" {
     try std.testing.expectEqual(StoredKeyReadStatus.not_found, resolution.stored_key_status);
 }
 
-/// A HOME holding an fx login whose session is expired and whose refresh token
+/// A HOME holding an di login whose session is expired and whose refresh token
 /// the issuer rejects, which is what an expired or revoked login looks like on
 /// disk. Paired with `oauth_transport.unavailable_provider`, the refresh fails.
 const ExpiredFxLoginFixture = struct {
