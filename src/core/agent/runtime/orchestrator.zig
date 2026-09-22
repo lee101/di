@@ -3224,6 +3224,44 @@ fn filterMaterializedProviderCalls(
     return .{ .calls = filtered, .removed = calls.len - keep_count };
 }
 
+const ParallelSubagentCompletionPublisher = struct {
+    deps: *const AgentRuntimeDeps,
+    turn_id: u64,
+    advertised_dynamic_tool_names: []const []const u8,
+    step_ctx: debug_trace.TraceContext,
+
+    fn notify(
+        raw: *anyopaque,
+        arena: Allocator,
+        call: ToolCall,
+        attempt: runtime_parallel_execution.ParallelToolAttempt,
+        _: usize,
+    ) void {
+        const self: *ParallelSubagentCompletionPublisher = @ptrCast(@alignCast(raw));
+        switch (attempt) {
+            .completed => |result| {
+                _ = runtime_tool_presentation.publishSubagentCompletionPreview(
+                    self.deps,
+                    arena,
+                    self.turn_id,
+                    call,
+                    result.execution,
+                    self.advertised_dynamic_tool_names,
+                ) catch |err| {
+                    debug_trace.eventf(
+                        "subagent",
+                        "parallel_completion_preview_failed",
+                        self.step_ctx,
+                        "call_id={s} error={s}",
+                        .{ call.id, @errorName(err) },
+                    );
+                };
+            },
+            .cancelled => {},
+        }
+    }
+};
+
 fn finishPendingParallelCancelled(
     deps: *const AgentRuntimeDeps,
     provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
@@ -10415,6 +10453,16 @@ fn processQueuedPromptLoop(
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
                     };
+                    var completion_publisher = ParallelSubagentCompletionPublisher{
+                        .deps = deps,
+                        .turn_id = turn_id,
+                        .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
+                        .step_ctx = step_ctx,
+                    };
+                    const attempt_observer: ?runtime_parallel_execution.ParallelAttemptObserver = if (parallel_group.kind == .subagent)
+                        .{ .ctx = &completion_publisher, .notify = ParallelSubagentCompletionPublisher.notify }
+                    else
+                        null;
                     if (comptime host_target.is_wasm) {
                         parallel_run = try runtime_parallel_execution.runSequentialCalls(arena, executable_calls.items, .{
                             .exec_ctx = &parallel_exec_ctx,
@@ -10422,6 +10470,7 @@ fn processQueuedPromptLoop(
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
                             .cancel_flag = config.cancel_flag,
+                            .attempt_observer = attempt_observer,
                         });
                     } else {
                         parallel_run = try runtime_parallel_execution.runParallelCalls(arena, executable_calls.items, .{
@@ -10430,6 +10479,7 @@ fn processQueuedPromptLoop(
                             .format_ctx = &parallel_exec_ctx,
                             .format_error = runtime_parallel_execution.parallelHookFormatError,
                             .cancel_flag = config.cancel_flag,
+                            .attempt_observer = attempt_observer,
                         });
                     }
                 }

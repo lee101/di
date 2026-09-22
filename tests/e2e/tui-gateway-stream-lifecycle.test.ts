@@ -5717,6 +5717,120 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
+    "parallel sibling subagent rows terminalize independently",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-parallel-subagent-rows-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+      const rootPrompt = "PARALLEL_SUBAGENT_ROW_FIXTURE";
+      const firstTask = "Check first sibling";
+      const secondTask = "Check second sibling";
+      let releaseFirst!: (response: Response) => void;
+      let releaseSecond!: (response: Response) => void;
+      const heldFirst = new Promise<Response>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const heldSecond = new Promise<Response>((resolve) => {
+        releaseSecond = resolve;
+      });
+      const started = new Set<string>();
+      let parentContinuations = 0;
+      const rowGateway = startDynamicFakeGateway((body) => {
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role: string; content: unknown }>;
+        };
+        const userText = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        if (userText.includes(firstTask) && !userText.includes(rootPrompt)) {
+          started.add("first");
+          return heldFirst;
+        }
+        if (userText.includes(secondTask) && !userText.includes(rootPrompt)) {
+          started.add("second");
+          return heldSecond;
+        }
+        const parts = request.prompt.flatMap((message) =>
+          Array.isArray(message.content) ? message.content : [],
+        );
+        const firstResult = parts.find((part) =>
+          part.type === "tool-result" && part.toolCallId === "parallel_row_first",
+        );
+        const secondResult = parts.find((part) =>
+          part.type === "tool-result" && part.toolCallId === "parallel_row_second",
+        );
+        if (firstResult && secondResult) {
+          parentContinuations += 1;
+          return fakeGatewayFinalText("PARALLEL_SUBAGENT_ROWS_FINISHED");
+        }
+        return fakeGatewaySse([
+          {
+            type: "tool-call",
+            toolCallId: "parallel_row_first",
+            toolName: "subagent",
+            input: { request: { action: "run", task: firstTask } },
+          },
+          {
+            type: "tool-call",
+            toolCallId: "parallel_row_second",
+            toolName: "subagent",
+            input: { request: { action: "run", task: secondTask } },
+          },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+          },
+        ]);
+      }, { classifierDecision: "clear" });
+      gateway = rowGateway;
+      const env = {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-parallel-subagent-row-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_DISABLE_KEYCHAIN: "1",
+        FX_SOUND: "0",
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_MODEL: MODEL,
+      };
+      session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
+      try {
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(rootPrompt);
+        await waitForCondition(() => started.size === 2, "both sibling subagents started");
+        await session.waitForText(`Subagent working · ${firstTask}`, TIMEOUT);
+        await session.waitForText(`Subagent working · ${secondTask}`, TIMEOUT);
+
+        releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
+        await session.waitForText(`Subagent finished · ${firstTask}`, TIMEOUT);
+        const partial = await session.captureFullScrollback();
+        expect(partial).toContain(`Subagent working · ${secondTask}`);
+        expect(partial).not.toContain(`Subagent finished · ${secondTask}`);
+        expect(parentContinuations).toBe(0);
+
+        releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
+        await session.waitForText("PARALLEL_SUBAGENT_ROWS_FINISHED", TIMEOUT);
+        const completed = await session.captureFullScrollback();
+        expect(countOccurrences(completed, `Subagent finished · ${firstTask}`)).toBe(1);
+        expect(countOccurrences(completed, `Subagent finished · ${secondTask}`)).toBe(1);
+        expect(parentContinuations).toBe(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      } finally {
+        releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
+        releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "subagent rows show task previews and named replies through resume",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-rows-")));

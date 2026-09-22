@@ -957,6 +957,53 @@ fn isShellWaitCall(arena: Allocator, call: ToolCall) Allocator.Error!bool {
     return std.mem.eql(u8, action, "wait");
 }
 
+pub fn publishSubagentCompletionPreview(
+    hooks: *const AgentRuntimeDeps,
+    arena: Allocator,
+    turn_id: u64,
+    call: ToolCall,
+    result: ToolExecutionResult,
+    advertised_dynamic_tool_names: []const []const u8,
+) !bool {
+    if (!std.mem.eql(u8, call.name, "subagent")) return false;
+    const base_line = if (try tooling_presentation.subagentStatusLine(
+        arena,
+        call,
+        result.model_output,
+    )) |line|
+        try std.fmt.allocPrint(arena, "● {s}", .{line})
+    else switch (result.status) {
+        .success => try hooks.describe_tool_action_completed(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            advertised_dynamic_tool_names,
+        ),
+        .failure => try hooks.describe_tool_action_denied(
+            hooks.ctx,
+            arena,
+            call,
+            null,
+            try tooling_presentation.subagentFailureLabel(
+                arena,
+                call,
+                result.model_output,
+            ),
+            advertised_dynamic_tool_names,
+        ),
+    };
+    const line = if (result.subagent_completion) |status|
+        renderedSubagentSummary(hooks, arena, base_line, status)
+    else
+        base_line;
+    try hooks.push_tool_lifecycle(hooks.ctx, .{ .progress = .{
+        .id = .{ .turn_id = turn_id, .call_id = call.id },
+        .text = line,
+    } });
+    return true;
+}
+
 pub fn finishExecutedToolStatus(
     hooks: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2353,6 +2400,40 @@ test "provider search completion keeps terminal result detail" {
         .terminal => |terminal| {
             try std.testing.expect(terminal.result != null);
             try std.testing.expect(std.mem.find(u8, terminal.result.?, "https://example.test/source") != null);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "subagent completion preview updates progress without publishing a terminal" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const call = ToolCall{
+        .id = "child",
+        .name = "subagent",
+        .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}",
+    };
+
+    try std.testing.expect(try publishSubagentCompletionPreview(
+        &hooks,
+        arena,
+        3,
+        call,
+        .{ .model_output = "{\"ok\":true,\"pending\":true}" },
+        &.{},
+    ));
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    switch (capture.events.items[0]) {
+        .progress => |progress| {
+            try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
+            try std.testing.expectEqualStrings("child", progress.id.call_id);
+            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
         },
         else => return error.TestExpectedEqual,
     }
