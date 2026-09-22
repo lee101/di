@@ -1524,6 +1524,9 @@ pub const Usage = struct {
     cache_read_tokens: ?u64 = null,
     cache_write_tokens: ?u64 = null,
     reasoning_tokens: ?u64 = null,
+    /// Provider-reported charge for this request when the transport settles
+    /// usage exactly (for example OpenRouter `usage.cost`).
+    cost: ?f64 = null,
 };
 
 /// Exact usage metadata returned by a completed provider stream. `model` is

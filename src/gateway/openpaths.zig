@@ -1159,17 +1159,22 @@ test "openpaths omits provider-executed advertised tools from requests" {
     try std.testing.expect(std.mem.find(u8, body, "web_search") == null);
 }
 
+const CostCapture = struct {
+    fn content(_: *anyopaque, _: []const u8) void {}
+};
+
 test "openpaths usage parsing captures cost and cache details" {
     const wire =
         "data: {\"id\":\"gen_9\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":194,\"completion_tokens\":2,\"cost\":0.95,\"prompt_tokens_details\":{\"cached_tokens\":100,\"cache_write_tokens\":10},\"completion_tokens_details\":{\"reasoning_tokens\":7}}}\n\n" ++
         "data: [DONE]\n\n";
     var reader: std.Io.Reader = .fixed(wire);
     var cancelled = std.atomic.Value(bool).init(false);
+    var capture: u8 = 0;
     const completion = try consumeSse(
         std.testing.allocator,
         &reader,
-        undefined,
-        null,
+        @ptrCast(&capture),
+        CostCapture.content,
         null,
         null,
         null,
@@ -1200,14 +1205,14 @@ test "openpaths usage parsing captures cost and cache details" {
 test "openpaths billing stays unset without provider-reported cost" {
     const usage = types.Usage{ .input_tokens = 3, .output_tokens = 4 };
     try std.testing.expect((try billingFromUsage(std.testing.allocator, "xiaomi/mimo-v2.6-pro", usage)) == null);
-    const invalid_cost = types.Usage{ .input_tokens = 3, .cost = std.math.nan(f64) };
-    try std.testing.expect(costField(blk: {
-        var object = std.json.ObjectMap.init(std.testing.allocator);
-        defer object.deinit();
-        try object.put("cost", .{ .float = -1.0 });
-        break :blk object;
-    }, "cost") == null);
-    _ = invalid_cost;
+
+    const negative = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"cost\":-1.0}", .{});
+    defer negative.deinit();
+    try std.testing.expect(costField(negative.value.object, "cost") == null);
+
+    const numeric_string = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"cost\":\"0.25\"}", .{});
+    defer numeric_string.deinit();
+    try std.testing.expectEqual(@as(?f64, 0.25), costField(numeric_string.value.object, "cost"));
 }
 
 test "openpaths rejects advertised tools without a usable schema" {
