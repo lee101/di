@@ -630,7 +630,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("di needs access to Vercel AI Gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );

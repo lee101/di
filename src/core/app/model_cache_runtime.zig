@@ -564,6 +564,11 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        // Browser/WASI hosts cannot spawn a background thread, including
+        // refreshes triggered after seeding the menu from its disk cache.
+        if (comptime @import("builtin").single_threaded) {
+            return self.loadCooperative(provider, access);
+        }
         self.ensureCachePath();
         self.rememberRefreshSource(provider, access);
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;

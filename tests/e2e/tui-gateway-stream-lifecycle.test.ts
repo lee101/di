@@ -4854,7 +4854,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(observed.stderr).toBe(
           stage === "baseline-silent"
             ? ""
-            : "fx: LifecycleReconciliationCollision\n",
+            : "di: LifecycleReconciliationCollision\n",
         );
         return;
       }
