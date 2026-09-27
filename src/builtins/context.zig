@@ -3607,6 +3607,10 @@ test "gateway_system_prompt: focused tools and live verification" {
 
 test "gateway_system_prompt: static guidance is capability-neutral" {
     inline for (&.{
+        "fuzzy_search",
+        "gemini_search",
+        "grep_files",
+        "glob_files",
         "run_command",
         "web_fetch",
         "web_search",
