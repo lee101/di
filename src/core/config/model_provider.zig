@@ -105,6 +105,26 @@ pub const NameKey = struct {
 /// not chosen one. Verified against the OpenPaths catalog.
 pub const openpaths_default_model = "xiaomi/mimo-v2.6-pro";
 
+/// Stealth Space Bunny Alpha is the current stealth route on the OpenRouter
+/// catalog. OpenRouter may retire or replace it without notice, so
+/// `model_fallback.zig` pairs it with the OpenPaths default.
+pub const openrouter_default_model = "stealth/space-bunny-alpha";
+
+/// Key order mirrors `credentials.resolveForProvider`, which tries the
+/// OpenPaths key before the OpenRouter key, so the stealth id leads only when
+/// the OpenRouter key is the sole route to the catalog.
+pub fn openpathsDefaultModel() []const u8 {
+    return openpathsDefaultModelFor(
+        hasNonEmptyEnv("OPENPATHS_API_KEY"),
+        hasNonEmptyEnv("OPENROUTER_API_KEY"),
+    );
+}
+
+fn openpathsDefaultModelFor(openpaths_key: bool, openrouter_key: bool) []const u8 {
+    if (!openpaths_key and openrouter_key) return openrouter_default_model;
+    return openpaths_default_model;
+}
+
 pub const ProviderSelection = struct {
     provider: ProviderId,
     model: []const u8,
@@ -202,10 +222,22 @@ pub fn usesGatewayAuxiliaries(provider: ProviderId) bool {
 /// API keys is present in the environment so a fresh install works with zero
 /// setup commands.
 pub fn defaultId() ProviderId {
-    if (hasNonEmptyEnv("OPENPATHS_API_KEY") or hasNonEmptyEnv("OPENROUTER_API_KEY")) {
-        return .openpaths;
-    }
+    return defaultIdFor(
+        hasNonEmptyEnv("OPENPATHS_API_KEY"),
+        hasNonEmptyEnv("OPENROUTER_API_KEY"),
+    );
+}
+
+fn defaultIdFor(openpaths_key: bool, openrouter_key: bool) ProviderId {
+    if (openpaths_key or openrouter_key) return .openpaths;
     return .gateway;
+}
+
+/// Provider that actually runs once settings, launch flags, and the environment
+/// have all had their say. Settings win; an unset provider falls back to the
+/// compiled default rather than to the gateway.
+pub fn effectiveProvider(configured: ?ProviderId) ProviderId {
+    return configured orelse defaultId();
 }
 
 fn hasNonEmptyEnv(name: []const u8) bool {
@@ -214,6 +246,23 @@ fn hasNonEmptyEnv(name: []const u8) bool {
 }
 test "openpaths default model is the MiMo pro id" {
     try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpaths_default_model);
+}
+
+test "stealth space bunny leads only when the OpenRouter key is the sole route" {
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModelFor(false, true));
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(true, true));
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(true, false));
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(false, false));
+}
+
+test "an unconfigured provider falls back to the compiled default" {
+    try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(true, false));
+    try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(false, true));
+    try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(true, true));
+    try std.testing.expectEqual(ProviderId.gateway, defaultIdFor(false, false));
+    try std.testing.expectEqual(defaultId(), effectiveProvider(null));
+    try std.testing.expectEqual(ProviderId.openpaths, effectiveProvider(.openpaths));
+    try std.testing.expectEqual(ProviderId.gateway, effectiveProvider(.gateway));
 }
 
 test "explicit providers authorize only their own credential origins" {

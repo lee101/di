@@ -2,6 +2,7 @@ const std = @import("std");
 const credentials = @import("credentials.zig");
 const browser_callback = @import("browser_callback.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
+const codex_cli_session = @import("codex_cli_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -404,10 +405,25 @@ pub fn logout() !chatgpt_session.DeleteOutcome {
     return mutation.delete();
 }
 
+/// Presence of either di's own profile session or an existing Codex CLI login.
+pub fn presence() host.SecretStorePresence {
+    return switch (chatgpt_session.presence()) {
+        .missing => codex_cli_session.presence(),
+        else => |value| value,
+    };
+}
+
 pub fn sourceExists(alloc: Allocator) !bool {
-    var session = (try chatgpt_session.load(alloc)) orelse return false;
+    var session = (try loadStoredSession(alloc)) orelse return false;
     defer session.deinit(alloc);
     return true;
+}
+
+/// Profile session, else a read-only view of an existing Codex CLI login. The
+/// CLI file stays untouched: only the write paths below adopt it.
+fn loadStoredSession(alloc: Allocator) !?chatgpt_session.Session {
+    if (try chatgpt_session.load(alloc)) |session| return session;
+    return codex_cli_session.load(alloc);
 }
 
 pub fn loadAccess(
@@ -416,20 +432,39 @@ pub fn loadAccess(
     mode: RefreshMode,
 ) !?Access {
     if (mode == .stored) {
-        var session = (try chatgpt_session.load(alloc)) orelse return null;
+        var session = (try loadStoredSession(alloc)) orelse return null;
         defer session.deinit(alloc);
         return takeAccess(&session);
     }
 
-    var mutation = (try chatgpt_session.beginExistingMutation()) orelse return null;
+    var mutation = (try beginAccessMutation(alloc)) orelse return null;
     defer mutation.deinit();
-    var session = (try mutation.load(alloc)) orelse return null;
+    var session = (try mutation.load(alloc)) orelse blk: {
+        // The Codex CLI login shares di's OAuth client, so its refresh token
+        // mints a usable session. di copies it into the profile store and
+        // refreshes there; the CLI keeps its own file.
+        var cli = (try codex_cli_session.load(alloc)) orelse return null;
+        mutation.save(alloc, cli) catch |err| {
+            cli.deinit(alloc);
+            return err;
+        };
+        break :blk cli;
+    };
     defer session.deinit(alloc);
 
     if (mode == .force or session.expired(io_mod.milliTimestamp())) {
         try refreshSession(alloc, transport, &mutation, &session);
     }
     return takeAccess(&session);
+}
+
+/// The existing profile store when di has one, otherwise a newly created store,
+/// but only when a Codex CLI login is waiting to be adopted.
+fn beginAccessMutation(alloc: Allocator) !?chatgpt_session.Mutation {
+    if (try chatgpt_session.beginExistingMutation()) |mutation| return mutation;
+    var cli = (try codex_cli_session.load(alloc)) orelse return null;
+    cli.deinit(alloc);
+    return try chatgpt_session.beginMutation();
 }
 
 fn takeAccess(session: *chatgpt_session.Session) Access {

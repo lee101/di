@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -235,6 +237,7 @@ function gatewayEnv(
 ) {
   return {
     HOME: home,
+    FX_PROVIDER: "gateway",
     AI_GATEWAY_API_KEY: "fake-file-paths-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -345,6 +348,154 @@ async function runTerminalToolScenario(args: {
 }
 
 describe("filesystem path handling", () => {
+  for (const scenario of ["search", "missing-index", "old-backend"] as const) {
+    test(`fuzzy_search ${scenario} uses bounded read-only zbed protocol`, async () => {
+      const root = createIsolatedRoot();
+      const backend = join(root.root, "zbed-fixture");
+      const query = "index; $(touch sentinel)";
+      writeFileSync(backend, `#!/bin/sh
+if [ "$1" = help ]; then
+  printf '%s\\n' '${scenario === "old-backend" ? "old search CLI" : "zbed-search-readonly-v1"}'
+  exit 0
+fi
+[ "$1" = search-readonly ] || exit 9
+[ "$#" -eq 8 ] || exit 10
+printf 'literal query=%s\\n' "$2"
+printf '%s\\n' 'src/example.zig:7 token refresh implementation'
+touch backend-searched
+`);
+      chmodSync(backend, 0o700);
+      if (scenario !== "missing-index") {
+        mkdirSync(join(root.workspace, ".zbed"));
+        writeFileSync(join(root.workspace, ".zbed", "index.bin"), "fixture index");
+      }
+      const gateway = startFakeGateway([
+        toolCall("fuzzy_fixture", "fuzzy_search", { query, limit: 7 }),
+        (body) => {
+          const output = toolResultOutput(body, "fuzzy_fixture");
+          if (scenario === "search") {
+            expect(output).toContain(`literal query=${query}`);
+            expect(output).toContain("src/example.zig:7 token refresh implementation");
+            expect(output).toContain("may be stale");
+          } else if (scenario === "old-backend") {
+            expect(output).toContain("does not advertise zbed-search-readonly-v1");
+          } else {
+            expect(output).toContain("never builds or refreshes one");
+          }
+          return finalText("fuzzy search handled");
+        },
+      ]);
+      try {
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Run the requested semantic search once."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home, {
+              FX_ZBED_BIN: backend,
+              FX_ZBED_MODEL_DIR: root.root,
+            }),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([{ name: "fuzzy_search", status: scenario === "search" ? "success" : "error" }]);
+        expect(gateway.remainingResponseCount()).toBe(0);
+        expect(existsSync(join(root.workspace, "sentinel"))).toBe(false);
+        expect(existsSync(join(root.workspace, "backend-searched"))).toBe(scenario === "search");
+        if (scenario === "missing-index") expect(existsSync(join(root.workspace, ".zbed"))).toBe(false);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT);
+  }
+
+  test.skipIf(!process.env.FX_E2E_ZBED_BIN || !process.env.FX_E2E_ZBED_MODEL_DIR)(
+    "fuzzy_search real backend finds an indexed concept without changing the index",
+    async () => {
+      const root = createIsolatedRoot();
+      const binary = process.env.FX_E2E_ZBED_BIN!;
+      const model = process.env.FX_E2E_ZBED_MODEL_DIR!;
+      const gateway = startFakeGateway([
+        toolCall("real_fuzzy", "fuzzy_search", { query: "authentication session tokens" }),
+        (body) => {
+          const output = toolResultOutput(body, "real_fuzzy");
+          expect(output).toContain("auth.txt:1");
+          expect(output).toContain("refreshes expired session tokens");
+          return finalText("semantic implementation found");
+        },
+      ]);
+      try {
+        writeFileSync(join(root.workspace, "auth.txt"), "User authentication refreshes expired session tokens.\n");
+        writeFileSync(join(root.workspace, "paint.txt"), "Paint the wall bright yellow with a roller.\n");
+        execFileSync(binary, ["index", root.workspace, "--model-dir", model], { stdio: "pipe" });
+        const indexPath = join(root.workspace, ".zbed", "index.bin");
+        const before = readFileSync(indexPath);
+        const result = await runFx(["ask", "--auto", "--json", "--no-save", "Find the authentication implementation."], {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, root.home, { FX_ZBED_BIN: binary, FX_ZBED_MODEL_DIR: model }),
+          timeoutMs: TIMEOUT,
+        });
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([{ name: "fuzzy_search", status: "success" }]);
+        expect(json.output).toBe("semantic implementation found");
+        expect(readFileSync(indexPath)).toEqual(before);
+        expect(gateway.remainingResponseCount()).toBe(0);
+        expect(result.stderr).not.toMatch(/panic|abort|error:/i);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, TIMEOUT,
+  );
+
+  test("shell search rewrite keeps hidden and ignored text matches", async () => {
+    const root = createIsolatedRoot();
+    const gateway = startFakeGateway([
+      toolCall("search_rewrite", "shell", { request: {
+        action: "run",
+        command: "grep -ranFH needle .",
+        profile: "clean",
+        yield_time_ms: 1000,
+      } }),
+      (body) => {
+        const output = toolResultOutput(body, "search_rewrite");
+        expect(output).toContain("./visible.txt:1:needle visible");
+        expect(output).toContain("./.hidden.txt:1:needle hidden");
+        expect(output).toContain("./ignored.txt:1:needle ignored");
+        return finalText("search verified");
+      },
+    ]);
+    try {
+      writeFileSync(join(root.workspace, "visible.txt"), "needle visible\n");
+      writeFileSync(join(root.workspace, ".hidden.txt"), "needle hidden\n");
+      writeFileSync(join(root.workspace, "ignored.txt"), "needle ignored\n");
+      writeFileSync(join(root.workspace, ".ignore"), "ignored.txt\n");
+      const result = await runFx(
+        ["ask", "--yolo", "--json", "--no-save", "Search the fixture once."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway, root.home),
+          timeoutMs: TIMEOUT,
+        },
+      );
+      const json = parseFxJson(result);
+      expect(json.tool_calls).toEqual([expect.objectContaining({
+        name: "shell", status: "success",
+        command_result: expect.objectContaining({
+          command: expect.stringContaining("command rg --no-config"),
+          exit_code: 0,
+        }),
+      })]);
+      expect(json.output).toBe("search verified");
+      expect(gateway.remainingResponseCount()).toBe(0);
+      expect(result.stderr).not.toMatch(/panic|abort|error:/i);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   for (const supportsImages of [true, false]) {
     test(
       supportsImages

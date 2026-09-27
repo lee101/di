@@ -542,7 +542,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
     let passed = false;
     try {
       const terminal = await f.launch(true);
-      const authMessage = "fx needs access to Vercel AI Gateway";
+      const authMessage = "di needs access to Vercel AI Gateway";
       async function authNotices(label: string) {
         await terminal.sendKeys("C-o");
         await terminal.waitForText("full detail", 5000);

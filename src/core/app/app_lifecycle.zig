@@ -1413,10 +1413,10 @@ fn configuredProviderSelection(
     settings: *const config_runtime.Settings,
     provider_override: ?model_provider.ProviderId,
 ) !model_provider.ProviderSelection {
-    const provider = provider_override orelse settings.provider orelse .gateway;
+    const provider = provider_override orelse model_provider.effectiveProvider(settings.provider);
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .openpaths => model_provider.openpaths_default_model,
+        .openpaths => model_provider.openpathsDefaultModel(),
         .codex => return error.CodexModelNotSelected,
         .grok => return error.GrokModelNotSelected,
         .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,

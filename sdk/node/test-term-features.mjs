@@ -78,7 +78,7 @@ async function command(text, expected) {
   await waitFor(() => grid().includes(expected), expected);
 }
 
-await waitFor(() => grid().includes("𝒇x"), "startup");
+await waitFor(() => grid().includes("di v"), "startup");
 runtime.write("clipboard draft");
 runtime.write("\x1b[97;9u\x1b[99;9u");
 await waitFor(() => clipboardWrites.length === 1, "composer copy");

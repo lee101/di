@@ -577,7 +577,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (io_mod.getenv("FX_MODEL")) |model_override| {
         if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+            const override_provider = model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider));
             sources.models.set(override_provider, .process_override) catch |err| switch (err) {
                 error.TooManyModelPreferences => debug_trace.logf(
                     "config",
@@ -624,7 +624,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
+        .model_source = sources.models.get(model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider))),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,

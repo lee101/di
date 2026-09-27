@@ -39,7 +39,7 @@ const NO_GATEWAY_AUTH = {
   VERCEL_OIDC_TOKEN: undefined,
 };
 const MISSING_AUTH_MESSAGE =
-  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+  "di needs access to Vercel AI Gateway. Run di login to sign in, di setup to use an API key, or set AI_GATEWAY_API_KEY.";
 const MODERN_MCP_FIXTURE = join(
   import.meta.dirname,
   "fixtures",
@@ -330,9 +330,9 @@ describe("cli: help", () => {
       expect(stdout).not.toContain("\x1b[");
       expect(stdout).not.toContain("\x1b]2;");
       expect(stdout).toStartWith(
-        `𝒇x v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
+        `di v${sourceVersion()}\nFast, native coding agent for the terminal.\n`,
       );
-      expect(stdout.match(/𝒇x/g) ?? []).toHaveLength(1);
+      expect(stdout.match(/^di v/g) ?? []).toHaveLength(1);
       expect(stdout).toContain("fx starts an interactive session by default.");
       expect(stdout).toContain("Commands:\n");
       expect(stdout).toContain("Run one noninteractive request");
@@ -378,17 +378,19 @@ describe("cli: help", () => {
         ...NO_GATEWAY_AUTH,
         FX_DISABLE_KEYCHAIN: "1",
       };
-      const expected = `fx ask
+      const expected = `di ask
 
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  di ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                      Automatically review unresolved permission requests
   --full-access               Disable fx permission checks
   --yolo                      Alias for --full-access
+  --auto-next-steps           Continue with the next logical implementation steps after each turn
+  --auto-next-idea            Brainstorm and implement follow-up improvements after each turn
   --model <id>                Override the model for this request
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
@@ -414,6 +416,7 @@ Operational progress and diagnostics are written to stderr. JSON \`output\` keep
 JSON usage sums reported main-agent input_tokens and output_tokens, including with --no-save; unreported counts are null. Nested usage and dollar spend are excluded.
 --system replaces only the built-in base prompt for this request; tool, skill, project, and runtime context still apply.
 With --prompt-permissions, JSON and quiet requests may prompt on stderr only when stdin is a TTY.
+Autonomous flags keep the saved session running until interrupted; they cannot be combined with --no-save.
 `;
 
       for (const alias of ["--help", "-h"]) {
@@ -454,7 +457,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  di acp [--model <id>] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--log-file <path>");
@@ -484,7 +487,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--log-file <path>]\n",
+          "usage: di acp [--model <id>] [--log-file <path>]\n",
         );
       }
     },
@@ -528,7 +531,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
     async () => {
       const r = await runFx(["--record"]);
       expect(r.code).not.toBe(0);
-      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.stderr).toContain("di: unknown subcommand: --record");
       expect(r.stderr).not.toContain("visual terminal capture:");
     },
     TIMEOUT,
@@ -708,12 +711,12 @@ describe("cli: status", () => {
     { name: "automatic Gateway", provider: "gateway", source: undefined, help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Codex preference", provider: "gateway", source: "chatgpt_subscription", help: MISSING_AUTH_MESSAGE },
     { name: "Gateway with a stale Grok preference", provider: "gateway", source: "grok_subscription", help: MISSING_AUTH_MESSAGE },
-    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "fx login is selected but unavailable. Run fx login to reconnect; no other credential was selected." },
-    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
-    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
-    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
-    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
-    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
+    { name: "an exact Gateway login", provider: "gateway", source: "fx_login", help: "di login is selected but unavailable. Run di login to reconnect; no other credential was selected." },
+    { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting di; no other credential was selected." },
+    { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting di; no other credential was selected." },
+    { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start di and open /provider to choose an available credential; no other credential was selected." },
+    { name: "Codex", provider: "codex", source: undefined, help: "di needs a Codex subscription login for this model. Run di login codex." },
+    { name: "Grok", provider: "grok", source: undefined, help: "di needs a Grok subscription login for this model. Run di login grok." },
   ]) {
     test(
       `status and doctor respect ${scenario.name} when credentials are missing`,
@@ -806,7 +809,7 @@ describe("cli: status", () => {
       writeFileSync(settingsPath, pinned);
       const status = await runFx(["status", "--json"], options);
       const help = JSON.parse(status.stdout).auth_help;
-      expect(help).toContain("fx login is selected but unavailable");
+      expect(help).toContain("di login is selected but unavailable");
       for (const resumed of [false, true]) {
         for (const json of [false, true]) {
           const result = await runFx([
@@ -835,7 +838,7 @@ describe("cli: status", () => {
   }, TIMEOUT);
 
   test(
-    "status and doctor share fx login source, team, and refreshability",
+    "status and doctor share di login source, team, and refreshability",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-auth-"));
       try {
@@ -861,14 +864,14 @@ describe("cli: status", () => {
         expect(doctorText.code).toBe(0);
         expect(doctorJsonResult.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "di login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
         expect(JSON.parse(statusJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         expect(JSON.parse(doctorJsonResult.stdout.trim())).toMatchObject(expectedAuth);
         for (const output of [statusText.stdout, doctorText.stdout]) {
-          expect(output).toContain("auth=fx login");
+          expect(output).toContain("auth=di login");
           expect(output).toContain("auth_refreshable=true");
           expect(output).toContain("team=vercel-labs");
         }
@@ -918,7 +921,7 @@ describe("cli: status", () => {
         expect(status.code).toBe(0);
         expect(doctor.code).toBe(0);
         const expectedAuth = {
-          auth: "fx login",
+          auth: "di login",
           auth_refreshable: true,
           team: "vercel-labs",
         };
@@ -1143,16 +1146,16 @@ describe("cli: status", () => {
         expect(first.permission_mode).toBe("auto");
         expect(first.agent_step_limit).toBe(7);
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=model",
+          "di: config project: ignored_project_user_only_setting; key=model",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission_mode",
+          "di: config project: ignored_project_user_only_setting; key=permission_mode",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=permission",
+          "di: config project: ignored_project_user_only_setting; key=permission",
         );
         expect(status.stderr).toContain(
-          "fx: config project: ignored_project_user_only_setting; key=statusLine",
+          "di: config project: ignored_project_user_only_setting; key=statusLine",
         );
         expect(status.stderr).not.toContain("danger");
 
@@ -1217,7 +1220,7 @@ describe("cli: status", () => {
         expect(Date.now() - userStartedAt).toBeLessThan(3_000);
         expect(user.code).toBe(0);
         expect(JSON.parse(user.stdout)).toMatchObject({ kind: "status" });
-        expect(user.stderr).toContain("fx: config user: durable_path_unsafe");
+        expect(user.stderr).toContain("di: config user: durable_path_unsafe");
 
         rmSync(join(fxDir, "settings.json"));
         expect(spawnSync("mkfifo", [join(workspace, ".fx.json")]).status).toBe(0);
@@ -1230,7 +1233,7 @@ describe("cli: status", () => {
         expect(Date.now() - projectStartedAt).toBeLessThan(3_000);
         expect(project.code).toBe(0);
         expect(JSON.parse(project.stdout)).toMatchObject({ kind: "status" });
-        expect(project.stderr).toContain("fx: config project: durable_path_unsafe");
+        expect(project.stderr).toContain("di: config project: durable_path_unsafe");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -1747,7 +1750,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of di.\n");
         expect(logout.stderr).toBe("");
         expect(existsSync(authPath)).toBe(false);
         expect(issuer.requests).toEqual([
@@ -1801,7 +1804,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of di.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
@@ -1836,7 +1839,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of di.\n");
         expect(catcher.requests).toEqual([]);
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
@@ -1873,7 +1876,7 @@ describe("cli: logout", () => {
         });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of di.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
@@ -1917,10 +1920,10 @@ describe("cli: logout", () => {
         expect(logout.code).toBe(1);
         expect(logout.stdout).toBe("");
         expect(logout.stderr).toBe(
-          "fx logout: failed to durably remove saved fx login\n",
+          "di logout: failed to durably remove saved di login\n",
         );
         expect(existsSync(authPath)).toBe(true);
-        expect(JSON.parse(status.stdout).auth).toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).toBe("di login");
         expect(issuer.requests).toEqual([]);
       } finally {
         chmodSync(fxDir, 0o700);
@@ -1950,7 +1953,7 @@ describe("cli: logout", () => {
 
         const logout = await runFx(["logout"], { env });
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("Signed out of fx.\n");
+        expect(logout.stdout).toBe("Signed out of di.\n");
         expect(logout.stderr).toBe(
           "Warning: signed out locally, but the remote session could not be revoked.\n",
         );
@@ -2031,7 +2034,7 @@ describe("cli: logout", () => {
         const status = await runFx(["status", "--json"], { env });
 
         expect(logout.code).toBe(0);
-        expect(logout.stdout).toBe("No fx login session found.\n");
+        expect(logout.stdout).toBe("No di login session found.\n");
         expect(logout.stderr).toBe("");
         expect(JSON.parse(status.stdout)).toMatchObject({
           auth: "AI_GATEWAY_API_KEY",
@@ -2089,7 +2092,7 @@ describe("cli: logout", () => {
         expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
         expect(stored.status).toBe(0);
         expect(stored.stdout.trim()).toBe(keychainToken);
-        expect(JSON.parse(status.stdout).auth).not.toBe("fx login");
+        expect(JSON.parse(status.stdout).auth).not.toBe("di login");
         expect(logout.stdout).not.toContain(keychainToken);
         expect(status.stdout).not.toContain(keychainToken);
       } finally {
@@ -2108,7 +2111,7 @@ describe("cli: logout", () => {
 
 describe("cli: setup", () => {
   test(
-    "fx setup is a top-level command and fails cleanly when Keychain is disabled",
+    "di setup is a top-level command and fails cleanly when Keychain is disabled",
     async () => {
       const r = await runFx(["setup"], {
         env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" },
@@ -2121,7 +2124,7 @@ describe("cli: setup", () => {
   );
 
   test(
-    "fx setup never invokes the configured Vercel CLI",
+    "di setup never invokes the configured Vercel CLI",
     async () => {
       const runId = `${process.pid}-${Date.now()}`;
       const fakeDir = mkdtempSync(join(tmpdir(), "fx-e2e-vercel-cli-"));
@@ -3463,7 +3466,7 @@ describe("cli: models", () => {
         "requested_access=public_only credential_source=none effective_access=public_only public_only_reason=no_credential anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "uses the selected fx login team catalog",
+      name: "uses the selected di login team catalog",
       seedFxLogin: true,
       expiredFxLogin: false,
       authEnv: {},
@@ -3474,7 +3477,7 @@ describe("cli: models", () => {
         "requested_access=authenticated credential_source=fx_login effective_access=authenticated public_only_reason=none anonymous_fallback=false outcome=loaded failure_category=none http_status=none retryable=none",
     },
     {
-      name: "refreshes an expired fx login before loading the selected team catalog",
+      name: "refreshes an expired di login before loading the selected team catalog",
       seedFxLogin: true,
       expiredFxLogin: true,
       authEnv: {},
@@ -3900,7 +3903,7 @@ describe("cli: interactive startup", () => {
           const r = await runFx(args, { env: { HOME: home } });
           expect(r.code).toBe(1);
           expect(r.stdout).toBe("");
-          expect(r.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+          expect(r.stderr).toBe("di requires an interactive terminal (TTY).\n");
           expect(readdirSync(home)).toEqual([]);
         } finally {
           rmSync(home, { recursive: true, force: true });
@@ -4091,7 +4094,7 @@ describe("cli: ask success", () => {
       expect(textResult.code).toBe(1);
       expect(textResult.stdout).toBe("");
       expect(textResult.stderr).toBe(
-        "fx ask: prompt exceeds the local input safety limit\n",
+        "di ask: prompt exceeds the local input safety limit\n",
       );
 
       const jsonResult = await runFx(["ask", "--json", "--auto", "--no-save"], {
@@ -4156,7 +4159,7 @@ describe("cli: ask success", () => {
         expect(
           result.stderr
             .replace(
-              /fx ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
+              /di ask: warning: skipped \d+ invalid or unreadable skill candidates?; relaunch with FX_TRACE=1 to write a trace log\n/g,
               "",
             )
             .replace(
@@ -4934,10 +4937,10 @@ describe("cli: error handling", () => {
           expect(rejected.code).toBe(1);
           expect(rejected.stdout).toBe("");
           expect(rejected.stderr).toContain(
-            "fx ask: --no-save cannot be used with --resume or --resume-id",
+            "di ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -4963,7 +4966,7 @@ describe("cli: workspace access", () => {
         { env: enabled },
       );
       expect(help.code).toBe(0);
-      expect(help.stdout.startsWith("fx ask\n\n")).toBe(true);
+      expect(help.stdout.startsWith("di ask\n\n")).toBe(true);
       expect(help.stderr).toBe("");
 
       const missing = await runFx(["--add-dir"], { env: enabled });
@@ -5454,7 +5457,7 @@ describe("cli: MCP profile add", () => {
         env: { HOME: home, ...NO_GATEWAY_AUTH },
       });
       expect(missingAuthName.code).toBe(1);
-      expect(missingAuthName.stderr).toBe("usage: fx mcp auth NAME\n");
+      expect(missingAuthName.stderr).toBe("usage: di mcp auth NAME\n");
       expect(existsSync(marker)).toBe(false);
       expect(local.code).toBe(0);
       expect(local.stderr).toBe("");

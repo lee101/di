@@ -34,6 +34,39 @@ pub fn requireWritableProfileFile(file_name: []const u8, lock_name: []const u8) 
     return exists;
 }
 
+/// Presence of a credential file inside an absolute directory owned by another
+/// tool (for example `$CODEX_HOME`). Metadata only; nothing is written.
+pub fn absoluteDirFile(
+    dir_path: []const u8,
+    file_name: []const u8,
+    max_bytes: usize,
+) host.SecretStorePresence {
+    if (comptime host_target.is_wasm) return .missing;
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), dir_path, .{ .iterate = true }) catch |err| {
+        return if (err == error.FileNotFound) .missing else .unavailable;
+    };
+    defer dir.close(io_mod.getIo());
+
+    var file = dir.openFile(io_mod.getIo(), file_name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
+    defer file.close(io_mod.getIo());
+
+    const stat = file.stat(io_mod.getIo()) catch return .unavailable;
+    if (stat.kind != .file or
+        stat.nlink != 1 or
+        stat.permissions.toMode() & 0o077 != 0 or
+        stat.size == 0 or
+        stat.size > max_bytes)
+    {
+        return .unavailable;
+    }
+    return .present;
+}
+
 /// Storage-origin errors must not be interpreted as OAuth AccessDenied.
 pub fn storageError(file_name: []const u8, err: anyerror) error{ OutOfMemory, Cancelled, LockBusy, CredentialStorageUnavailable } {
     debug_trace.logf("auth", "credential storage operation failed file={s} err={s}", .{ file_name, @errorName(err) });

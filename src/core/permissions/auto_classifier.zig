@@ -322,7 +322,7 @@ pub const ProviderInput = struct {
     tenant: ?[]const u8 = null,
     endpoint: []const u8 = "",
     /// Resolved review-model override (`review_model` setting or
-    /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
+    /// FX_REVIEW_MODEL). Empty means the provider's catalog-backed default.
     reviewer_model: []const u8 = "",
     cancel_flag: ?*std.atomic.Value(bool) = null,
     usage: ?*session_usage.Usage = null,

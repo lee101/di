@@ -21,11 +21,18 @@ fn reviewCodex(
 ) anyerror!permission_auto_classifier.ParseOutcome {
     return responses_reviewer.review(alloc, input, request, .{
         .source = .chatgpt_subscription,
-        .model = openai_codex_models.reviewer_model,
+        .model = reviewerModel(input),
         .validate_fn = validateCredential,
         .build_fn = openai_codex.buildRequest,
         .send_fn = sendPrepared,
     });
+}
+
+/// The `review_model` setting / `FX_REVIEW_MODEL` wins over the catalog-backed
+/// default, matching the Gateway reviewer.
+fn reviewerModel(input: permission_auto_classifier.ProviderInput) []const u8 {
+    if (input.reviewer_model.len > 0) return input.reviewer_model;
+    return openai_codex_models.reviewerModelId();
 }
 
 fn validateCredential(
@@ -44,11 +51,18 @@ fn sendPrepared(
     return openai_codex.streamPrepared(alloc, request, payload);
 }
 
-test "Codex reviewer model remains catalog-selected gpt-5.6-luna" {
-    try std.testing.expectEqualStrings("gpt-5.6-luna", openai_codex_models.reviewer_model);
+test "Codex reviewer model prefers the newest catalog entry and honors the override" {
+    try std.testing.expectEqualStrings("gpt-6-luna", openai_codex_models.reviewer_model_preferences[0]);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", openai_codex_models.reviewer_model_preferences[1]);
+    try std.testing.expectEqualStrings("gpt-6-luna", reviewerModel(.{}));
+    try std.testing.expectEqualStrings(
+        "openai/gpt-5.4",
+        reviewerModel(.{ .reviewer_model = "openai/gpt-5.4" }),
+    );
 }
 
-test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
+test "Codex reviewer builds a direct Responses request with the catalog-backed model" {
+    const model = openai_codex_models.reviewerModelId();
     const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending action." }};
     const messages = [_]types.ChatMessage{
         .{ .role = .user, .content = "User requested the change." },
@@ -64,7 +78,7 @@ test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
     var cancelled = std.atomic.Value(bool).init(false);
     const body = try responses_reviewer.buildPayloadForTest(
         std.testing.allocator,
-        openai_codex_models.reviewer_model,
+        model,
         &instructions,
         &messages,
         "call_review",
@@ -77,7 +91,9 @@ test "Codex reviewer builds a direct Responses request with gpt-5.6-luna" {
     );
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.6-luna\"") != null);
+    const expected_model = try std.fmt.allocPrint(std.testing.allocator, "\"model\":\"{s}\"", .{model});
+    defer std.testing.allocator.free(expected_model);
+    try std.testing.expect(std.mem.find(u8, body, expected_model) != null);
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"required\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "ai-gateway") == null);
