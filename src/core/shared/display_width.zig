@@ -323,6 +323,11 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
     var last_space: ?usize = null;
     var index: usize = 0;
     while (index < prefix.len) {
+        // A space inside an escape, such as an OSC 8 URL, is not a break.
+        if (prefix[index] == 0x1b) {
+            index = ansiSequenceEnd(prefix, index);
+            continue;
+        }
         const unit = displayUnitAt(prefix, index);
         if (prefix[index] == ' ' or prefix[index] == '\t') last_space = index;
         index += unit.byte_len;
@@ -589,6 +594,10 @@ test "wrapCutIgnoringAnsi prefers the last space inside the budget" {
     try std.testing.expectEqualStrings(" a", wrapCutIgnoringAnsi(" abcd", 2));
     try std.testing.expectEqualStrings("aaaa bbbb cccc", wrapCutIgnoringAnsi("aaaa bbbb cccc", 20));
     try std.testing.expectEqualStrings("\x1b[31maaaa", wrapCutIgnoringAnsi("\x1b[31maaaa bbbb\x1b[0m", 6));
+    try std.testing.expectEqualStrings(
+        "see",
+        wrapCutIgnoringAnsi("see \x1b]8;id=1;https://x.io/a b\x1b\\docs more", 8),
+    );
 }
 
 test "trimBreakWhitespace strips leading spaces and tabs" {

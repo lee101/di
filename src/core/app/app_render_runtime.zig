@@ -491,24 +491,27 @@ pub fn Runtime(comptime App: type) type {
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
             if (!ui_render.themeNeedsUpdate(light, rgb)) return;
 
-            const prior_light = ui_render.is_light;
-            app.shell.retintEntriesForTheme(app.alloc, prior_light, light) catch |err| {
+            // Resolve the target first so the retint rewrites the old theme's
+            // escapes into the new theme's, custom pairs included.
+            const prior_theme = shared_theme.current();
+            var resolved_target: ?shared_theme.Theme = null;
+            if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
+                // Custom themes re-resolve on live flips: sibling swap or
+                // builtin fallback, same rule as startup.
+                resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
+                    debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
+                    break :blk null;
+                };
+            }
+            const target = resolved_target orelse shared_theme.builtin(light);
+
+            app.shell.retintEntriesForTheme(app.alloc, prior_theme, target) catch |err| {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
             app.pacer.rethemeInlineCode(light);
-            if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
-                // Custom themes re-resolve on live flips: sibling swap or
-                // builtin fallback, same rule as startup.
-                const custom = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
-                    debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
-                    break :blk null;
-                };
-                if (custom) |resolved| {
-                    ui_render.applyTheme(resolved, rgb);
-                } else {
-                    ui_render.initTheme(light, rgb);
-                }
+            if (resolved_target) |resolved| {
+                ui_render.applyTheme(resolved, rgb);
             } else {
                 ui_render.initTheme(light, rgb);
             }
@@ -763,7 +766,7 @@ pub fn Runtime(comptime App: type) type {
                         .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
                         .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
                         .prompts = if (view.prompts) |catalog| catalog.items else &.{},
-                        .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
+                        .configuration_issues = if (view.health) |health| health.configuration_issues else &.{},
                         .preview = view.preview,
                         .feedback = view.feedback,
                         .add_name = view.add_form.name.items,

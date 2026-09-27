@@ -39,25 +39,39 @@ await agent.close();
 
 `apiKey` is required. `model` is optional and defaults to fx's built-in model.
 Agent configuration uses named options; `env` is reserved for
-`createFxTerminal()`.
+`createFxTerminal()`. The canonical model configuration groups the model ID
+and model-specific options:
 
-`effort` sets the reasoning effort for models that advertise effort levels. It
-uses the same vocabulary as the fx CLI's `--effort` flag: `"default"` leaves
-the choice to the model, and named levels such as `"low"`, `"medium"`,
-`"high"`, or `"xhigh"` request a specific level. A named level is validated
-against the selected model's advertised levels at creation; an unsupported
-level rejects with an error (code `LIBFX_UNSUPPORTED_EFFORT`) naming the
-supported set. When `effort` is omitted or `"default"`, the model default
-applies.
+```js
+const agent = await createFxAgent({
+  apiKey,
+  model: { id: "anthropic/claude-opus-5.5-fast", effort: "low", fast: true },
+});
+```
 
-`fast` enables the fast lane for models that advertise one, matching the fx
-CLI's `--fast` flag. Enabling it is validated against the selected model at
-creation; a model without a fast path rejects with an error (code
-`LIBFX_UNSUPPORTED_FAST`). When `fast` is omitted or `false`, the model
-default applies.
+A string `model` remains supported as shorthand. Top-level `effort` and
+`fast` are deprecated but remain supported with a string model or no model;
+they cannot be mixed with a model object. New code should use the model object.
+
+`model.effort` sets the reasoning effort for models that advertise effort
+levels. It uses the same vocabulary as the fx CLI's `--effort` flag:
+`"default"` leaves the choice to the model; named levels such as `"low"`,
+`"medium"`, `"high"`, or `"xhigh"` request a specific level. A named level is
+validated at creation; an unsupported level rejects with an Error carrying
+`code: "LIBFX_MODEL_UNSUPPORTED_EFFORT"`, `model`, and
+`capability: "effort"`. Its message names the supported set when available.
+Omitting effort or using `"default"` leaves the model default in place.
+
+`model.fast` enables the fast lane for models that advertise one, matching the
+fx CLI's `--fast` flag. A model without a fast path rejects at creation with
+`code: "LIBFX_MODEL_UNSUPPORTED_FAST"`, `model`, and `capability: "fast"`.
+Omitting fast or setting it to `false` leaves the model default in place.
+The new codes replace `LIBFX_UNSUPPORTED_EFFORT` and `LIBFX_UNSUPPORTED_FAST`
+for both nested and legacy top-level settings. Callers that check the old codes
+must update their error handling.
 
 The host selects the model. Agent creation does not fetch the Gateway model
-catalog unless `effort` requests a named level or `fast` is enabled. Prompting
+catalog unless effort requests a named level or fast is enabled. Prompting
 can resolve model capabilities and context capacity through the supplied
 `fetch`; fx caches that metadata for the agent.
 
@@ -106,22 +120,32 @@ that threshold when the queue is empty; an individual encoded ACP message is
 limited to 64 MiB on both backends. These are transport bounds, not a total
 answer-size limit or a bound on retained conversation history.
 
-Image blocks use ACP's content shape and carry canonical base64 (no line
-wrapping) of a PNG, JPEG, GIF, or WebP payload:
+Image blocks accept a `Blob` or `File` with a non-empty `type`, or the
+existing canonical base64 (no line wrapping) and explicit `mimeType` of a PNG,
+JPEG, GIF, or WebP payload:
 
 ```js
 const turn = agent.prompt([
   { type: "text", text: "What does this screenshot show?" },
-  { type: "image", data: base64Png, mimeType: "image/png" },
+  { type: "image", data: file }, // File or Blob, with file.type
+  // Or: { type: "image", data: base64Png, mimeType: "image/png" }
 ]);
 ```
 
 A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
-with at most 8 MiB of image data per prompt; the SDK rejects larger input with
-typed `RangeError`s before any request. The kernel then validates the decoded
-bytes against the declared `mimeType` and fails the turn with
-`Invalid image prompt block` on a mismatch. Images are routed only to models
-that advertise image input; for any other model the turn fails with
+with at most 8 MiB of image data per prompt. The SDK checks Blob size before
+reading it, encodes it for the same ACP wire format, and rejects larger input
+with typed `RangeError`s. The total frame size is checked before reading a
+Blob, and the actual byte count is checked before encoding it. Blob reads are
+asynchronous: `prompt()` returns a turn, and read failures reject
+`turn.result`. Cancelling or closing while a Blob is being read settles the
+turn without sending its prompt. For base64 input, size errors still throw
+synchronously from `prompt()`.
+
+The kernel sniffs decoded bytes and compares them with the claimed MIME type
+for both input forms; a mismatch fails the turn with
+`Invalid image prompt block`. Images are routed only to models that advertise
+image input; for any other model the turn fails with
 `Image prompts are unavailable for the selected model` and no image bytes
 leave the process. Prompt images are retained in checkpoints within the
 existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
@@ -133,8 +157,10 @@ without discarding the in-flight response or completed tool work. Steering also
 accepts an array of text blocks; image and resource steering blocks are rejected.
 Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
 queued steering text. Accepted steering appears as a `user_message` event before
-the model's continued output. Calling `steer()` after the turn settles rejects
-with `no prompt is running`.
+the model's continued output. For a Blob prompt, steering during the read
+waits for the prompt to be sent; cancelling before then rejects the pending
+steering. Calling `steer()` after the turn settles rejects with
+`no prompt is running`.
 
 ```js
 const turn = agent.prompt("Build the feature.");
@@ -162,8 +188,8 @@ The checkpoint contains conversation history and usage only. The host owns
 durable storage and must resupply models, credentials, instructions, tools,
 MCP clients, and skill records. Reasoning effort and fast mode are
 agent-creation options and are not stored in a checkpoint: recreate the agent
-with new `effort` or `fast` values to change them, the same path as switching
-models.
+with new `model.effort` or `model.fast` values to change them, the same path as
+switching models.
 
 ## Models
 

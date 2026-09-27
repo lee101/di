@@ -31,6 +31,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
+const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
@@ -559,7 +560,7 @@ pub fn Handlers(comptime App: type) type {
                     try std.fmt.allocPrint(
                         app.alloc,
                         "MCP authentication for '{s}' failed: {s}.",
-                        .{ completion.server_name, @errorName(err) },
+                        .{ completion.server_name, mcp_auth.authentication_error_message(err) },
                     );
                 defer app.alloc.free(body);
                 try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
@@ -1258,7 +1259,8 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0 and
+            const command = std.mem.trim(u8, rest, " \t");
+            if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
                 closeModelMenuIfPresent(app);
@@ -3718,36 +3720,7 @@ fn stripAnsiEscapes(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     while (i < input.len) {
         const c = input[i];
         if (c == 0x1b and i + 1 < input.len) {
-            const next = input[i + 1];
-            if (next == '[') {
-                // CSI: ESC '[' params... final-byte (0x40-0x7E)
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    i += 1;
-                    if (b >= 0x40 and b <= 0x7E) break;
-                }
-                continue;
-            }
-            if (next == ']') {
-                // OSC: ESC ']' ... BEL (0x07) or ESC '\'
-                i += 2;
-                while (i < input.len) {
-                    const b = input[i];
-                    if (b == 0x07) {
-                        i += 1;
-                        break;
-                    }
-                    if (b == 0x1b and i + 1 < input.len and input[i + 1] == '\\') {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            // Other ESC sequences: skip ESC + one byte
-            i += 2;
+            i = display_width.ansiSequenceEnd(input, i);
             continue;
         }
         if (c == '\r') {
@@ -4215,8 +4188,10 @@ const McpCommandFakeApp = struct {
     };
 
     alloc: std.mem.Allocator,
+    shell: transcript_runtime.TranscriptRuntime = .{},
     notice_body: std.ArrayList(u8) = .empty,
     list_count: usize = 0,
+    menu_open_count: usize = 0,
     reload_count: usize = 0,
     notice_count: usize = 0,
     last_topic: ?[]const u8 = null,
@@ -4230,7 +4205,12 @@ const McpCommandFakeApp = struct {
     menu_authentication_completions: usize = 0,
 
     fn deinit(self: *McpCommandFakeApp) void {
+        self.shell.deinit(self.alloc);
         self.notice_body.deinit(self.alloc);
+    }
+
+    fn openMcpMenu(self: *McpCommandFakeApp) !void {
+        self.menu_open_count += 1;
     }
 
     fn mcpCommandProvider(_: *const McpCommandFakeApp) mcp_command_provider.Provider {
@@ -5242,6 +5222,18 @@ test "copy command reports missing replies and host failures" {
         try std.testing.expectEqualStrings("Failed to copy to clipboard.", app.last_body.?);
     }
     try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
+}
+
+test "MCP list opens the menu without writing a transcript notice" {
+    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), " list ");
+
+    try std.testing.expectEqual(@as(usize, 1), app.menu_open_count);
+    try std.testing.expectEqual(@as(usize, 0), app.list_count);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
 }
 
 test "app_commands renders transactional status for explicit MCP reload" {

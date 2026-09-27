@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxAgent as createSharedAgent } from "../fx-sdk.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const backend = process.argv[2] || "native";
@@ -101,6 +102,23 @@ function fileParts(body) {
   await agent.close();
 }
 
+// Blob and File use their own media types and share the base64 wire format
+// and the kernel's byte-sniffing path on both backends.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: { id: "sdk/vision-model" } });
+  const file = new File([Buffer.from(pngData, "base64")], "image.png", { type: "image/png" });
+  const result = await runPrompt(agent, [
+    { type: "text", text: "describe this file" },
+    { type: "image", data: file },
+  ]);
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(fileParts(gateway.state.chatBodies[0]), [
+    { type: "file", mediaType: "image/png", data: { type: "data", data: pngData } },
+  ]);
+  await agent.close();
+}
+
 // A pure-image prompt is valid; the placeholder keeps the turn non-empty.
 {
   const gateway = mockGateway();
@@ -140,7 +158,7 @@ function fileParts(body) {
   const first = await createAgent(gateway, { model: "sdk/vision-model" });
   const initial = await runPrompt(first, [
     { type: "text", text: "remember this image" },
-    { type: "image", data: pngData, mimeType: "image/png" },
+    { type: "image", data: new Blob([Buffer.from(pngData, "base64")], { type: "image/png" }) },
   ]);
   assert.equal(initial.stopReason, "end_turn");
   const checkpoint = await first.checkpoint();
@@ -172,6 +190,30 @@ function fileParts(body) {
   assert.throws(
     () => agent.prompt([{ type: "image", data: 42, mimeType: "image/png" }]),
     (error) => error instanceof TypeError && /requires base64 data/.test(error.message),
+  );
+
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Blob(["untyped"]) }]),
+    (error) => error instanceof TypeError && /requires a mimeType/.test(error.message),
+  );
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new Blob(["bytes"], { type: "image/png" }), mimeType: "image/jpeg" }]),
+    (error) => error instanceof TypeError && /disagrees with Blob.type/.test(error.message),
+  );
+  let readOversized = false;
+  class OversizedBlob extends Blob {
+    get size() { return 1; }
+    async arrayBuffer() { readOversized = true; return super.arrayBuffer(); }
+  }
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: new OversizedBlob([Buffer.alloc(4 * 1024 * 1024)], { type: "image/png" }) }]),
+    (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message),
+  );
+  assert.equal(readOversized, false);
+  const budgetBlob = new Blob([Buffer.alloc(3.5 * 1024 * 1024)], { type: "image/png" });
+  assert.throws(
+    () => agent.prompt(Array.from({ length: 2 }, () => ({ type: "image", data: budgetBlob }))),
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
 
   const overSized = pngWithEncodedLength(5 * 1024 * 1024 + 4);
@@ -212,6 +254,35 @@ function fileParts(body) {
     () => agent.prompt("x".repeat(9 * 1024 * 1024)),
     (error) => error instanceof RangeError && /frame limit/.test(error.message),
   );
+  let readMixed = false;
+  class UnreadBlob extends Blob {
+    arrayBuffer() { readMixed = true; return new Promise(() => {}); }
+  }
+  assert.throws(
+    () => agent.prompt([
+      { type: "text", text: "x".repeat(9 * 1024 * 1024) },
+      { type: "image", data: new UnreadBlob(["bytes"], { type: "image/png" }) },
+    ]),
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+  );
+  assert.equal(readMixed, false);
+
+  // The projected data fits the image budgets but its ACP envelope does not.
+  const boundaryBlob = new Blob([Buffer.alloc(3 * 1024 * 1024)], { type: "image/png" });
+  assert.throws(
+    () => agent.prompt([
+      { type: "image", data: boundaryBlob },
+      { type: "image", data: boundaryBlob },
+    ]),
+    (error) => error instanceof RangeError && /frame limit/.test(error.message),
+  );
+
+  class LyingBlob extends Blob {
+    get size() { return 1; }
+    async arrayBuffer() { return new ArrayBuffer(4 * 1024 * 1024); }
+  }
+  const actualOverflow = agent.prompt([{ type: "image", data: new LyingBlob(["x"], { type: "image/png" }) }]);
+  await assert.rejects(actualOverflow.result, (error) => error instanceof RangeError && /per-image libfx limit/.test(error.message));
 
   assert.equal(gateway.state.catalogFetches, 0);
   assert.equal(gateway.state.chatBodies.length, 0);
@@ -229,6 +300,300 @@ function fileParts(body) {
   const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]).toString("base64");
   const mismatch = agent.prompt([{ type: "image", data: jpegBytes, mimeType: "image/png" }]);
   await assert.rejects(mismatch.result, /Invalid image prompt block/);
+  const blobMismatch = agent.prompt([
+    { type: "image", data: new Blob([Buffer.from(jpegBytes, "base64")], { type: "image/png" }) },
+  ]);
+  await assert.rejects(blobMismatch.result, /Invalid image prompt block/);
+  assert.equal(gateway.state.chatBodies.length, 0);
+  await agent.close();
+}
+
+// A Blob read failure rejects only that turn and does not send a partial frame.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class BrokenBlob extends Blob {
+    async arrayBuffer() { throw new Error("read failed"); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new BrokenBlob(["bytes"], { type: "image/png" }) }]);
+  await assert.rejects(turn.result, /read failed/);
+  class CancelledBlob extends Blob {
+    async arrayBuffer() { throw new Error("Cancelled"); }
+  }
+  const failedRead = agent.prompt([{ type: "image", data: new CancelledBlob(["bytes"], { type: "image/png" }) }]);
+  await assert.rejects(failedRead.result, (error) => error.message === "Cancelled");
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "retry with text")).stopReason, "end_turn");
+  await agent.close();
+}
+
+// Steering during a Blob read waits for the prompt to reach the core on both
+// backends instead of racing ahead of the initial session/prompt.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  let finishRead;
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["x"], { type: "image/png" }) }]);
+  const steering = turn.steer("focus on the image");
+  await Promise.resolve();
+  assert.equal(gateway.state.chatBodies.length, 0);
+  finishRead(Buffer.from(pngData, "base64"));
+  await steering;
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.ok(gateway.state.chatBodies.length >= 1);
+  await agent.close();
+}
+
+// Cancel or close while Blob.arrayBuffer() is pending: settle promptly, do not
+// send a late prompt, and leave the agent available for the next turn.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  let finishRead;
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const blob = new SlowBlob([Buffer.from(pngData, "base64")], { type: "image/png" });
+  const turn = agent.prompt([{ type: "image", data: blob }]);
+  await Promise.resolve();
+  const steering = turn.steer("pending guidance");
+  turn.cancel();
+  await assert.rejects(steering, /no prompt is running/);
+  assert.equal((await turn.result).stopReason, "cancelled");
+  finishRead(Buffer.from(pngData, "base64"));
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "still usable")).stopReason, "end_turn");
+  await agent.close();
+}
+
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise(() => {}); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  await agent.close();
+  assert.equal((await turn.result).stopReason, "cancelled");
+  assert.equal(gateway.state.chatBodies.length, 0);
+}
+
+// A Blob can abort the signal synchronously from arrayBuffer(). The turn must
+// still settle even when the read promise never resolves.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  const controller = new AbortController();
+  class AbortingBlob extends Blob {
+    arrayBuffer() {
+      controller.abort();
+      return new Promise(() => {});
+    }
+  }
+  const turn = agent.prompt([
+    { type: "image", data: new AbortingBlob(["bytes"], { type: "image/png" }) },
+  ], { signal: controller.signal });
+  let timer;
+  try {
+    const result = await Promise.race([
+      turn.result,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Blob abort did not settle")), 1500); }),
+    ]);
+    assert.equal(result.stopReason, "cancelled");
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(gateway.state.chatBodies.length, 0);
+  assert.equal((await runPrompt(agent, "usable after abort")).stopReason, "end_turn");
+  await agent.close();
+}
+
+// Closing from arrayBuffer() must find an initialized turn result and release
+// the runtime rather than rejecting before it can close stdin.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  let closing;
+  class ClosingBlob extends Blob {
+    arrayBuffer() {
+      closing = agent.close();
+      return new Promise(() => {});
+    }
+  }
+  const turn = agent.prompt([{ type: "image", data: new ClosingBlob(["bytes"], { type: "image/png" }) }]);
+  await Promise.resolve();
+  assert.ok(closing);
+  let timer;
+  try {
+    await Promise.race([
+      closing,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("reentrant close did not settle")), 1500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal((await turn.result).stopReason, "cancelled");
+  assert.equal(gateway.state.chatBodies.length, 0);
+}
+
+// A core exit before or just after Blob bytes arrive rejects the turn and
+// iterator without submitting a prompt or reporting user cancellation.
+for (const timing of ["during-read", "after-read"]) {
+  let finishRuntime;
+  let finishRead;
+  let onLine;
+  const sentMethods = [];
+  const runtime = {
+    exited: new Promise((resolveExit) => { finishRuntime = resolveExit; }),
+    setLineHandler(handler) { onLine = handler; },
+    write(line) {
+      const request = JSON.parse(line);
+      sentMethods.push(request.method);
+      if (request.method === "initialize" || request.method === "libfx/new") {
+        queueMicrotask(() => onLine({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: request.method === "libfx/new" ? { sessionId: "image-exit-test" } : {},
+        }));
+      }
+    },
+    abortHostEffects() {},
+    closeStdin() { finishRuntime(0); },
+  };
+  const controller = new AbortController();
+  const agent = await createSharedAgent({
+    apiKey: "image-exit-test-key",
+    runtimeFactory: async () => runtime,
+    onEvent(event) {
+      if (event.type === "runtime.exit" && timing === "during-read") controller.abort();
+    },
+  });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }], { signal: controller.signal });
+  const settled = Promise.all([
+    assert.rejects(turn.result, /fx-core exited with code 1/),
+    assert.rejects(turn[Symbol.asyncIterator]().next(), /fx-core exited with code 1/),
+  ]);
+  let timer;
+  try {
+    await Promise.resolve();
+    if (timing === "after-read") finishRead(Buffer.from(pngData, "base64"));
+    finishRuntime(1);
+    await Promise.race([
+      settled,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`core exit ${timing} did not settle Blob turn`)), 1500); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+  assert.equal(sentMethods.includes("session/prompt"), false);
+  assert.equal(sentMethods.includes("session/cancel"), false);
+  await agent.close();
+}
+
+// Queued steering must fail if the prompt write throws or the core exits as
+// it accepts the write; neither case may deliver guidance to a dead turn.
+for (const failure of ["write", "exit"]) {
+  let finishRuntime;
+  let onLine;
+  let finishRead;
+  const sentMethods = [];
+  const runtime = {
+    exited: new Promise((resolveExit) => { finishRuntime = resolveExit; }),
+    setLineHandler(handler) { onLine = handler; },
+    write(line) {
+      const request = JSON.parse(line);
+      sentMethods.push(request.method);
+      if (request.method === "session/prompt") {
+        if (failure === "write") throw new Error("prompt write failed");
+        finishRuntime(1);
+        return;
+      }
+      if (request.method === "initialize" || request.method === "libfx/new") {
+        queueMicrotask(() => onLine({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: request.method === "libfx/new" ? { sessionId: "image-write-test" } : {},
+        }));
+      }
+    },
+    steer(text) { sentMethods.push(`steer:${text}`); },
+    abortHostEffects() {},
+    closeStdin() { finishRuntime(0); },
+  };
+  const agent = await createSharedAgent({ apiKey: "image-write-test-key", runtimeFactory: async () => runtime });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise((resolveRead) => { finishRead = resolveRead; }); }
+  }
+  const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+  const steering = turn.steer("queued guidance");
+  await Promise.resolve();
+  finishRead(Buffer.from(pngData, "base64"));
+  const expectedError = failure === "write" ? /prompt write failed/ : /fx-core exited with code 1/;
+  await assert.rejects(turn.result, expectedError);
+  await assert.rejects(steering, expectedError);
+  assert.equal(sentMethods.includes("steer:queued guidance"), false);
+  await agent.close();
+}
+
+// Pre-prompt steering has the same count and byte limits as the core queue.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  class SlowBlob extends Blob {
+    arrayBuffer() { return new Promise(() => {}); }
+  }
+  for (const [payload, count] of [["x", 64], ["x".repeat(64 * 1024), 16]]) {
+    const turn = agent.prompt([{ type: "image", data: new SlowBlob(["bytes"], { type: "image/png" }) }]);
+    const queued = Array.from({ length: count }, () => turn.steer(payload).catch((error) => error));
+    await assert.rejects(turn.steer(payload), /steering queue is full/);
+    turn.cancel();
+    const rejected = await Promise.all(queued);
+    assert.ok(rejected.every((error) => error instanceof Error && /no prompt is running/.test(error.message)));
+    assert.equal((await turn.result).stopReason, "cancelled");
+  }
+  assert.equal(gateway.state.chatBodies.length, 0);
+  await agent.close();
+}
+
+// A pre-aborted Blob prompt must reject steering immediately.
+{
+  const gateway = mockGateway();
+  const agent = await createAgent(gateway, { model: "sdk/vision-model" });
+  const controller = new AbortController();
+  controller.abort();
+  const turn = agent.prompt([
+    { type: "image", data: new Blob([Buffer.from(pngData, "base64")], { type: "image/png" }) },
+  ], { signal: controller.signal });
+  await assert.rejects(turn.steer("late guidance"), /no prompt is running/);
+  assert.equal((await turn.result).stopReason, "cancelled");
+  await agent.close();
+}
+
+// Cancellation from the send event must not let a late prompt through after
+// its session/cancel notification.
+{
+  const gateway = mockGateway();
+  let turn;
+  let promptSendEvents = 0;
+  const agent = await createAgent(gateway, {
+    model: "sdk/vision-model",
+    onEvent(event) {
+      if (event.type !== "acp.send" || event.message?.method !== "session/prompt") return;
+      promptSendEvents++;
+      turn.cancel();
+    },
+  });
+  turn = agent.prompt([{ type: "image", data: new Blob([Buffer.from(pngData, "base64")], { type: "image/png" }) }]);
+  assert.equal((await turn.result).stopReason, "cancelled");
+  assert.equal(promptSendEvents, 1);
   assert.equal(gateway.state.chatBodies.length, 0);
   await agent.close();
 }

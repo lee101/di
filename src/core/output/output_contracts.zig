@@ -3143,8 +3143,25 @@ pub const SlackSnapshot = struct {
         } else if (!self.installed) {
             try out.writer.writeAll("No local Slack bot installation. Run di slack install.\n");
         } else {
-            try out.writer.print("Slack bot {s} in workspace {s}: {s}.\n", .{ self.bot_user_id.?, self.team_id.?, self.action });
-            if (self.expires_at_ms) |expiry| try out.writer.print("Access expires at {d} (Unix milliseconds). Run di slack refresh to renew locally.\n", .{expiry});
+            try out.writer.writeAll(if (std.mem.eql(u8, self.action, "install"))
+                "di is now installed in your Slack workspace.\n"
+            else
+                "Your di Slack bot credentials are saved on this computer.\n");
+            if (self.expires_at_ms) |expiry| {
+                if (expiry >= 0 and expiry <= 253_402_300_799_999) {
+                    var date_buf: [24]u8 = undefined;
+                    const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(expiry, std.time.ms_per_s)) };
+                    const day = epoch.getDaySeconds();
+                    try out.writer.print("Access expires on {s} at {d:0>2}:{d:0>2} UTC.\n", .{
+                        usage_report.formatUtcDate(&date_buf, expiry),
+                        day.getHoursIntoDay(),
+                        day.getMinutesIntoHour(),
+                    });
+                } else {
+                    try out.writer.writeAll("Access expiration time is unavailable.\n");
+                }
+                try out.writer.writeAll("Run di slack refresh to renew locally.\n");
+            }
         }
         return out.toOwnedSlice();
     }

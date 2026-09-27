@@ -1090,7 +1090,7 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
             if (auth.client_id) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_id", field);
             if (auth.client_secret_env) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_secret_env", field);
             if (auth.client_metadata_url) |field| try writeOptionalJsonField(&out.writer, &first_auth, "client_metadata_url", field);
-            if (auth.scopes.len > 0) {
+            if (auth.scopes_configured or auth.scopes.len > 0) {
                 if (!first_auth) try out.writer.writeByte(',');
                 first_auth = false;
                 try out.writer.writeAll("\"scopes\":[");

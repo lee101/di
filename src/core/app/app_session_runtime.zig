@@ -69,6 +69,28 @@ const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
 
+const RecoveryAutoContinue = enum {
+    auto_continue,
+    skip_compaction_owned,
+    ask_after_unclean_exit,
+};
+
+/// Whether a paused recovery continues on its own after a restart or resume.
+/// A leftover owner marker means the previous process died mid-recovery, and
+/// a leftover asked marker means a prior resume already suppressed this
+/// checkpoint without the user resolving it. Either way the turn is the
+/// user's to retry, not fx's to re-spend.
+fn recoveryAutoContinueDecision(
+    checkpoint: session_codec.RecoveryCheckpoint,
+    previous_owner_died: bool,
+    recovery_asked_before: bool,
+) RecoveryAutoContinue {
+    if (checkpoint.cause == .compaction_prepared) return .skip_compaction_owned;
+    if (recovery_asked_before) return .ask_after_unclean_exit;
+    if (previous_owner_died) return .ask_after_unclean_exit;
+    return .auto_continue;
+}
+
 const BackgroundSessionPolicy = enum {
     carry_forward,
     stop_forget,
@@ -535,7 +557,7 @@ const SessionPickerCatalogCache = struct {
     ready: bool = false,
     loaded_at_ns: i128 = 0,
     active_id: ?[]u8 = null,
-    catalog: subagent_resume_admission.ActionableSessionCatalog = .{},
+    catalog: session_catalog_cache.ActionableSessionCatalog = .{},
 
     fn deinit(self: *SessionPickerCatalogCache) void {
         const alloc = std.heap.c_allocator;
@@ -559,7 +581,7 @@ const SessionPickerCatalogCache = struct {
 
     fn install(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
     ) !void {
         return self.installAt(source, active_id, io_mod.nanoTimestamp());
@@ -569,7 +591,7 @@ const SessionPickerCatalogCache = struct {
     /// immediately while still scheduling a background revalidation scan.
     fn installStale(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
     ) !void {
         return self.installAt(source, active_id, 0);
@@ -577,7 +599,7 @@ const SessionPickerCatalogCache = struct {
 
     fn installAt(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
         loaded_at_ns: i128,
     ) !void {
@@ -616,7 +638,7 @@ fn installStaleDiskCatalog(
         for (summaries.items) |*summary| summary.deinit(std.heap.c_allocator);
         summaries.deinit(std.heap.c_allocator);
     }
-    var catalog: subagent_resume_admission.ActionableSessionCatalog = .{ .summaries = summaries };
+    var catalog: session_catalog_cache.ActionableSessionCatalog = .{ .summaries = summaries };
     session_summary_codec.sortSummariesNewestFirst(catalog.summaries.items);
     try cache.installStale(&catalog, active_id);
 }
@@ -768,7 +790,7 @@ const SessionPickerLoad = struct {
         home_dir: []u8,
         workspace_root: []u8,
         request: PageRequest,
-        catalog: ?subagent_resume_admission.ActionableSessionCatalog = null,
+        catalog: ?session_catalog_cache.ActionableSessionCatalog = null,
         cache_writer: ?session_catalog_cache.Writer = null,
         failure: ?anyerror = null,
 
@@ -971,7 +993,7 @@ const SessionPickerLoad = struct {
         };
         defer read_only.deinit(std.heap.c_allocator);
 
-        task.catalog = subagent_resume_admission.listActionableCatalog(
+        task.catalog = session_catalog_cache.listActionableCatalog(
             read_only,
             std.heap.c_allocator,
             task.request.active_id,
@@ -2017,6 +2039,16 @@ pub fn Runtime(comptime App: type) type {
             var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
 
+            // Decide before rendering: the checkpoint replay below must not
+            // promise an automatic continuation the gate is about to suppress.
+            const recovery_decision: ?RecoveryAutoContinue = if (comptime @hasDecl(App, "queueRecoveryCheckpoint"))
+                if (state.recovery_checkpoint) |checkpoint|
+                    recoveryAutoContinueDecision(checkpoint, previousOwnerDied(app), recoveryAskedBefore(app))
+                else
+                    null
+            else
+                null;
+
             if (comptime @hasDecl(App, "beginResumeProjection")) {
                 const projection_started_ns = io_mod.nanoTimestamp();
                 var projection = try app.beginResumeProjection();
@@ -2028,7 +2060,7 @@ pub fn Runtime(comptime App: type) type {
                 };
                 try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -2048,52 +2080,86 @@ pub fn Runtime(comptime App: type) type {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
+                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels, recovery_decision);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
-            // A paused recovery resumes on its own after every restart or
-            // resume; the user never re-runs a manual continuation. Harnesses
-            // without a real worker queue opt out via the decl check. A
-            // compaction_prepared checkpoint records completed source, not a
-            // turn waiting to run; the compaction flow owns it.
+            // A paused recovery resumes on its own after a clean restart or
+            // resume. Harnesses without a real worker queue opt out via the
+            // decl check. A compaction_prepared checkpoint records completed
+            // source, not a turn waiting to run; the compaction flow owns it.
+            // A checkpoint left behind by an unclean exit is different: the
+            // interrupted turn may be what killed the process, so the user
+            // decides whether to retry it instead of fx re-spending the turn
+            // on its own, and that suppression stays sticky until the turn
+            // is resolved.
             if (comptime @hasDecl(App, "queueRecoveryCheckpoint")) {
                 if (state.recovery_checkpoint) |checkpoint| {
-                    if (checkpoint.cause == .compaction_prepared) {
-                        debug_trace.logf(
+                    switch (recovery_decision.?) {
+                        .skip_compaction_owned => debug_trace.logf(
                             "session",
                             "event=auto_continue_skipped cause=compaction_prepared",
                             .{},
-                        );
-                    } else {
-                        const queued = continuePausedRecovery(app) catch |err| switch (err) {
-                            error.MissingApiKey => missing: {
-                                try app.writeDomainNotice(.{
-                                    .topic = "recovery",
-                                    .tone = .warning,
-                                    .body = "sign in to let the interrupted response continue automatically",
-                                }, true);
-                                break :missing false;
-                            },
-                            else => other: {
-                                debug_trace.logf(
-                                    "session",
-                                    "event=auto_continue_failed err={s}",
-                                    .{@errorName(err)},
-                                );
-                                try app.writeDomainNotice(.{
-                                    .topic = "recovery",
-                                    .tone = .warning,
-                                    .body = "the interrupted response could not continue automatically; it will try again on the next resume",
-                                }, true);
-                                break :other false;
-                            },
-                        };
-                        _ = queued;
+                        ),
+                        .ask_after_unclean_exit => {
+                            debug_trace.logf(
+                                "session",
+                                "event=auto_continue_suppressed reason=unclean_exit turn_id={d}",
+                                .{checkpoint.turn_id},
+                            );
+                            if (comptime @hasField(App, "session_persistence")) {
+                                if (app.session_persistence.writable) |*loaded| {
+                                    session_log.markRecoveryAsked(app.alloc, &loaded.log.dir);
+                                }
+                            }
+                            try app.writeDomainNotice(.{
+                                .topic = "recovery",
+                                .tone = .warning,
+                                .body = "di quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+                            }, true);
+                        },
+                        .auto_continue => {
+                            const queued = continuePausedRecovery(app) catch |err| switch (err) {
+                                error.MissingApiKey => missing: {
+                                    try app.writeDomainNotice(.{
+                                        .topic = "recovery",
+                                        .tone = .warning,
+                                        .body = "sign in to let the interrupted response continue automatically",
+                                    }, true);
+                                    break :missing false;
+                                },
+                                else => other: {
+                                    debug_trace.logf(
+                                        "session",
+                                        "event=auto_continue_failed err={s}",
+                                        .{@errorName(err)},
+                                    );
+                                    try app.writeDomainNotice(.{
+                                        .topic = "recovery",
+                                        .tone = .warning,
+                                        .body = "the interrupted response could not continue automatically; it will try again on the next resume",
+                                    }, true);
+                                    break :other false;
+                                },
+                            };
+                            _ = queued;
+                        },
                     }
                 }
             }
+        }
+
+        fn previousOwnerDied(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return loaded.log.previous_owner_died;
+        }
+
+        fn recoveryAskedBefore(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            const loaded = if (app.session_persistence.writable) |*value| value else return false;
+            return session_log.recoveryWasAsked(&loaded.log.dir);
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -2585,13 +2651,76 @@ pub fn Runtime(comptime App: type) type {
             return app.queueRecoveryCheckpoint(&checkpoint);
         }
 
+        /// Poll cadence and bound for snapshotFreshPromptBoundary's wait for an
+        /// in-flight turn close.
+        const fresh_prompt_turn_close_poll_ms: u64 = 50;
+        const fresh_prompt_turn_close_wait_ms: i64 = 30 * std.time.ms_per_s;
+
+        const FreshPromptBoundaryProbe = union(enum) {
+            wait,
+            ready: session_codec.RecoveryCheckpoint,
+        };
+
+        /// An open turn without a recovery checkpoint is the finalization
+        /// window of a cancelled or stall-stopped turn: those paths clear the
+        /// durable checkpoint first and close the turn through the queued
+        /// turn-finished event, which drains on another thread. Wait for the
+        /// close instead of failing the send. Only a turn that stays open
+        /// past the deadline is genuinely corrupt and still errors.
         pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            if (!loaded.conversation_writer.turn_open) return null;
-            const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
-            return try value.dupe(alloc);
+            return snapshotFreshPromptBoundaryWithin(app, alloc, fresh_prompt_turn_close_wait_ms);
+        }
+
+        fn snapshotFreshPromptBoundaryWithin(app: *App, alloc: Allocator, wait_ms: i64) !?session_codec.RecoveryCheckpoint {
+            const deadline_ms = io_mod.milliTimestamp() + wait_ms;
+            var waiting_logged = false;
+            while (true) {
+                const probe: FreshPromptBoundaryProbe = blk: {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                    const loaded = if (app.session_persistence.writable) |*value| value else return null;
+                    if (!loaded.conversation_writer.turn_open) {
+                        loaded.boundary_wedged = false;
+                        return null;
+                    }
+                    if (loaded.state.recovery_checkpoint) |checkpoint| {
+                        loaded.boundary_wedged = false;
+                        break :blk .{ .ready = try checkpoint.dupe(alloc) };
+                    }
+                    // A wedged boundary (a stop path that never commits the
+                    // close) already paid the wait once; fail fast after that.
+                    if (loaded.boundary_wedged) return error.InvalidRecoveryCheckpoint;
+                    break :blk .wait;
+                };
+                switch (probe) {
+                    .ready => |value| return value,
+                    .wait => {},
+                }
+                // A cancelled or shutting-down worker must not hold the send
+                // (or the worker-thread join at shutdown) for the full wait.
+                if (comptime @hasDecl(@TypeOf(app.worker), "isCancelRequested")) {
+                    if (app.worker.isCancelRequested()) {
+                        debug_trace.logf("session", "event=fresh_prompt_boundary_aborted reason=cancel_requested", .{});
+                        return error.InvalidRecoveryCheckpoint;
+                    }
+                }
+                if (!waiting_logged) {
+                    debug_trace.logf("session", "event=fresh_prompt_boundary_waiting reason=open_turn_without_checkpoint", .{});
+                    waiting_logged = true;
+                }
+                if (io_mod.milliTimestamp() >= deadline_ms) {
+                    app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+                    if (app.session_persistence.writable) |*loaded| {
+                        if (loaded.conversation_writer.turn_open and loaded.state.recovery_checkpoint == null) {
+                            loaded.boundary_wedged = true;
+                        }
+                    }
+                    app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                    debug_trace.logf("session", "event=fresh_prompt_boundary_timeout reason=open_turn_without_checkpoint wait_ms={d}", .{wait_ms});
+                    return error.InvalidRecoveryCheckpoint;
+                }
+                io_mod.sleep(fresh_prompt_turn_close_poll_ms * std.time.ns_per_ms);
+            }
         }
 
         pub fn normalizeFreshPromptPreparation(app: *App, request: worker_runtime.FreshPromptPreparation) worker_runtime.FreshPromptPreparation {
@@ -2861,16 +2990,26 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             if (persistence_failure) |err| {
-                // The turn already rendered. Keep the session alive and coherent
-                // in memory, record the failure for shutdown reporting, and warn
-                // instead of taking the process down.
+                // A finished turn kept in memory cannot be followed by another
+                // prompt while its unfinished copy is still in the journal.
                 recordShutdownFailure(app, err);
+                if (loaded.conversation_writer.turn_open and loaded.conversation_writer.failure == null) {
+                    loaded.conversation_writer.failure = error.SessionCommitFailed;
+                    debug_trace.logf("session", "open turn blocked after failed save err={s}", .{@errorName(err)});
+                }
                 if (comptime @hasDecl(App, "writeDomainNotice")) {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "Turn completed, but di could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
-                        .{@errorName(err)},
-                    );
+                    const body = if (loaded.conversation_writer.turn_open)
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "Turn completed, but di could not save it ({s}). New messages are blocked until you reopen the session. The turn may run again.",
+                            .{@errorName(err)},
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            app.alloc,
+                            "Turn completed, but di could not save it ({s}). The session keeps running; this turn may be missing after a resume.",
+                            .{@errorName(err)},
+                        );
                     defer app.alloc.free(body);
                     app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
                 }
@@ -3308,6 +3447,15 @@ pub fn Runtime(comptime App: type) type {
         pub fn requestPersistenceShutdown(app: *App) void {
             app.session_persistence.session_picker_load.requestStop();
             app.session_persistence.title_generation.requestStop();
+        }
+
+        /// Exit publishes nothing to the profile usage ledger, so it never
+        /// waits on another process holding its lock. The session keeps
+        /// unpublished usage for recovery and the next resume.
+        pub fn abandonProfileLedgerForProcessExit(app: *App) void {
+            if (comptime @hasField(@TypeOf(app.session), "profile_usage")) {
+                app.session.profile_usage.abandonLedgerForProcessExit();
+            }
         }
 
         fn LiveHistorySink(comptime SinkApp: type) type {
@@ -4025,6 +4173,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             state: session_codec.DurableSessionState,
             labels: *HistoricalSessionLabels,
+            recovery_decision: ?RecoveryAutoContinue,
         ) !void {
             const checkpoint = state.recovery_checkpoint orelse return;
             var has_prior_turns = false;
@@ -4046,8 +4195,14 @@ pub fn Runtime(comptime App: type) type {
             }
             // A compaction_prepared checkpoint records completed source owned by
             // the compaction flow, not a turn waiting to run; it gets no recovery
-            // notice and no automatic continuation.
-            if (checkpoint.cause != .compaction_prepared) {
+            // notice and no automatic continuation. Only a checkpoint the gate
+            // will actually auto-continue may promise one; a suppressed
+            // checkpoint gets the gate's own notice below.
+            const recovery_notice_suppressed = if (recovery_decision) |decision|
+                decision != .auto_continue
+            else
+                checkpoint.cause == .compaction_prepared;
+            if (!recovery_notice_suppressed) {
                 // No attempt counts: there is no budget to count against.
                 const recovery_notice: []const u8 = if (checkpoint.tool_state == .uncertain)
                     "model response recovery paused and continues automatically; inspect the uncertain tool state if anything looks wrong"
@@ -4542,50 +4697,64 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Loads spilled previous/after snapshots for a replayed presentation.
-        /// A missing or corrupt artifact degrades to the inline preview, never
-        /// to a resume failure; the full-diff expansion is simply absent.
-        fn loadResumeDiffContent(
+        /// Builds the full review of a resumed edit the first time it is
+        /// opened, from the spilled snapshots. Runs at most once per entry. A
+        /// missing or corrupt artifact leaves only the preview and never
+        /// fails; the full-diff expansion is simply absent. The built diff is
+        /// owned by `entry` and allocated with `std.heap.c_allocator`.
+        pub fn materializeDeferredDiff(
             app: *App,
-            call_id: []const u8,
-            handle: []const u8,
-        ) ?result_store.DiffContentPack {
-            if (comptime !@hasField(App, "session_persistence")) return null;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            const capability = loaded.childCapability() catch |err| {
+            entry: *diff.DiffEntry,
+            styles: diff.FormatStyles,
+        ) void {
+            const deferred = entry.deferred orelse return;
+            entry.deferred = null;
+            defer deferred.deinit(std.heap.c_allocator);
+            const capability = childCapability(app) orelse {
                 debug_trace.logf(
                     "session",
-                    "resume diff content capability unavailable call_id={s} err={s}",
-                    .{ call_id, @errorName(err) },
+                    "event=diff_content_unavailable call_id={s} reason=no_session",
+                    .{deferred.call_id},
                 );
-                return null;
+                return;
             };
-            const pack = result_store.loadDiffContentManaged(
+            var pack = result_store.loadDiffContentManaged(
                 app.alloc,
                 capability,
-                call_id,
-                handle,
+                deferred.call_id,
+                deferred.content_handle,
             ) catch |err| {
                 debug_trace.logf(
                     "session",
-                    "resume diff content load failed call_id={s} err={s}; rendering preview only",
-                    .{ call_id, @errorName(err) },
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
                 );
-                return null;
+                return;
+            };
+            defer pack.deinit(app.alloc);
+            const after = pack.after_content orelse return;
+            entry.full = diff.formatFileChangeFullDiff(
+                std.heap.c_allocator,
+                pack.previous_content,
+                .{ .after_content = after, .lifecycle_id = deferred.lifecycle_id },
+                styles,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
+                );
+                return;
             };
             debug_trace.logf(
                 "session",
                 "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d}",
                 .{
-                    call_id,
+                    deferred.call_id,
                     if (pack.previous_content) |content| content.len else 0,
-                    if (pack.after_content) |content| content.len else 0,
+                    after.len,
                 },
             );
-            return pack;
         }
 
         fn writeCommittedFilePresentation(
@@ -4601,20 +4770,24 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
-            var resolved = presentation;
-            var content_pack: result_store.DiffContentPack = .{};
-            defer content_pack.deinit(app.alloc);
+            // Spilled snapshots stay on disk: the transcript renders the inline
+            // preview, and the full review is built only when it is opened.
+            var deferred: ?diff.DeferredFullDiff = null;
             if (presentation.content_handle) |handle| {
-                if (presentation.previous_content == null or presentation.after_content == null) {
-                    if (loadResumeDiffContent(app, result.tool_call_id, handle)) |pack| {
-                        content_pack = pack;
-                        resolved.previous_content = content_pack.previous_content;
-                        resolved.after_content = content_pack.after_content;
+                if (presentation.lifecycle_id) |lifecycle_id| {
+                    if (presentation.previous_content == null or presentation.after_content == null) {
+                        deferred = try diff.DeferredFullDiff.clone(
+                            std.heap.c_allocator,
+                            result.tool_call_id,
+                            handle,
+                            lifecycle_id,
+                        );
                     }
                 }
             }
 
-            const payload = app.preparePersistedFileDiff(resolved) catch |err| {
+            var payload = app.preparePersistedFileDiff(presentation) catch |err| {
+                if (deferred) |value| value.deinit(std.heap.c_allocator);
                 debug_trace.logf(
                     "session",
                     "resume committed file presentation unavailable call_id={s} err={s}",
@@ -4622,6 +4795,7 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return false;
             };
+            payload.deferred = deferred;
             var owns_payload = true;
             errdefer if (owns_payload) diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
 
@@ -4942,6 +5116,12 @@ pub fn Runtime(comptime App: type) type {
                 };
                 break :blk .{ .session_id = session_id };
             } else null;
+            // WASM hosts keep sessions in the JavaScript host store, never in a
+            // native session directory, so only native builds discard here.
+            const discard_empty = if (comptime host_target.is_wasm)
+                false
+            else
+                handoff == null and discardableOnClose(app, loaded);
             if (comptime @hasDecl(
                 @TypeOf(app.session),
                 "clearWebFetchArtifacts",
@@ -4949,9 +5129,43 @@ pub fn Runtime(comptime App: type) type {
                 app.session.clearWebFetchArtifacts();
             }
             disableSubagentHost(app);
+            if (comptime !host_target.is_wasm) {
+                if (discard_empty) {
+                    if (app.session_persistence.store) |store| {
+                        // Consumes `loaded` on every return; the store logs the disposition.
+                        _ = store.discardPristineStartedSession(app.alloc, loaded);
+                        app.session_persistence.writable = null;
+                        return handoff;
+                    }
+                }
+            }
             loaded.deinit(app.alloc);
             app.session_persistence.writable = null;
             return handoff;
+        }
+
+        /// A fresh interactive session that never received durable work has
+        /// nothing to resume. Discarding it on close keeps each launch from
+        /// leaving an empty session directory behind, matching `fx ask` and
+        /// ACP. A user-chosen title is durable intent, so a renamed session stays.
+        fn discardableOnClose(
+            app: *App,
+            loaded: *session_store.LoadedWritableSession,
+        ) bool {
+            if (!session_store.isPristineStartedSession(loaded)) return false;
+            const title = loaded.conversationTitle(app.alloc) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=pristine_session_discard disposition=retained reason=title_unreadable err={s}",
+                    .{@errorName(err)},
+                );
+                return false;
+            };
+            if (title) |value| {
+                app.alloc.free(value);
+                return false;
+            }
+            return true;
         }
 
         fn configureWebFetchArtifacts(
@@ -5651,10 +5865,15 @@ const FakeWorker = struct {
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
     active_prompt_is_root_authority: bool = false,
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn isCancelRequested(self: *const FakeWorker) bool {
+        return self.cancel_requested.load(.seq_cst);
     }
 
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
@@ -6689,10 +6908,44 @@ test "resume handoff suppresses missing and pristine writable sessions" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const pristine_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+    defer alloc.free(pristine_id);
     Runtime(TestApp).requestResumeHandoff(&app);
 
     try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
     try std.testing.expect(app.session_persistence.writable == null);
+    // Nothing durable happened, so closing leaves no empty session behind.
+    try std.testing.expectError(
+        error.SessionNotFound,
+        app.session_persistence.store.?.loadReadOnly(alloc, pristine_id),
+    );
+}
+
+test "closing a renamed pristine session keeps it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const renamed_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+    defer alloc.free(renamed_id);
+    try std.testing.expect(try app.session_persistence.writable.?.renameConversation(alloc, "kept by name"));
+
+    try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
+    var kept = try app.session_persistence.store.?.loadReadOnly(alloc, renamed_id);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings(renamed_id, kept.id);
 }
 
 test "upgrade resume handoff owns a validated pristine session" {
@@ -6723,6 +6976,10 @@ test "upgrade resume handoff owns a validated pristine session" {
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+    // The relaunch resumes this id, so closing must not discard it.
+    var kept = try app.session_persistence.store.?.loadReadOnly(alloc, expected_id);
+    defer kept.deinit(alloc);
+    try std.testing.expectEqualStrings(expected_id, kept.id);
 }
 
 test "resume handoff owns the exact non-pristine session id" {
@@ -10463,7 +10720,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var all_catalog: subagent_resume_admission.ActionableSessionCatalog = .{};
+    var all_catalog: session_catalog_cache.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
     try all_catalog.summaries.append(catalog_alloc, .{
         .id = try catalog_alloc.dupe(u8, "foreign-session"),
@@ -10557,7 +10814,7 @@ test "session picker cold open paints the persisted catalog before revalidation"
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var built = try subagent_resume_admission.listActionableCatalog(store, alloc, active_id, &stopped, &writer);
+    var built = try session_catalog_cache.listActionableCatalog(store, alloc, active_id, &stopped, &writer);
     defer built.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), built.summaries.items.len);
     app.session_persistence.session_picker_cache.deinit();
@@ -10603,7 +10860,7 @@ test "session catalog preload feeds the picker open without a second scan" {
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var seeded = try subagent_resume_admission.listActionableCatalog(
+    var seeded = try session_catalog_cache.listActionableCatalog(
         store,
         alloc,
         app.session_persistence.writable.?.active_id,
@@ -10675,7 +10932,7 @@ test "session catalog preload is best-effort and never duplicates an in-flight s
     var writer = (try session_catalog_cache.Writer.init(store)).?;
     defer writer.deinit();
     var stopped = std.atomic.Value(bool).init(false);
-    var seeded = try subagent_resume_admission.listActionableCatalog(
+    var seeded = try session_catalog_cache.listActionableCatalog(
         store,
         alloc,
         app.session_persistence.writable.?.active_id,
@@ -11982,4 +12239,162 @@ test "remembered selection write failure leaves pending user work durable and wa
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Session saved, but could not remember") != null);
     try std.testing.expect(std.mem.find(u8, app.notices.items[0], loaded.active_id) != null);
+}
+
+fn parseTestRecoveryCheckpoint(alloc: Allocator, cause: []const u8) !session_codec.RecoveryCheckpoint {
+    const json = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"turn_id\":1,\"user\":{{\"text\":\"saved request\",\"images\":[]}},\"assistant_source\":\"partial\",\"execution\":{{\"schema_version\":3,\"tool_steps\":[],\"files\":[]}},\"cause\":\"{s}\",\"action\":\"continuing_response\",\"tool_state\":\"uncertain\",\"authority\":{{\"provider\":\"gateway\",\"model\":\"test/model\",\"credential_source\":null,\"credential_identity\":null}},\"requested_fast_mode\":false,\"fast_mode\":false,\"max_provider_attempts\":3,\"consumed_provider_attempts\":0,\"outstanding_reservation\":false}}", .{cause});
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    return session_codec.parseRecoveryCheckpoint(alloc, parsed.value);
+}
+
+test "recovery auto-continue asks after an unclean exit instead of restarting" {
+    const alloc = std.testing.allocator;
+    var interrupted = try parseTestRecoveryCheckpoint(alloc, "response_interrupted");
+    defer interrupted.deinit(alloc);
+    try std.testing.expectEqual(.auto_continue, recoveryAutoContinueDecision(interrupted, false, false));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, false));
+    // Suppression stays sticky: a clean quit without a resolution still asks.
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, false, true));
+    try std.testing.expectEqual(.ask_after_unclean_exit, recoveryAutoContinueDecision(interrupted, true, true));
+
+    var compaction = try parseTestRecoveryCheckpoint(alloc, "compaction_prepared");
+    defer compaction.deinit(alloc);
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, false, false));
+    try std.testing.expectEqual(.skip_compaction_owned, recoveryAutoContinueDecision(compaction, true, true));
+}
+
+test "fresh prompt boundary waits out the cancel finalization window" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // The cancel-finalization window: turn still open, checkpoint cleared.
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - started_ms >= 150);
+
+    // A checkpointed open turn still resolves immediately.
+    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
+        .turn_id = 1,
+        .user = .{ .text = @constCast("saved pending request") },
+        .assistant_source = @constCast(""),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    });
+    var ready = (try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200)).?;
+    ready.deinit(alloc);
+
+    // A close landing mid-wait resolves the boundary as no prior turn.
+    try Runtime(TestApp).clearRecoveryCheckpoint(&app);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(app_ptr: *TestApp) void {
+            io_mod.sleep(100 * std.time.ns_per_ms);
+            app_ptr.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app_ptr.session_persistence.write_mutex.unlock(io_mod.getIo());
+            app_ptr.session_persistence.writable.?.conversation_writer.turn_open = false;
+        }
+    }.run, .{&app});
+    defer closer.join();
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 10_000) == null);
+}
+
+test "fresh prompt boundary fails fast after the first wedged timeout" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    // The wedge is latched: later sends fail fast instead of re-waiting.
+    const latched_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - latched_ms < 150);
+
+    // The latch clears when the turn closes...
+    app.session_persistence.writable.?.conversation_writer.turn_open = false;
+    try std.testing.expect(try Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200) == null);
+    // ...and a later open turn earns a full wait again.
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const reopened_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 200),
+    );
+    try std.testing.expect(io_mod.milliTimestamp() - reopened_ms >= 150);
+}
+
+test "fresh prompt boundary aborts the wait when cancellation lands" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    app.session_persistence.writable.?.conversation_writer.turn_open = true;
+    const canceller = try std.Thread.spawn(.{}, struct {
+        fn run(app_ptr: *TestApp) void {
+            io_mod.sleep(150 * std.time.ns_per_ms);
+            app_ptr.worker.cancel_requested.store(true, .seq_cst);
+        }
+    }.run, .{&app});
+    defer canceller.join();
+    const started_ms = io_mod.milliTimestamp();
+    try std.testing.expectError(
+        error.InvalidRecoveryCheckpoint,
+        Runtime(TestApp).snapshotFreshPromptBoundaryWithin(&app, alloc, 30_000),
+    );
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expect(elapsed_ms >= 150);
+    try std.testing.expect(elapsed_ms < 5_000);
 }

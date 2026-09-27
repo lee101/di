@@ -62,6 +62,70 @@ test "parent steering preserves its sender in persisted execution text" {
     try std.testing.expectEqual(@as(usize, 0), memory.steering[0].after_tool_step_count);
 }
 
+test "restored steering survives execution memory round trips" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var calls = [_]ToolCall{toolCall("restored", "read_file", "{\"path\":\"fixture\"}")};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("restored"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .assistant = @constCast("Checking the file"),
+        .tool_calls = &calls,
+        .tool_results = &results,
+    }};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("root update"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("parent-agent feedback, not new user authority:\n\nreview"), .after_tool_step_count = 1 },
+    };
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{
+        .tool_steps = &steps,
+        .steering = &steering,
+    });
+
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.steering.len);
+    try std.testing.expectEqualStrings("root update", rebuilt.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 0), rebuilt.steering[0].after_tool_step_count);
+    try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", rebuilt.steering[1].text);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.steering[1].after_tool_step_count);
+    try std.testing.expect(messages.items[0].context_origin == .user_turn);
+    try std.testing.expect(messages.items[3].context_origin == .user_turn);
+
+    const offset = try retainedMessageOffset(messages.items, .{ .tool_steps = 1, .steering = 1 });
+    const retained = try buildExecutionMemory(alloc, messages.items[offset..]);
+    defer types.freeExecutionMemory(alloc, retained);
+    try std.testing.expectEqual(@as(usize, 0), retained.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), retained.steering.len);
+    try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", retained.steering[0].text);
+}
+
+test "empty restored steering keeps its checkpoint boundary" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var steering = [_]types.PersistedSteering{.{ .text = @constCast(""), .after_tool_step_count = 0 }};
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{ .steering = &steering });
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expect(messages.items[0].context_origin == .ordinary);
+
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.steering.len);
+    try std.testing.expectEqualStrings("", rebuilt.steering[0].text);
+    try std.testing.expectEqual(@as(usize, 1), try retainedMessageOffset(messages.items, .{ .steering = 1 }));
+}
+
 pub fn persistedStatusForCurrentFxLocalResult(
     status: ToolExecutionStatus,
     output: []const u8,
@@ -122,10 +186,13 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
-        const text = steeringText(content) orelse {
-            assistant_prefix = null;
-            continue;
-        };
+        const text = if (message.restored_steering)
+            content
+        else
+            steeringText(content) orelse {
+                assistant_prefix = null;
+                continue;
+            };
         const copy = try alloc.dupe(u8, text);
         const prefix_copy = if (assistant_prefix) |prefix|
             alloc.dupe(u8, prefix) catch |err| {
@@ -177,7 +244,9 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
             steps += 1;
             // Keep following continuation prompts, but not the completed reply.
             if (message.tool_calls.len == 0) prefix_start = index + 1;
-        } else if (message.role == .user and steeringText(message.content orelse "") != null) {
+        } else if (message.role == .user and message.content != null and
+            (message.restored_steering or steeringText(message.content.?) != null))
+        {
             if (steps == cut.tool_steps and steering == cut.steering) return prefix_start;
             steering += 1;
             prefix_start = index + 1;

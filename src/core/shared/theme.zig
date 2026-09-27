@@ -1,9 +1,10 @@
 //! Built-in color themes plus theme.json loading.
 //!
-//! `fx_dark` and `fx_light` are the historical fx palettes, preserved byte for
-//! byte so the default look never changes. Both core presentation and ui
-//! rendering resolve their themed values from here. User themes load from
-//! `~/.fx/themes/<name>.json` (selected with FX_THEME=<name>) in either the
+//! `fx_dark` and `fx_light` retain their historical palette bytes. The ui
+//! keeps diff marker accents off until a theme is explicitly selected. Both
+//! core presentation and ui rendering resolve their themed values from here.
+//! User themes load from `~/.fx/themes/<name>.json` (selected with
+//! FX_THEME=<name>) in either the
 //! native fx slot schema or the VS Code theme schema (`colors` +
 //! `tokenColors`), so editor themes like GitHub Dark apply
 //! directly. Hex colors resolve to truecolor escapes when the terminal
@@ -48,11 +49,10 @@ pub const Theme = struct {
     red_style: []const u8,
     diff_added_style: []const u8,
     diff_removed_style: []const u8,
-    // The line number and +/- sign carry the only color in an otherwise
-    // monochrome diff: green for additions (#30A46C), red for deletions
-    // (#E5484D). Truecolor when the terminal supports it, 256-color fallback
-    // otherwise. Both variants ship in every theme because capability is a
-    // terminal property, not a theme property.
+    // When selected, the line number and +/- sign carry the diff color:
+    // green for additions (#30A46C), red for deletions (#E5484D).
+    // Unconfigured builtins keep markers monochrome. Both truecolor and
+    // 256-color variants ship in each theme for terminal capability selection.
     diff_added_marker_truecolor: []const u8,
     diff_removed_marker_truecolor: []const u8,
     diff_added_marker_fallback: []const u8,

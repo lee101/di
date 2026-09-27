@@ -2706,8 +2706,6 @@ test "registered shell empty observation waits through one managed execution" {
             .source = .yolo,
         },
     };
-    var start_status_detail: ?[]u8 = null;
-    defer if (start_status_detail) |detail| alloc.free(detail);
     const started = try tool_dispatch.dispatchAuthorizedToolCall(
         .{
             .allocator = alloc,
@@ -2729,7 +2727,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 2; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
-        &start_status_detail,
     );
     defer started.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
@@ -2745,8 +2742,6 @@ test "registered shell empty observation waits through one managed execution" {
     );
     defer alloc.free(interact_arguments);
 
-    var wait_status_detail: ?[]u8 = null;
-    defer if (wait_status_detail) |detail| alloc.free(detail);
     var command_result_json: ?[]const u8 = null;
     defer if (command_result_json) |json| alloc.free(@constCast(json));
     var tool_result_memory: ?types.ToolResultMemory = null;
@@ -2772,7 +2767,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = interact_arguments,
         },
-        &wait_status_detail,
     );
     defer waited.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, waited.status);

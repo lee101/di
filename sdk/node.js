@@ -13,6 +13,7 @@ import {
   encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
+  normalizeAgentOptions,
   supportsJspi,
   xtermAdapter,
 } from "./fx-sdk.js";
@@ -513,10 +514,11 @@ function createNativeAgent(addon, options) {
 }
 
 async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
-  const { nativeAddon, backend = "auto", ...runtimeOptions } = options ?? {};
+  const { nativeAddon, backend = "auto", ...unvalidatedOptions } = options ?? {};
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
+  const runtimeOptions = surface === "agent" ? normalizeAgentOptions(unvalidatedOptions) : unvalidatedOptions;
 
   let nativeError;
   let nativeAttempted = false;
@@ -530,7 +532,8 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
         return await native.backend[nativeMethod](runtimeOptions);
       } catch (error) {
         nativeError = error;
-        if (backend === "native") throw error;
+        if (backend === "native" || error?.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ||
+          error?.code === "LIBFX_MODEL_UNSUPPORTED_EFFORT") throw error;
       }
     }
     if (backend === "native") {
@@ -549,9 +552,6 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 }
 
 export async function createFxAgent(options = {}) {
-  if (options != null && Object.hasOwn(Object(options), "env")) {
-    throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
-  }
   return createWithFallback(
     "agent",
     "createCore",

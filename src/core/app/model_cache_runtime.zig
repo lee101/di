@@ -358,11 +358,6 @@ pub const ModelMenu = struct {
         return false;
     }
 
-    pub fn selectedModelAlloc(self: *const ModelMenu, alloc: Allocator) !?[]u8 {
-        const selected = (try self.selectedItemAlloc(alloc)) orelse return null;
-        return selected.id;
-    }
-
     pub fn selectedItemAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
         if (!self.active) return null;
         const item = self.itemAt(self.selected_index) orelse return null;

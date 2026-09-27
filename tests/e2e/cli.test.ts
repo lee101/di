@@ -2688,7 +2688,7 @@ describe("cli: sessions", () => {
   );
 
   test(
-    "session lists use projections without opening unreadable event logs",
+    "session lists use projections when event logs are unreadable",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-projections-"));
       try {

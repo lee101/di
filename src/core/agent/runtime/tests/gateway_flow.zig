@@ -22,6 +22,7 @@ const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const prompt_context = @import("../prompt_context.zig");
+const runtime_orchestrator = @import("../orchestrator.zig");
 
 const test_support = @import("support.zig");
 
@@ -714,6 +715,102 @@ test "processQueuedPrompt recovers when a model rejects post-Vision assistant pr
     );
     try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
     try std.testing.expectEqualStrings("Recovered final answer", hooks.finish_assistant_text.?);
+}
+
+test "fake gateway rejects assistant prefill and unexpected tail continuations" {
+    const alloc = std.testing.allocator;
+    const check = test_support.expectReplyablePromptTail;
+    try check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"go\"}]}]}", false);
+    try check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"tool\",\"content\":[]}]}", false);
+    try std.testing.expectError(
+        error.TestAssistantPrefillRequest,
+        check(alloc, "{\"prompt\":[{\"role\":\"user\",\"content\":[]},{\"role\":\"assistant\",\"content\":[]}]}", true),
+    );
+    const continued = try std.fmt.allocPrint(
+        alloc,
+        "{{\"prompt\":[{{\"role\":\"assistant\",\"content\":[]}},{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}]}}",
+        .{runtime_orchestrator.assistant_tail_continuation_prompt},
+    );
+    defer alloc.free(continued);
+    try std.testing.expectError(error.TestAssistantTailContinued, check(alloc, continued, false));
+    try check(alloc, continued, true);
+}
+
+fn expectMalformedArgumentFeedback(
+    gateway: *const FakeGateway,
+    index: usize,
+    failure: []const u8,
+    received_bytes: usize,
+) !void {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gateway.request_bodies.items[index], .{});
+    defer parsed.deinit();
+    const prompt = parsed.value.object.get("prompt").?.array.items;
+    const tail = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", tail.get("role").?.string);
+    const result = tail.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("error-text", result.get("output").?.object.get("type").?.string);
+    var feedback = try std.json.parseFromSlice(std.json.Value, alloc, result.get("output").?.object.get("value").?.string, .{});
+    defer feedback.deinit();
+    const details = feedback.value.object.get("error").?.object.get("details").?.object;
+    try std.testing.expectEqualStrings(failure, details.get("failure").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(received_bytes)), details.get("received_bytes").?.integer);
+}
+
+test "processQueuedPrompt returns diagnosed feedback so the model can correct malformed arguments" {
+    const alloc = std.testing.allocator;
+    const malformed = [_]ToolCall{toolCall("call_cut", "read_file", "{\"path\":\"a")};
+    const corrected = [_]ToolCall{toolCall("call_fixed", "read_file", "{\"path\":\"a\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &malformed },
+        .{ .tool_calls = &corrected },
+        .{ .content = "Read after correcting the call" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectMalformedArgumentFeedback(&gateway, 1, "truncated", malformed[0].arguments_json.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
+    try std.testing.expectEqualStrings("Read after correcting the call", hooks.finish_assistant_text.?);
+}
+
+test "processQueuedPrompt recovers when a model rejects assistant prefill after a malformed tool call" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("call_bad_prefill", "read_file", "{\"path\":\"a\",}")};
+    const prefill_rejection =
+        "{\"error\":{\"message\":\"AI_APICallError: This model does not support " ++
+        "assistant message prefill. The conversation must end with a user message.\"}}";
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &calls },
+        .{ .status = .bad_request, .err_body = prefill_rejection },
+        .{ .content = "Recovered after malformed call" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+    try expectMalformedArgumentFeedback(&gateway, 1, "syntax_error", calls[0].arguments_json.len);
+    try expectGatewayPromptTailText(
+        &gateway,
+        2,
+        .user,
+        "Continue from the preceding tool result.",
+    );
+    try std.testing.expectEqual(@as(?std.http.Status, null), hooks.http_status);
+    try std.testing.expectEqualStrings("Recovered after malformed call", hooks.finish_assistant_text.?);
 }
 
 test "text-only Vision keeps later permission restriction trusted across model steps" {
@@ -2912,7 +3009,8 @@ test "processQueuedPrompt projects bounded output limits into gateway requests" 
         expected_json: ?[]const u8,
     }{
         .{ .context_window = 256_000, .max_output_tokens = 32_000, .expected_json = "\"maxOutputTokens\":32000" },
-        .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576, .expected_json = null },
+        .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576, .expected_json = "\"maxOutputTokens\":32768" },
+        .{ .context_window = 256_000, .max_output_tokens = null, .expected_json = null },
     };
 
     for (cases) |case| {
@@ -3325,46 +3423,50 @@ test "processQueuedPrompt compacts and retries one context overflow" {
         .model = model,
         .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
     }};
-    const completions = [_]FakeCompletion{
-        .{
-            .status = .bad_request,
-            .err_body =
-            \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
-            ,
-        },
-        .{ .content = "Retain the completed prior turn and continue from it." },
-        .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+    const overflow_bodies = [_][]const u8{
+        \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+        ,
+        // Anthropic's rejection, as the gateway returns it.
+        \\{"error":{"message":"prompt is too long: 1077372 tokens > 1000000 maximum","type":"AI_APICallError"}}
+        ,
     };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.available_capability_overrides = &available_overrides;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.model = @constCast(model);
-    var history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
-        .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
-    } }};
-    job.history = &history;
+    for (overflow_bodies) |overflow_body| {
+        const completions = [_]FakeCompletion{
+            .{ .status = .bad_request, .err_body = overflow_body },
+            .{ .content = "Retain the completed prior turn and continue from it." },
+            .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
+            .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+        } }};
+        job.history = &history;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 1, "\"tools\":[]");
-    try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
-    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
-    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
-    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
-    try std.testing.expectEqualStrings(
-        "CONTEXT_OVERFLOW_RECOVERED",
-        hooks.finish_assistant_text.?,
-    );
-    try std.testing.expect(hooks.http_status == null);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 1, "\"tools\":[]");
+        try expectBodyContains(&gateway, 2, "context_handoff");
+        try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+        try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+        try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+        try std.testing.expectEqualStrings(
+            "CONTEXT_OVERFLOW_RECOVERED",
+            hooks.finish_assistant_text.?,
+        );
+        try std.testing.expect(hooks.http_status == null);
+    }
 }
 
 test "processQueuedPrompt stops after one context overflow recovery" {

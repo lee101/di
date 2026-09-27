@@ -1,14 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const {
-  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText,
-  heldFakeGatewayFinalText, startDynamicFakeGateway, hasEmptyComposer,
-  tmuxAvailable,
+  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall,
+  fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
+  hasEmptyComposer, tmuxAvailable,
 } = await import("./tmux-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
@@ -590,4 +591,304 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       passed = true;
     } finally { await f.cleanup(passed); }
   }, 60_000);
+
+  test("auto: steering sent during a turn stays user text through compaction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compaction-steering-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    for (let n = 1; n <= 30; n++) {
+      writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
+    }
+    const task = "STEER_TASK_8d4: read the probe files and report progress.";
+    // Longer than the excerpt compaction used for generated notices.
+    const steering = "STEER_RULE_8d4: prefix every progress line with S1>. " +
+      "Keep all of this correction. ".repeat(80) + "STEER_END_8d4";
+    const ordinaryBodies: string[] = [];
+    const summaryBodies: string[] = [];
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        summaryBodies.push(raw);
+        return fakeGatewayFinalText("STEER_SUMMARY_8d4: the probe files are being read.");
+      }
+      ordinaryBodies.push(raw);
+      const n = ordinaryBodies.length;
+      if (summaryBodies.length > 0) return fakeGatewayFinalText("STEER_DONE_8d4");
+      if (n === 1) return fakeShellRun("steer-window-8d4", "printf STEER_WINDOW_8d4; sleep 3");
+      if (n <= 31) return fakeGatewayToolCall(`steer-probe-${n - 1}-8d4`, "read_file", { path: `probe-${n - 1}.txt` });
+      return fakeGatewayFinalText("STEER_NOT_COMPACTED_8d4");
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 60000, max_tokens: 4096 }] });
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const command = `/usr/bin/env -i ${Object.entries(env)
+      .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: command, cwd: workspace, env, isolated: true, remainOnExit: true,
+        stderrPath, width: 120, height: 40, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(15_000);
+      await terminal.sendText(task);
+      await terminal.waitForText("STEER_WINDOW_8d4", 15_000);
+      await terminal.sendText(steering);
+      await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
+      await terminal.waitForText("STEER_DONE_8d4", 20_000);
+
+      const steered = ordinaryBodies.filter((body) => body.includes("STEER_RULE_8d4"));
+      expect(steered.length).toBeGreaterThan(1);
+      expect(steered[0]).toContain("<user_steering>");
+
+      const source = JSON.parse(summaryBodies[0]!).prompt
+        .filter((message: { role: string }) => message.role === "user")
+        .map((message: { content: { text?: string }[] }) => message.content.map((part) => part.text ?? "").join(""))
+        .join("\n");
+      const at = source.indexOf("STEER_RULE_8d4");
+      expect(at).toBeGreaterThan(-1);
+      const header = source.slice(source.lastIndexOf("\n### ", at) + 1, at);
+      expect(header).toStartWith("### User\n> USER_RETAINED:");
+      expect(header).not.toContain("Generated notice");
+      expect(source).toContain("STEER_END_8d4");
+
+      const sessionId = readdirSync(join(home, ".fx/sessions"))
+        .find((id) => existsSync(join(home, ".fx/sessions", id, "events.jsonl")));
+      expect(sessionId).toBeDefined();
+      const sessionDir = join(home, ".fx/sessions", sessionId!);
+      await until(() => readFileSync(join(sessionDir, "events.jsonl"), "utf8").includes("\"turn_completed\""), "saved turn", 10_000);
+      const handoff = readFileSync(join(sessionDir, "events.jsonl"), "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).find((frame) => frame.event?.context_checkpoint)?.event.context_checkpoint.summary ?? "";
+      const match = /> fx-compaction-state-v1 (\S+) (\d+) ([a-f0-9]{64})\n/.exec(handoff);
+      expect(match).not.toBeNull();
+      const state = JSON.parse(readFileSync(join(sessionDir, "tool-results", match![1]!), "utf8"));
+      expect(state.users).toEqual([task, steering]);
+
+      const afterCompaction = ordinaryBodies.at(-1)!;
+      expect(afterCompaction).toContain("<context_handoff>");
+      expect(afterCompaction).toContain("STEER_END_8d4");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary: ordinaryBodies.length, summaries: summaryBodies.length }, null, 2));
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`compaction steering evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  for (const injectedStaleCheckpoint of [false, true]) {
+    test(`overflow recovery ${injectedStaleCheckpoint ? "blocks a stale checkpoint" : "saves a retained image turn"} after a killed post-compaction tool`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-compaction-recovery-"));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const image = join(workspace, "before.png");
+      const queuedImage = join(workspace, "queued.png");
+      const trace = join(root, "active.trace");
+      const activeStderr = join(root, "active.stderr");
+      const resumedStderr = join(root, "resumed.stderr");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace);
+      copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), image);
+      copyFileSync(join(import.meta.dir, "fixtures/favicon.png"), queuedImage);
+      for (let step = 2; step <= 24; step++) {
+        writeFileSync(join(workspace, `probe-${step}.txt`),
+          Array.from({ length: 80 }, (_, line) =>
+            `READ_PROBE_BEFORE_OVERFLOW_67e step=${step} line=${line} long evidence for retained context boundary\n`).join(""));
+      }
+      writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+        model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+      }));
+
+      const summaryHold = heldFakeGatewayFinalText();
+      let phase: "seed" | "active" | "resume" | "followup" = "seed";
+      let ordinary = 0;
+      let summaries = 0;
+      let summaryReleased = false;
+      let postCompactionTool = false;
+      const gateway = startDynamicFakeGateway((raw) => {
+        const request = JSON.parse(raw);
+        const summary = request.toolChoice?.type === "none" && request.tools?.length === 0;
+        if (summary) {
+          summaries++;
+          return summaryHold.response;
+        }
+        ordinary++;
+        if (phase === "seed") return fakeGatewayFinalText("RECOVERY_COMPACTION_SEED_67e");
+        if (phase === "active" && summaryReleased) {
+          postCompactionTool = true;
+          return fakeShellRun("post-compact-tool-67e",
+            "printf POST_COMPACT_TOOL_RUNNING_67e; sleep 15; printf POST_COMPACT_TOOL_FINISHED_67e");
+        }
+        if (phase === "active" && ordinary === 10) {
+          return fakeShellRun("early-steer-tool-67e", "printf EARLY_STEER_TOOL_RUNNING_67e; sleep 2");
+        }
+        if (phase === "active" && ordinary === 19) {
+          return fakeShellRun("late-steer-tool-67e", "printf LATE_STEER_TOOL_RUNNING_67e; sleep 2");
+        }
+        if (phase === "active" && ordinary <= 24) {
+          return fakeGatewayToolCall(`probe-read-${ordinary}-67e`, "read_file", { path: `probe-${ordinary}.txt` });
+        }
+        if (phase === "active" && ordinary === 25) {
+          return Response.json({ error: {
+            type: "invalid_request_error", code: "context_length_exceeded",
+            message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+          } }, { status: 400 });
+        }
+        if (phase === "resume") return fakeGatewayFinalText("RECOVERY_SAVED_TURN_67e");
+        return fakeGatewayFinalText("RECOVERY_FOLLOWUP_67e");
+      }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["vision", "file-input", "tool-use"], context_window: 400000, max_tokens: 8192 }] });
+      const env: Record<string, string> = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+        TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+        FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+        FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
+        FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "input,worker,session,agent,compaction,images,gateway",
+        FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      };
+      const command = (sessionId: string) => `/usr/bin/env -i ${Object.entries(env)
+        .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
+      const savedFrames = (eventsPath: string) => readFileSync(eventsPath, "utf8").trim().split("\n")
+        .filter(Boolean).map((line) => JSON.parse(line));
+      let active: InstanceType<typeof TmuxSession> | undefined;
+      let resumed: InstanceType<typeof TmuxSession> | undefined;
+      let passed = false;
+      try {
+        const seed = Bun.spawn([binary, "ask", "--json", "--auto", "Seed the compaction recovery scenario."], {
+          cwd: workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+        });
+        const [seedCode, seedStdout, seedStderr] = await Promise.all([
+          seed.exited, new Response(seed.stdout).text(), new Response(seed.stderr).text(),
+        ]);
+        expect(seedCode).toBe(0);
+        expect(seedStderr).toBe("");
+        const sessionId = JSON.parse(seedStdout).session_id as string;
+        const sessionDir = join(home, ".fx/sessions", sessionId);
+        const eventsPath = join(sessionDir, "events.jsonl");
+        const recoveryPath = join(sessionDir, "recovery.json");
+        const completedBefore = savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length;
+
+        phase = "active";
+        active = await TmuxSession.create({
+          cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
+          stderrPath: activeStderr, width: 110, height: 36, startupWaitMs: 0,
+        });
+        await active.waitForStableComposer(15_000);
+        const steer = (async () => {
+          await active!.waitForText("EARLY_STEER_TOOL_RUNNING_67e", 15_000);
+          await active!.sendText("STEER_EARLY_67e");
+          await active!.waitForText("LATE_STEER_TOOL_RUNNING_67e", 15_000);
+          await active!.sendText("STEER_LATE_67e");
+        })();
+        await active.sendText(`ACTIVE_IMAGE_TURN_67e ${image}`);
+        await until(() => summaries === 1, "context-overflow compaction", 20_000);
+        await steer;
+        summaryReleased = true;
+        summaryHold.release("COMPACTION_HANDOFF_67e preserve the retained image context");
+        await until(() => postCompactionTool && savedFrames(eventsPath)
+          .some((frame) => frame.event?.context_checkpoint), "post-compaction tool", 20_000);
+        const retained = JSON.parse(readFileSync(recoveryPath, "utf8")).checkpoint.execution;
+        expect(retained.tool_steps).toHaveLength(9);
+        expect(retained.steering).toHaveLength(1);
+        await active.waitForText("POST_COMPACT_TOOL_RUNNING_67e", 10_000);
+        await active.sendText(`QUEUED_DURING_TOOL_67e ${queuedImage}`);
+        await until(() => existsSync(trace) && readFileSync(trace, "utf8").split("event=prompt_enqueue").length >= 3,
+          "queued image admission", 5_000);
+        if (injectedStaleCheckpoint) {
+          const stale = JSON.parse(readFileSync(recoveryPath, "utf8"));
+          expect(stale.checkpoint.execution.tool_steps.length).toBeGreaterThanOrEqual(2);
+          stale.checkpoint.execution.tool_steps = stale.checkpoint.execution.tool_steps.slice(2);
+          for (const steering of stale.checkpoint.execution.steering) {
+            expect(steering.after_tool_step_count).toBeGreaterThanOrEqual(2);
+            steering.after_tool_step_count -= 2;
+          }
+          writeFileSync(recoveryPath, JSON.stringify(stale));
+          expect(stale.checkpoint.execution.tool_steps).toHaveLength(7);
+        }
+
+        const fixturePid = active.processPid();
+        const fixtureCommand = execFileSync("ps", ["-p", String(fixturePid), "-o", "command="], { encoding: "utf8" });
+        expect(fixtureCommand).toContain(binary);
+        expect(fixtureCommand).toContain(sessionId);
+        process.kill(fixturePid, "SIGKILL");
+        await until(() => active!.paneStatus().dead, "fixture fx SIGKILL", 5_000);
+        const completedAtKill = savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length;
+        expect(completedAtKill).toBe(completedBefore);
+        await active.kill();
+        active = undefined;
+
+        phase = "resume";
+        const requestsBeforeRecovery = gateway.requestCount();
+        resumed = await TmuxSession.create({
+          cmd: command(sessionId), cwd: workspace, env, isolated: true, remainOnExit: true,
+          stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
+        });
+        await resumed.waitForPane((pane) =>
+          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
+        expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
+        await resumed.waitForStableComposer(10_000);
+        await resumed.sendText("continue");
+        const recoveryScreen = await resumed.waitForPane((pane) =>
+          pane.includes("RECOVERY_SAVED_TURN_67e") || pane.includes("InvalidContextHistoryStart"), 15_000);
+        await resumed.waitForStableComposer(10_000);
+        if (injectedStaleCheckpoint) {
+          expect(recoveryScreen).toContain("InvalidContextHistoryStart");
+          expect(recoveryScreen).not.toContain("DuplicateImageId");
+          expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
+          expect(savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length).toBe(completedAtKill);
+        } else {
+          expect(recoveryScreen).toContain("RECOVERY_SAVED_TURN_67e");
+          expect(recoveryScreen).not.toContain("InvalidContextHistoryStart");
+          const resumeRequest = gateway.requests.at(-1)?.body ?? "";
+          expect(resumeRequest).toContain("STEER_LATE_67e");
+          expect(resumeRequest).toContain('"type":"file"');
+          phase = "followup";
+          const requestsBeforeFollowup = gateway.requestCount();
+          await resumed.sendText("RECOVERY_FOLLOWUP_REQUEST_67e");
+          const finalScreen = await resumed.waitForPane((pane) => pane.includes("RECOVERY_FOLLOWUP_67e"), 15_000);
+          expect(finalScreen).not.toContain("InvalidContextHistoryStart");
+          expect(finalScreen).not.toContain("DuplicateImageId");
+          await until(() => savedFrames(eventsPath).filter((frame) => frame.event?.turn_completed).length === completedAtKill + 2,
+            "saved recovered and follow-up turns", 10_000);
+          expect(gateway.requestCount()).toBe(requestsBeforeFollowup + 1);
+          expect(existsSync(recoveryPath)).toBe(false);
+        }
+        const imageIds = savedFrames(eventsPath).flatMap((frame) =>
+          frame.event?.user?.images?.map((image: { id: number }) => image.id) ?? []);
+        expect(new Set(imageIds).size).toBe(imageIds.length);
+        expect(readFileSync(activeStderr, "utf8")).toBe("");
+        expect(readFileSync(resumedStderr, "utf8")).toBe("");
+        passed = true;
+      } finally {
+        if (!passed) {
+          writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary, summaries, phase }, null, 2));
+          if (resumed) writeFileSync(join(root, "failure.scrollback.txt"), await resumed.captureFullScrollback());
+          console.error(`compaction recovery evidence retained: ${root}`);
+        }
+        await active?.kill();
+        await resumed?.kill();
+        summaryHold.dispose();
+        gateway.stop();
+        if (passed) rmSync(root, { recursive: true, force: true });
+      }
+    }, 90_000);
+  }
 });

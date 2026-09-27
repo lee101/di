@@ -24,7 +24,11 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
-const terminal_wait_pulse_ms: u64 = 100;
+/// Bounds how long a parent wait takes to observe cancellation or steering,
+/// and how long the polling loops take to see a child change. The terminal
+/// result wait also wakes on child state changes. Status publishing is rate
+/// limited separately, so a short pulse only adds cheap wakeups.
+const terminal_wait_pulse_ms: u64 = 20;
 
 pub const Defaults = struct {
     provider: model_provider.ProviderId,

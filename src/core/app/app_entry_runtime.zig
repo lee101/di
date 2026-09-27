@@ -103,14 +103,6 @@ pub const Config = struct {
     acp_runner: acp_runner.Runner,
 };
 
-pub fn run(comptime App: type, alloc: Allocator, args: []const [:0]const u8, cfg: Config) !void {
-    const outcome = try runWithDeps(App, alloc, args, cfg, .{});
-    switch (outcome) {
-        .returned => return,
-        .exit => |code| std.process.exit(code),
-    }
-}
-
 pub const RunOutcome = union(enum) {
     returned,
     exit: u8,
@@ -162,7 +154,8 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
         .exit => |code| return .{ .exit = code },
     }
 
-    return runInteractiveWithDeps(App, false, alloc, &launch, cfg.auth_mode, deps);
+    var app: App = undefined;
+    return runInteractiveWithDeps(App, false, &app, alloc, &launch, cfg.auth_mode, deps);
 }
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
@@ -212,23 +205,27 @@ fn benchEnabled() bool {
     return io_mod.getenv("FX_BENCH") != null;
 }
 
-pub fn runInteractive(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, false, alloc, launch, auth_mode, .{});
+/// `app` is uninitialized storage that must stay valid until the process
+/// exits: interactive shutdown stops background threads without joining them,
+/// so they can still reach the app after this returns.
+pub fn runInteractive(comptime App: type, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
+    return runInteractiveWithDeps(App, false, app, alloc, launch, auth_mode, .{});
 }
 
 /// Runs the interactive product without native CLI dispatch, process replacement,
 /// or a worker thread. Single-threaded hosts must arrange cooperative prompt work.
 pub fn runInteractiveCooperative(comptime App: type, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode) !RunOutcome {
-    return runInteractiveWithDeps(App, true, alloc, launch, auth_mode, .{});
+    var app: App = undefined;
+    return runInteractiveWithDeps(App, true, &app, alloc, launch, auth_mode, .{});
 }
 
 fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8, _: cli_surface.Config) anyerror!cli_surface.RunResult {
     return error.UnknownCliCommand;
 }
 
-fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
+fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     const resume_requested = launch.requested_resume != null;
-    var app = App.init(alloc, launch, auth_mode) catch |err| {
+    app.* = App.init(alloc, launch, auth_mode) catch |err| {
         switch (err) {
             error.NotATerminal => {
                 writeStderr(deps, "di requires an interactive terminal (TTY).\n");
@@ -252,6 +249,12 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             },
             error.NoSavedSessions => {
                 writeStderr(deps, "di: no saved sessions for this workspace.\n");
+                return .{ .exit = 1 };
+            },
+            error.NoReadableSessions => {
+                // The unreadable sessions can belong to any workspace, so only
+                // the absence of a readable one is tied to this workspace.
+                writeStderr(deps, "di: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `di doctor` for recovery guidance.\n");
                 return .{ .exit = 1 };
             },
             error.SessionNotFound => {
@@ -299,7 +302,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (comptime cooperative) {
             app.deinit();
         } else {
-            var shutdown = app.deinitWithResumeHandoff();
+            var shutdown = app.shutdownForProcessExit();
             defer shutdown.deinit(alloc);
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
@@ -315,7 +318,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
         if (@hasDecl(App, "startFileIndex")) app.startFileIndex();
-        startWorkerThread(App, &app, deps) catch |err| {
+        startWorkerThread(App, app, deps) catch |err| {
             app.releaseTerminal();
             reportUnexpectedInteractiveError(deps, err);
             return err;
@@ -331,7 +334,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
             if (comptime cooperative) {
                 app.deinit();
             } else {
-                var shutdown = app.deinitWithResumeHandoff();
+                var shutdown = app.shutdownForProcessExit();
                 defer shutdown.deinit(alloc);
                 if (shutdown.failure) |failure| {
                     reportShutdownFailure(deps, failure);
@@ -363,7 +366,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, alloc:
     const shutdown: app_session_runtime.ShutdownOutcome = if (comptime cooperative) blk: {
         app.deinit();
         break :blk .{};
-    } else app.deinitWithResumeHandoff();
+    } else app.shutdownForProcessExit();
     const handoff_value = shutdown.handoff;
     if (shutdown.failure) |err| {
         if (handoff_value) |value| {
@@ -795,7 +798,7 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn deinitWithResumeHandoff(self: *TestApp) app_session_runtime.ShutdownOutcome {
+    fn shutdownForProcessExit(self: *TestApp) app_session_runtime.ShutdownOutcome {
         const handoff: ?app_session_runtime.ResumeHandoff = if (active_capture.?.resume_handoff_id) |id| blk: {
             const session_id = std.testing.allocator.dupe(u8, id) catch {
                 self.deinit();
@@ -1309,13 +1312,22 @@ test "app entry maps noninteractive terminal startup to exit one" {
 
 test "app entry maps missing saved sessions to exit one" {
     const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.NoSavedSessions;
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
+    const Case = struct { err: anyerror, stderr: []const u8 };
+    for ([_]Case{
+        .{ .err = error.NoSavedSessions, .stderr = "di: no saved sessions for this workspace.\n" },
+        .{
+            .err = error.NoReadableSessions,
+            .stderr = "di: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `di doctor` for recovery guidance.\n",
+        },
+    }) |case| {
+        var capture = TestCapture.init(.{ .interactive = .{} });
+        defer capture.deinit();
+        capture.init_error = case.err;
+        const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
 
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqualStrings("di: no saved sessions for this workspace.\n", capture.stderr.written());
+        try std.testing.expectEqual(@as(u8, 1), outcome.exit);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+    }
 }
 
 test "app entry maps unavailable session state to one expected startup failure" {

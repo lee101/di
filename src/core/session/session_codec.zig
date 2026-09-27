@@ -544,7 +544,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeAll(",\"provider_replay\":");
             try std.json.Stringify.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
-            try writeExecutionMemory(writer, entry.execution);
+            try writeExecutionMemoryJson(writer, entry.execution, .durable);
             try writer.writeByte('}');
         },
         .interrupted => |entry| {
@@ -554,7 +554,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeOptionalDurableBytes(writer, entry.assistant);
             try writer.writeAll(",\"tool_call\":");
             if (entry.tool_call) |tool_call| {
-                try writeToolCall(writer, tool_call);
+                try writeExecutionToolCall(writer, tool_call, .durable);
             } else {
                 try writer.writeAll("null");
             }
@@ -571,7 +571,7 @@ pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             }
             if (hasDurableExecutionMemory(entry.execution)) {
                 try writer.writeAll(",\"execution\":");
-                try writeExecutionMemory(writer, entry.execution);
+                try writeExecutionMemoryJson(writer, entry.execution, .durable);
             }
             if (entry.cancelled_command) |presentation| {
                 try writer.writeAll(",\"cancelled_command\":");
@@ -1016,7 +1016,7 @@ pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
-    try writeExecutionMemory(writer, checkpoint.execution);
+    try writeExecutionMemoryJson(writer, checkpoint.execution, .durable);
     try writer.writeAll(",\"cause\":");
     try writeJsonString(writer, @tagName(checkpoint.cause));
     try writer.writeAll(",\"action\":");
@@ -1495,45 +1495,63 @@ fn writeSnapshotLocator(writer: *std.Io.Writer, value: ?[]const u8) !void {
     try writeDurableBytes(writer, locator);
 }
 
-fn writeExecutionMemory(writer: *std.Io.Writer, execution: session.ExecutionMemory) !void {
-    try writer.writeAll("{\"schema_version\":10,\"tool_steps\":[");
+pub const ExecutionMemoryJsonFormat = enum {
+    durable,
+    presentation,
+};
+
+pub noinline fn writeExecutionMemoryJson(
+    writer: *std.Io.Writer,
+    execution: session.ExecutionMemory,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    try writer.writeAll(if (format == .durable)
+        "{\"schema_version\":10,\"tool_steps\":["
+    else
+        "{\"schema_version\":3,\"tool_steps\":[");
     for (execution.tool_steps, 0..) |step, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"assistant\":");
-        try writeOptionalDurableBytes(writer, step.assistant);
-        try writer.writeAll(",\"provider_replay\":");
-        try std.json.Stringify.value(step.provider_replay, .{}, writer);
+        try writeOptionalExecutionBytes(writer, step.assistant, format);
+        if (format == .durable) {
+            try writer.writeAll(",\"provider_replay\":");
+            try std.json.Stringify.value(step.provider_replay, .{}, writer);
+        }
         try writer.writeAll(",\"tool_calls\":[");
         for (step.tool_calls, 0..) |tool_call, call_index| {
             if (call_index > 0) try writer.writeByte(',');
-            try writeToolCall(writer, tool_call);
+            try writeExecutionToolCall(writer, tool_call, format);
         }
         try writer.writeAll("],\"tool_results\":[");
         for (step.tool_results, 0..) |result, result_index| {
             if (result_index > 0) try writer.writeByte(',');
-            try writePersistedToolResult(writer, result);
+            try writeExecutionToolResult(writer, result, format);
         }
         try writer.writeAll("]}");
     }
     try writer.writeAll("],\"files\":[");
     for (execution.files, 0..) |file, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeFileEvidence(writer, file);
+        try writeExecutionFileEvidence(writer, file, format);
     }
     try writer.writeAll("],\"steering\":[");
     for (execution.steering, 0..) |steering, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"text\":");
-        try writeDurableBytes(writer, steering.text);
+        try writeExecutionBytes(writer, steering.text, format);
         try writer.writeAll(",\"assistant_prefix\":");
-        try writeOptionalDurableBytes(writer, steering.assistant_prefix);
+        try writeOptionalExecutionBytes(writer, steering.assistant_prefix, format);
         try writer.print(",\"after_tool_step_count\":{d}}}", .{steering.after_tool_step_count});
     }
-    try writer.writeAll("],\"turn_summary\":");
-    if (execution.turn_summary) |summary| {
-        try writeTurnSummary(writer, summary);
+    if (format == .durable) {
+        try writer.writeAll("],\"turn_summary\":");
+        if (execution.turn_summary) |summary| {
+            try writeTurnSummary(writer, summary);
+        } else {
+            try writer.writeAll("null");
+        }
     } else {
-        try writer.writeAll("null");
+        try writer.writeByte(']');
     }
     try writer.writeByte('}');
 }
@@ -1558,82 +1576,127 @@ fn writeTurnSummary(writer: *std.Io.Writer, summary: types.TurnSummary) !void {
     );
 }
 
-fn writeToolCall(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
+fn writeExecutionBytes(
+    writer: *std.Io.Writer,
+    bytes: []const u8,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (format == .durable) {
+        try writeDurableBytes(writer, bytes);
+    } else {
+        try writeJsonString(writer, bytes);
+    }
+}
+
+fn writeOptionalExecutionBytes(
+    writer: *std.Io.Writer,
+    value: ?[]const u8,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (value) |bytes| {
+        try writeExecutionBytes(writer, bytes, format);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeExecutionToolCall(
+    writer: *std.Io.Writer,
+    tool_call: session.ToolCall,
+    format: ExecutionMemoryJsonFormat,
+) !void {
     try writer.writeAll("{\"id\":");
-    try writeDurableBytes(writer, tool_call.id);
+    try writeExecutionBytes(writer, tool_call.id, format);
     try writer.writeAll(",\"name\":");
-    try writeDurableBytes(writer, tool_call.name);
+    try writeExecutionBytes(writer, tool_call.name, format);
     try writer.writeAll(",\"arguments_json\":");
-    try writeDurableBytes(writer, tool_call.arguments_json);
+    try writeExecutionBytes(writer, tool_call.arguments_json, format);
     try writer.writeAll(",\"provider_result\":");
-    try writeOptionalDurableBytes(writer, tool_call.provider_result);
+    try writeOptionalExecutionBytes(writer, tool_call.provider_result, format);
     try writer.writeByte('}');
 }
 
-fn writePersistedToolResult(writer: *std.Io.Writer, result: session.PersistedToolResult) !void {
-    if (result.review_feedback and (result.status != .failure or result.provider_native)) {
+fn writeExecutionToolResult(
+    writer: *std.Io.Writer,
+    result: session.PersistedToolResult,
+    format: ExecutionMemoryJsonFormat,
+) !void {
+    if (format == .durable and
+        result.review_feedback and
+        (result.status != .failure or result.provider_native))
+    {
         return error.InvalidSessionFormat;
     }
     try writer.writeAll("{\"tool_call_id\":");
-    try writeDurableBytes(writer, result.tool_call_id);
+    try writeExecutionBytes(writer, result.tool_call_id, format);
     try writer.writeAll(",\"tool_name\":");
-    try writeDurableBytes(writer, result.tool_name);
+    try writeExecutionBytes(writer, result.tool_name, format);
     try writer.writeAll(",\"status\":");
     try writeJsonString(writer, @tagName(result.status));
     try writer.writeAll(",\"output\":");
-    try writeDurableBytes(writer, result.output);
-    try writer.writeAll(",\"output_handle\":");
-    try writeOptionalDurableBytes(writer, result.output_handle);
-    try writer.writeAll(",\"preview\":");
-    try writeOptionalDurableBytes(writer, result.preview);
+    try writeExecutionBytes(writer, result.output, format);
+    if (format == .durable or result.output_handle != null) {
+        try writer.writeAll(",\"output_handle\":");
+        try writeOptionalExecutionBytes(writer, result.output_handle, format);
+    }
+    if (format == .durable or result.preview != null) {
+        try writer.writeAll(",\"preview\":");
+        try writeOptionalExecutionBytes(writer, result.preview, format);
+    }
     try writer.print(
-        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s},\"review_feedback\":{s},\"created_at_ms\":{d}",
+        ",\"output_bytes\":{d},\"stored_output_bytes\":{d},\"truncated\":{s},\"provider_native\":{s}",
         .{
             result.output_bytes,
             result.stored_output_bytes,
             if (result.truncated) "true" else "false",
             if (result.provider_native) "true" else "false",
-            if (result.review_feedback) "true" else "false",
-            result.created_at_ms,
         },
     );
+    if (format == .durable) {
+        try writer.print(",\"review_feedback\":{s}", .{if (result.review_feedback) "true" else "false"});
+    }
+    try writer.print(",\"created_at_ms\":{d}", .{result.created_at_ms});
     try writer.writeAll(",\"permission_feedback\":[");
     for (result.permission_feedback, 0..) |feedback, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeDurableBytes(writer, feedback);
+        try writeExecutionBytes(writer, feedback, format);
     }
-    try writer.writeAll("],\"committed_file_presentation\":");
     if (result.committed_file_presentation) |presentation| {
-        try writeCommittedFilePresentation(writer, presentation);
+        try writer.writeAll("],\"committed_file_presentation\":");
+        try writeExecutionFilePresentation(writer, presentation, format);
+    } else if (format == .durable) {
+        try writer.writeAll("],\"committed_file_presentation\":null");
     } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"command_output_replay\":");
-    try writeOptionalCommandOutputReplay(writer, result.command_output_replay);
-    try writer.writeAll(",\"command_process_presentation\":");
-    try writeOptionalCommandProcessPresentation(
-        writer,
-        result.command_process_presentation,
-    );
-    try writer.writeAll(",\"terminal_action_presentation\":");
-    try writeOptionalTerminalActionPresentation(
-        writer,
-        result.terminal_action_presentation,
-    );
-    if (result.tool_image_handle) |handle| {
-        try writer.writeAll(",\"tool_image_handle\":");
-        try writeDurableBytes(writer, handle);
-    } else if (result.tool_images.len > 0) {
-        try writer.writeAll(",\"tool_images\":[");
-        for (result.tool_images, 0..) |image, index| {
-            if (index > 0) try writer.writeByte(',');
-            try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
-            try writer.writeAll(",\"data\":");
-            try std.json.Stringify.value(image.data, .{}, writer);
-            try writer.writeByte('}');
-        }
         try writer.writeByte(']');
+    }
+    if (format == .durable) {
+        try writer.writeAll(",\"command_output_replay\":");
+        try writeOptionalCommandOutputReplay(writer, result.command_output_replay);
+        try writer.writeAll(",\"command_process_presentation\":");
+        try writeOptionalCommandProcessPresentation(
+            writer,
+            result.command_process_presentation,
+        );
+        try writer.writeAll(",\"terminal_action_presentation\":");
+        try writeOptionalTerminalActionPresentation(
+            writer,
+            result.terminal_action_presentation,
+        );
+        if (result.tool_image_handle) |handle| {
+            try writer.writeAll(",\"tool_image_handle\":");
+            try writeDurableBytes(writer, handle);
+        } else if (result.tool_images.len > 0) {
+            try writer.writeAll(",\"tool_images\":[");
+            for (result.tool_images, 0..) |image, index| {
+                if (index > 0) try writer.writeByte(',');
+                try writer.writeAll("{\"type\":\"image\",\"mimeType\":");
+                try std.json.Stringify.value(image.mime_type, .{}, writer);
+                try writer.writeAll(",\"data\":");
+                try std.json.Stringify.value(image.data, .{}, writer);
+                try writer.writeByte('}');
+            }
+            try writer.writeByte(']');
+        }
     }
     try writer.writeByte('}');
 }
@@ -1754,15 +1817,16 @@ fn writeTerminalReturnPresentation(
     }
 }
 
-fn writeCommittedFilePresentation(
+fn writeExecutionFilePresentation(
     writer: *std.Io.Writer,
     presentation: types.CommittedFilePresentation,
+    format: ExecutionMemoryJsonFormat,
 ) !void {
     if (!types.committedFilePresentationContentSourceValid(presentation)) {
         return error.InvalidSessionFormat;
     }
     try writer.writeAll("{\"path\":");
-    try writeDurableBytes(writer, presentation.path);
+    try writeExecutionBytes(writer, presentation.path, format);
     try writer.writeAll(",\"kind\":");
     try writeJsonString(writer, @tagName(presentation.kind));
     try writer.writeAll(",\"lines\":[");
@@ -1775,7 +1839,7 @@ fn writeCommittedFilePresentation(
         try writer.writeAll(",\"new_line\":");
         try writeOptionalU32(writer, line.new_line);
         try writer.writeAll(",\"text\":");
-        try writeDurableBytes(writer, line.text);
+        try writeExecutionBytes(writer, line.text, format);
         try writer.writeByte('}');
     }
     try writer.print(
@@ -1786,35 +1850,41 @@ fn writeCommittedFilePresentation(
             if (presentation.truncated) "true" else "false",
         },
     );
-    try writeOptionalDurableBytes(writer, presentation.previous_content);
+    try writeOptionalExecutionBytes(writer, presentation.previous_content, format);
     try writer.writeAll(",\"after_content\":");
-    try writeOptionalDurableBytes(writer, presentation.after_content);
+    try writeOptionalExecutionBytes(writer, presentation.after_content, format);
     try writer.writeAll(",\"lifecycle_id\":");
     if (presentation.lifecycle_id) |lifecycle_id| {
         try writer.print("{{\"turn_id\":{d},\"call_id\":", .{lifecycle_id.turn_id});
-        try writeDurableBytes(writer, lifecycle_id.call_id);
+        try writeExecutionBytes(writer, lifecycle_id.call_id, format);
         try writer.writeByte('}');
     } else {
         try writer.writeAll("null");
     }
-    // Omit the key entirely when unspilled so non-spilled records keep the
-    // shipped 9-key shape older builds can still parse.
+    // Durable records omit an absent handle for compatibility with the
+    // shipped 9-key shape. Presentation JSON always includes the key.
     if (presentation.content_handle) |handle| {
         try writer.writeAll(",\"content_handle\":");
-        try writeDurableBytes(writer, handle);
+        try writeExecutionBytes(writer, handle, format);
+    } else if (format == .presentation) {
+        try writer.writeAll(",\"content_handle\":null");
     }
     try writer.writeByte('}');
 }
 
-fn writeFileEvidence(writer: *std.Io.Writer, file: session.FileEvidence) !void {
+fn writeExecutionFileEvidence(
+    writer: *std.Io.Writer,
+    file: session.FileEvidence,
+    format: ExecutionMemoryJsonFormat,
+) !void {
     try writer.writeAll("{\"path\":");
-    try writeDurableBytes(writer, file.path);
+    try writeExecutionBytes(writer, file.path, format);
     try writer.writeAll(",\"new_path\":");
-    try writeOptionalDurableBytes(writer, file.new_path);
+    try writeOptionalExecutionBytes(writer, file.new_path, format);
     try writer.writeAll(",\"tool_call_id\":");
-    try writeDurableBytes(writer, file.tool_call_id);
+    try writeExecutionBytes(writer, file.tool_call_id, format);
     try writer.writeAll(",\"tool_name\":");
-    try writeDurableBytes(writer, file.tool_name);
+    try writeExecutionBytes(writer, file.tool_name, format);
     try writer.writeAll(",\"action\":");
     try writeJsonString(writer, @tagName(file.action));
     try writer.writeAll(",\"status\":");
@@ -3459,12 +3529,12 @@ test "non-object interrupted inputs repair locally and preserve provider-owned r
     for ([_]bool{ false, true }) |native| {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try writeToolCall(&out.writer, .{
+        try writeExecutionToolCall(&out.writer, .{
             .id = "interrupted",
             .name = "read_file",
             .arguments_json = "[]",
             .provider_result = if (native) "provider result" else null,
-        });
+        }, .durable);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
         defer parsed.deinit();
         const repaired = (try parseOptionalToolCall(alloc, parsed.value)).?;
@@ -3673,7 +3743,7 @@ test "review feedback survives durable execution memory round trip" {
         var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
         var encoded: std.Io.Writer.Allocating = .init(alloc);
         defer encoded.deinit();
-        try writeExecutionMemory(&encoded.writer, .{ .tool_steps = &steps });
+        try writeExecutionMemoryJson(&encoded.writer, .{ .tool_steps = &steps }, .durable);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
         defer parsed.deinit();
         const decoded = try parseExecutionMemory(alloc, parsed.value);
@@ -3692,7 +3762,7 @@ test "review feedback durable codec rejects invalid provenance and unknown field
     result.review_feedback = true;
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writePersistedToolResult(&encoded.writer, result);
+    try writeExecutionToolResult(&encoded.writer, result, .durable);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     const cases = [_]struct { status: []const u8, provider_native: bool, marker: std.json.Value }{
@@ -3716,7 +3786,10 @@ test "review feedback durable codec rejects invalid provenance and unknown field
         var invalid = result;
         invalid.status = if (native) .failure else .success;
         invalid.provider_native = native;
-        try std.testing.expectError(error.InvalidSessionFormat, writePersistedToolResult(&encoded.writer, invalid));
+        try std.testing.expectError(
+            error.InvalidSessionFormat,
+            writeExecutionToolResult(&encoded.writer, invalid, .durable),
+        );
     }
 }
 
@@ -3727,7 +3800,7 @@ test "review feedback defaults old durable results without inspecting output" {
     result.output = @constCast("Security review held this action.");
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    try writePersistedToolResult(&encoded.writer, result);
+    try writeExecutionToolResult(&encoded.writer, result, .durable);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded.written(), .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.swapRemove("review_feedback"));
@@ -3989,7 +4062,7 @@ test "committed file presentation codec reads shipped and spilled shapes" {
     // the shipped 9-key shape readable by older builds.
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeCommittedFilePresentation(&out.writer, shipped_presentation);
+    try writeExecutionFilePresentation(&out.writer, shipped_presentation, .durable);
     try std.testing.expect(std.mem.find(u8, out.written(), "content_handle") == null);
     var roundtrip_parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.written(), .{});
     defer roundtrip_parsed.deinit();
@@ -4000,7 +4073,7 @@ test "committed file presentation codec reads shipped and spilled shapes" {
 
     // The writer emits the handle only when present, and it roundtrips.
     out.clearRetainingCapacity();
-    try writeCommittedFilePresentation(&out.writer, spilled_presentation);
+    try writeExecutionFilePresentation(&out.writer, spilled_presentation, .durable);
     try std.testing.expect(std.mem.find(
         u8,
         out.written(),

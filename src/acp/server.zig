@@ -2122,6 +2122,11 @@ fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Mess
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
+            .data = .{
+                .code = "LIBFX_MODEL_UNSUPPORTED_EFFORT",
+                .model = state.selected_model,
+                .capability = "effort",
+            },
         });
         return false;
     }
@@ -2237,6 +2242,11 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
         try state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
+            .data = .{
+                .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                .model = state.selected_model,
+                .capability = "fast",
+            },
         });
         return false;
     }

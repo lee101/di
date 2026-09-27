@@ -840,7 +840,7 @@ fn makeMenuPreview(alloc: Allocator, heading: []const u8, raw: []const u8) !Menu
 
 fn makeMenuPreviewOwned(alloc: Allocator, heading: []const u8, insert: []u8) !MenuPreview {
     errdefer alloc.free(insert);
-    var encoded = try text_utils.encodeTerminalSafe(alloc, insert, max_menu_preview_bytes);
+    var encoded = try text_utils.encodeTerminalSafeInline(alloc, insert, max_menu_preview_bytes);
     defer encoded.deinit(alloc);
     return .{
         .display = try std.mem.concat(alloc, u8, &.{ heading, encoded.bytes }),
@@ -941,6 +941,9 @@ pub const State = struct {
     pending_reload: ?*PendingReload = null,
     pending_authentication: ?*PendingAuthentication = null,
     pending_menu_operation: ?*PendingMenuOperation = null,
+    /// Set by process-exit teardown before it joins a pending reload, so the
+    /// reload discards its candidate runtime without grace or session DELETEs.
+    process_exiting: std.atomic.Value(bool) = .init(false),
     last_reload_completion_origin: PresentationOrigin = .command,
     last_authentication_completion_origin: PresentationOrigin = .command,
     project_prompts_suppressed: bool = false,
@@ -1639,7 +1642,7 @@ pub const State = struct {
                     "MCP authentication for '",
                     completion.server_name,
                     "' failed: ",
-                    @errorName(err),
+                    mcp_auth.authentication_error_message(err),
                 },
             );
         }
@@ -2510,7 +2513,11 @@ pub const State = struct {
         refresh_catalogs: bool,
     ) !ReloadOutcome {
         var candidate_owned = candidate != null;
-        defer if (candidate_owned) destroyRuntime(alloc, candidate.?);
+        defer if (candidate_owned) destroyRuntime(
+            alloc,
+            candidate.?,
+            if (self.process_exiting.load(.acquire)) .process_exit else .discard,
+        );
         self.lock.lockSharedUncancelable(io_mod.getIo());
         const stale = cancel_requested.load(.acquire) or (pending != null and self.pending_reload != pending.?);
         self.lock.unlockShared(io_mod.getIo());
@@ -2550,6 +2557,23 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .discard);
+    }
+
+    /// Teardown immediately followed by process exit: stdio servers are
+    /// killed without grace and remote sessions are left to expire.
+    pub fn deinitForProcessExit(self: *State, alloc: Allocator) void {
+        self.deinitWithMode(alloc, .process_exit);
+    }
+
+    fn deinitWithMode(self: *State, alloc: Allocator, mode: RuntimeTeardown) void {
+        if (mode == .process_exit) {
+            // A reload still in flight must see this before it is joined.
+            self.process_exiting.store(true, .release);
+            self.lock.lockSharedUncancelable(io_mod.getIo());
+            if (self.runtime) |runtime| runtime.prepareForProcessExit();
+            self.lock.unlockShared(io_mod.getIo());
+        }
         self.cancelPendingAuthentication("shutdown");
         self.cancelPendingReload();
         self.cancelPendingMenuOperation("shutdown");
@@ -2557,7 +2581,7 @@ pub const State = struct {
         const previous = self.runtime;
         self.runtime = null;
         self.lock.unlock(io_mod.getIo());
-        if (previous) |runtime| destroyRuntime(alloc, runtime);
+        if (previous) |runtime| destroyRuntime(alloc, runtime, mode);
         self.clearMenuOwned(alloc);
         self.model_catalog_baseline_lock.lockUncancelable(io_mod.getIo());
         self.clearModelCatalogBaselineLocked(alloc);
@@ -2579,10 +2603,32 @@ fn cancelAndDeinitAuthentication(
     pending.deinit();
 }
 
-fn destroyRuntime(alloc: Allocator, runtime: *mcp_runtime.McpRuntime) void {
+const RuntimeTeardown = enum { discard, process_exit };
+
+fn destroyRuntime(
+    alloc: Allocator,
+    runtime: *mcp_runtime.McpRuntime,
+    mode: RuntimeTeardown,
+) void {
     runtime.retireAndWait();
-    runtime.deinit();
+    switch (mode) {
+        .discard => runtime.deinit(),
+        .process_exit => runtime.deinitForProcessExit(),
+    }
     alloc.destroy(runtime);
+}
+
+test "MCP menu preview display flattens untrusted multi-line content" {
+    const alloc = std.testing.allocator;
+    var preview = try makeMenuPreview(alloc, "heading\n\n", "line one\n\nline two\x1b]0;owned\x07");
+    defer preview.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "heading\n\nline one line two\\x1b]0;owned\\x07",
+        preview.display,
+    );
+    try std.testing.expect(std.mem.find(u8, preview.display, "\\x0a") == null);
+    try std.testing.expectEqualStrings("line one\n\nline two\x1b]0;owned\x07", preview.insert);
 }
 
 test "MCP menu expands every resource template argument" {

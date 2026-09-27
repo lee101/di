@@ -4,6 +4,8 @@ const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
+const shared_theme = @import("../shared/theme.zig");
+const ui_render = @import("../../ui/render.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -1638,6 +1640,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_agent_step_limit,
         );
     defer startup.deinit(alloc);
+    applyAskThemeChoice(startup.theme);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
     // Bind gateway chat traffic to a per-process connection pool and warm one
     // connection in the background while the rest of startup continues.
@@ -3723,7 +3726,16 @@ fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runti
     if (request.server) |server_name| {
         mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
             error.McpAuthenticationRequired => {}, // Search renders the observed challenge with named login guidance.
-            else => return err,
+            error.Cancelled, error.OutOfMemory, error.McpAccessDenied, error.McpAuthorityChanged => return err,
+            else => {
+                if (!mcp.hasRecordedFailure(server_name)) return err;
+                // Search reports the recorded reason instead of the error name.
+                debug_trace.logf(
+                    "mcp",
+                    "deferred ask connection failed server={s} err={s}; search reports the recorded failure",
+                    .{ server_name, @errorName(err) },
+                );
+            },
         };
     } else {
         try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
@@ -4387,6 +4399,25 @@ fn toCorePermissionMode(mode: anytype) PermissionMode {
 
 fn takeCorePermissionRules(_: Allocator, startup: *app_lifecycle.StartupState) !types.PermissionRuleSet {
     return startup.takePermissionRules();
+}
+
+/// Theme selection mirrors the interactive bootstrap: FX_THEME wins over the
+/// settings "theme" key. light/dark pin the builtin variant immediately; a
+/// named theme records its source so the presentation layer can resolve it
+/// once terminal detection picks the variant.
+fn applyAskThemeChoice(settings_theme: ?[]const u8) void {
+    var configured: ?[]const u8 = settings_theme;
+    if (io_mod.getenv("FX_THEME")) |value| {
+        if (value.len > 0) configured = value;
+    }
+    const choice = if (configured) |value| shared_theme.classifyValue(value) else null;
+    if (choice) |selected| switch (selected) {
+        .pin_light, .pin_dark => {
+            shared_theme.setSource(null, true);
+            ui_render.initTheme(selected == .pin_light, null);
+        },
+        .custom => |name| shared_theme.setSource(name, false),
+    };
 }
 
 fn loadStartupStateDefault(

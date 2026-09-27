@@ -1489,7 +1489,7 @@ pub fn repairPersistedToolArguments(
             tracePersistedToolArgumentsRepair(call.*, source, true, integrity);
             continue;
         }
-        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name);
+        const failure_output = try tool_result_errors.malformedToolArgumentsJson(alloc, call.name, null);
 
         alloc.free(result.output);
         if (result.output_handle) |handle| alloc.free(handle);
@@ -1713,6 +1713,20 @@ pub const SessionRuntime = struct {
             .usage = session_usage.Usage.initFreshWithProviders(providers),
             .max_history_turns = max_history_turns,
         };
+    }
+
+    pub fn initIntoWithProviders(
+        self: *SessionRuntime,
+        max_history_turns: usize,
+        providers: generation_usage_provider.Set,
+    ) void {
+        inline for (std.meta.fields(SessionRuntime)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "usage") or
+                std.mem.eql(u8, field.name, "max_history_turns")) continue;
+            @field(self.*, field.name) = field.defaultValue().?;
+        }
+        self.usage.initIntoFreshWithProviders(providers);
+        self.max_history_turns = max_history_turns;
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
@@ -2074,6 +2088,18 @@ pub const SessionRuntime = struct {
         self.conversation_language = language;
     }
 };
+
+test "session initIntoWithProviders preserves runtime defaults without copying usage scratch arrays" {
+    var actual: SessionRuntime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initIntoWithProviders(17, .{});
+
+    var expected = SessionRuntime.initWithProviders(17, .{});
+    @memset(std.mem.asBytes(&expected.usage.active_sequences), 0xa5);
+    @memset(std.mem.asBytes(&expected.usage.incidents), 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
+}
 
 fn appendHistoryCopies(
     alloc: Allocator,
@@ -3209,9 +3235,7 @@ pub fn appendExecutionMemoryChatMessages(
                     try messages.append(alloc, .{ .role = .assistant, .content = prefix });
                 }
             }
-            if (steering.text.len > 0) {
-                try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
-            }
+            try messages.append(alloc, restoredSteeringChatMessage(steering.text));
             steering_index += 1;
         }
         if (step.tool_calls.len == 0 and step.provider_replay == null and step.assistant == null) continue;
@@ -3254,9 +3278,20 @@ pub fn appendExecutionMemoryChatMessages(
                 try messages.append(alloc, .{ .role = .assistant, .content = prefix });
             }
         }
-        if (steering.text.len == 0) continue;
-        try messages.append(alloc, .{ .role = .user, .content = steering.text, .context_origin = .user_turn });
+        try messages.append(alloc, restoredSteeringChatMessage(steering.text));
     }
+}
+
+/// Steering comes from whoever drives this session, so compaction keeps it as
+/// user text rather than a generated notice. Empty entries only mark a
+/// checkpoint boundary. Borrows `text`.
+fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
+    return .{
+        .role = .user,
+        .content = text,
+        .restored_steering = true,
+        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+    };
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {

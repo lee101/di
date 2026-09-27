@@ -5,6 +5,7 @@ const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const input_action = @import("../../core/input/input_action.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_release = @import("../../core/output/transcript_release.zig");
@@ -4013,7 +4014,7 @@ test "retintEntriesForTheme rewrites owned presentation without touching externa
     const segments = runtime.lookupAssistantSegments(assistant_id).?;
     try segments.text.appendSlice(alloc, "\x1b[38;5;245mcode\x1b[39m \x1b[38;5;252m✓\x1b[39m\n");
 
-    try runtime.retintEntriesForTheme(alloc, false, true);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
 
     try std.testing.expectEqual(owned_id, runtime.entries.items[0].id());
     try std.testing.expectEqual(command_id, runtime.entries.items[1].id());
@@ -6470,10 +6471,10 @@ pub const TranscriptRuntime = struct {
     pub fn retintEntriesForTheme(
         self: *TranscriptRuntime,
         alloc: Allocator,
-        from_light: bool,
-        to_light: bool,
+        from: shared_theme.Theme,
+        to: shared_theme.Theme,
     ) !void {
-        return transcript_store.retintEntriesForTheme(self, alloc, from_light, to_light);
+        return transcript_store.retintEntriesForTheme(self, alloc, from, to);
     }
 
     pub fn setTranscriptPresentationDepth(

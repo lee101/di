@@ -8,6 +8,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
 const usage_report = @import("../core/session/usage_report.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
@@ -7726,7 +7727,7 @@ test "theme reset retints fx entries and replays the retained transcript once" {
     const min_visible_rows = h.shell.min_visible_viewport_rows;
     const before = try h.file.length(io_mod.getIo());
 
-    try h.shell.retintEntriesForTheme(alloc, false, true);
+    try h.shell.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
     try h.shell.requestTerminalReset(&h.metrics);
     try std.testing.expect(h.shell.terminal_reset_pending);
     try std.testing.expectEqual(min_visible_rows, h.shell.min_visible_viewport_rows);

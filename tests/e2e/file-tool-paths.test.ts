@@ -744,6 +744,73 @@ touch backend-searched
   );
 
   test(
+    "resumed follow-up request extends the live request byte for byte",
+    async () => {
+      const root = createIsolatedRoot();
+      const lines = Array.from(
+        { length: 400 },
+        (_, index) => `PARITY_LINE_${String(index + 1).padStart(3, "0")}_${"x".repeat(24)}`,
+      );
+      writeFileSync(join(root.workspace, "parity.md"), `${lines.join("\n")}\n`);
+      const firstGateway = startFakeGateway([
+        toolCall("edit_parity_1", "edit_file", {
+          path: "parity.md",
+          old_string: "PARITY_LINE_200_",
+          new_string: "PARITY_EDITED_200_",
+        }),
+        finalText("parity edit done"),
+      ]);
+      let sessionId = "";
+      let liveBody = "";
+      try {
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Edit parity.md once, then stop."],
+          { cwd: root.workspace, env: gatewayEnv(root, firstGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        sessionId = parseFxJson(first).session_id;
+        expect(firstGateway.requests.length).toBe(2);
+        liveBody = firstGateway.requests[1].body;
+        expect(toolResultOutput(liveBody, "edit_parity_1")).not.toContain("Not executed");
+      } finally {
+        firstGateway.stop();
+      }
+      // The edit snapshots are large, so they live behind a handle and stay
+      // out of the log that resume reads.
+      const events = readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
+        "utf8",
+      );
+      expect(events).toMatch(/"content_handle":"diff-[0-9a-f]{16}-[0-9a-f]{16}\.json"/);
+      expect(events).not.toContain("PARITY_LINE_001_");
+
+      const secondGateway = startFakeGateway([finalText("parity follow-up done")]);
+      try {
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "What changed in parity.md?"],
+          { cwd: root.workspace, env: gatewayEnv(root, secondGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        expect(resumed.code, resumed.stderr).toBe(0);
+        expect(secondGateway.requests.length).toBe(1);
+        const live = JSON.parse(liveBody) as { prompt: unknown[]; tools?: unknown };
+        const next = JSON.parse(secondGateway.requests[0].body) as { prompt: unknown[]; tools?: unknown };
+        // Provider prompt caching depends on the resumed request starting
+        // with exactly the bytes the live session last sent.
+        const livePrompt = live.prompt.map((message) => JSON.stringify(message));
+        const nextPrompt = next.prompt.map((message) => JSON.stringify(message));
+        expect(livePrompt.length).toBeGreaterThanOrEqual(3);
+        expect(livePrompt.join("")).toContain("edit_parity_1");
+        expect(nextPrompt.length).toBeGreaterThan(livePrompt.length);
+        expect(nextPrompt.slice(0, livePrompt.length)).toEqual(livePrompt);
+        expect(JSON.stringify(next.tools)).toBe(JSON.stringify(live.tools));
+      } finally {
+        secondGateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "empty optional search paths use the workspace root",
     async () => {
       const root = createIsolatedRoot();

@@ -352,9 +352,14 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         expect(summary).toContain("Connecting");
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+        const beforeListMenu = await session.captureFullScrollback();
         await session.sendText("/mcp list");
-        const status = await session.waitForText("state=connecting", 5_000);
-        expect(status).toContain("pending source=profile scope=profile policy=optional");
+        const listMenu = await session.waitForText("[Servers]", 5_000);
+        expect(listMenu).toContain("pending");
+        expect(listMenu).toContain("Connecting");
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
+        expect(await session.captureFullScrollback()).toBe(beforeListMenu);
 
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(5_000)).toBe(true);

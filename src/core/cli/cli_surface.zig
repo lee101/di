@@ -45,6 +45,7 @@ const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
 const project_config = @import("../mcp/project_config.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
+const mcp_auth = @import("../mcp/mcp_auth.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
@@ -2739,7 +2740,7 @@ fn writeMcpOperationFailure(
     defer out.deinit();
     try out.writer.print(
         "di mcp {s} failed: {s}.\n",
-        .{ operation, @errorName(err) },
+        .{ operation, mcp_auth.authentication_error_message(err) },
     );
     try writeStderr(deps, out.written());
 }

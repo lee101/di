@@ -496,23 +496,11 @@ pub const Store = struct {
     }
 };
 
-/// Returns true for both the current immutable owner marker and legacy child
-/// control records. Any unreadable marker fails closed so a child cannot
-/// become externally resumable because its private metadata is damaged.
-pub fn isManagedChildSession(
-    sessions: session_store.Store,
-    alloc: Allocator,
-    session_id: []const u8,
-) !bool {
-    if (try hasManagedChildMarker(sessions, alloc, session_id)) return true;
-
-    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
-        error.SessionNotFound => false,
-        else => return err,
-    };
-}
-
-/// Reuses discovery's validated identity while retaining all child-marker checks.
+/// Listing check: reuses discovery's validated identity and every child
+/// marker. A legacy session without a metadata-level bit falls back to its
+/// first event, read only within a fixed 16 KiB bound; the session index
+/// caches the answer under the session's fingerprint, so it is paid once per
+/// change. A first event past the bound is unverifiable: listed, not cached.
 pub fn isDiscoveredManagedChildSession(
     sessions: session_store.Store,
     alloc: Allocator,
@@ -529,8 +517,9 @@ pub fn isDiscoveredManagedChildSession(
         if (try capabilityHasManagedChildMarker(alloc, value)) return true;
     }
     if (subagent_child) |identity| return identity;
-    return sessions.loadSubagentChildIdentity(alloc, session_id) catch |err| switch (err) {
-        error.SessionNotFound => false,
+    return sessions.loadListedLegacyChildIdentity(alloc, session_id) catch |err| switch (err) {
+        // A session without an event log has no first event to record it.
+        error.SessionNotFound, error.FileNotFound => false,
         else => return err,
     };
 }

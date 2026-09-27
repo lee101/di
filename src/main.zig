@@ -616,6 +616,8 @@ const App = struct {
             .auth = undefined,
             .usage_dashboard = undefined,
             .session_persistence = undefined,
+            .input_runtime = undefined,
+            .session = undefined,
             .shell = TranscriptRuntime.init(),
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
@@ -636,6 +638,15 @@ const App = struct {
         );
         usage_dashboard_runtime.Runtime.initInto(&app.usage_dashboard, std.heap.c_allocator);
         app_session_runtime.Persistence.initInto(&app.session_persistence);
+        InputRuntime.initInto(&app.input_runtime);
+        SessionRuntime.initIntoWithProviders(
+            &app.session,
+            max_history_turns,
+            if (comptime host_profile.generation_usage)
+                builtin_providers.native.deferredUsageProviders()
+            else
+                .{},
+        );
         if (comptime host_profile.js_host_workspace) {
             app.workspace_host = js_host_workspace.Runtime.init(alloc) catch |err| blk: {
                 if (err != error.WorkspaceUnavailable) {
@@ -838,13 +849,61 @@ const App = struct {
         return self.upgrader.takeRelaunchRequest();
     }
 
-    pub fn deinit(self: *App) void {
-        _ = self.deinitImpl(false);
-    }
+    /// Native interactive exit. Runs only the work whose effects outlive the
+    /// process: restoring the terminal, persisting the session, finishing
+    /// durable credential saves, and terminating child processes. Memory and
+    /// threads that hold no durable state are left for process exit, so a
+    /// thread blocked on the network or a disk scan cannot hold the prompt.
+    /// The caller must end the process without further teardown; the returned
+    /// handoff is owned by the caller.
+    pub fn shutdownForProcessExit(self: *App) app_session_runtime.ShutdownOutcome {
+        var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
+        // Failed startups (no TTY, too small) never earn a shutdown report.
+        const was_interactive = self.terminal.raw_enabled or self.terminal.signal_handler_installed;
+        // Hand the terminal back first; nothing below renders.
+        self.releaseTerminal();
+        shutdown_trace.mark("terminal_released");
 
-    /// Returns an owned handoff only after all interactive state is torn down.
-    pub fn deinitWithResumeHandoff(self: *App) app_session_runtime.ShutdownOutcome {
-        return self.deinitImpl(true);
+        self.auth.stopProviderPreparation();
+        // Client.deinit releases the herdr pane (clear agent + label) when enabled.
+        self.herdr.deinit();
+        self.stopStream();
+        self.worker.requestShutdown();
+        SessionAppRuntime.requestPersistenceShutdown(self);
+        SessionAppRuntime.abandonProfileLedgerForProcessExit(self);
+        self.upgrader.stopForProcessExit();
+        self.file_index.requestStop();
+        WorkspaceAppRuntime.requestStop(self);
+        self.managed_executions.terminateForProcessExit();
+        shutdown_trace.mark("background_stops_requested");
+
+        // The worker mutates session state, so it stops before persistence.
+        if (self.worker_thread) |thread| thread.join();
+        shutdown_trace.mark("worker_thread_joined");
+        WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
+            SessionAppRuntime.recordShutdownFailure(self, err);
+        };
+        // The dashboard loader reads the profile usage ledger that
+        // persistence flushes; stop it first.
+        self.usage_dashboard.deinit();
+        InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
+        const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
+        const shutdown_failure = self.session_persistence.shutdown_failure;
+        // These delete image snapshots and log discarded drafts.
+        self.worker.deinit(std.heap.c_allocator);
+        self.clearPendingImages();
+        SessionAppRuntime.deinitPersistence(self);
+        self.question_prompt.deinit(self.alloc);
+        shutdown_trace.mark("persistence_finalized");
+
+        // Waits for an in-flight API key or credential save to land.
+        self.auth.deinit(self.alloc);
+        shutdown_trace.mark("credentials_saved");
+        self.mcp.deinitForProcessExit(self.alloc);
+        shutdown_trace.mark("mcp_children_terminated");
+        shutdown_trace.mark("complete");
+        if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
+        return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
     pub fn resumeHandoffColumns(self: *const App) u16 {
@@ -859,7 +918,10 @@ const App = struct {
         return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
-    fn deinitImpl(self: *App, capture_resume_handoff: bool) app_session_runtime.ShutdownOutcome {
+    /// Full teardown for hosts that keep running after the shell ends, such as
+    /// the cooperative host. Native interactive exit uses
+    /// `shutdownForProcessExit`.
+    pub fn deinit(self: *App) void {
         var shutdown_trace = app_lifecycle.ShutdownStageTrace.init();
         // Only real interactive sessions earn a shutdown report; failed
         // startups (no TTY, too small) reach deinit through errdefer and must
@@ -890,14 +952,8 @@ const App = struct {
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
-        const resume_handoff = if (capture_resume_handoff)
-            SessionAppRuntime.finalizePersistenceWithResumeHandoff(self)
-        else blk: {
-            SessionAppRuntime.finalizePersistence(self);
-            break :blk null;
-        };
+        SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
-        const shutdown_failure = self.session_persistence.shutdown_failure;
         self.worker.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
@@ -937,7 +993,6 @@ const App = struct {
         if (self.review_model.len > 0) self.alloc.free(self.review_model);
         shutdown_trace.mark("complete");
         if (was_interactive) app_lifecycle.writeLastShutdownReport(self.alloc, &shutdown_trace);
-        return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
     pub fn releaseTerminal(self: *App) void {
@@ -2676,15 +2731,20 @@ const App = struct {
         return diff_mod.formatPersistedFileChangePayload(
             std.heap.c_allocator,
             presentation,
-            .{
-                .added_fg = ui_render.diff_added_style,
-                .removed_fg = ui_render.diff_removed_style,
-                .context_fg = ui_render.dim_style,
-                .added_marker_fg = ui_render.diff_added_marker_style,
-                .removed_marker_fg = ui_render.diff_removed_marker_style,
-                .reset = ui_render.reset_style,
-            },
+            persistedDiffStyles(),
         );
+    }
+
+    /// Reads the active theme, so it is evaluated at each use.
+    fn persistedDiffStyles() @import("core/output/diff.zig").FormatStyles {
+        return .{
+            .added_fg = ui_render.diff_added_style,
+            .removed_fg = ui_render.diff_removed_style,
+            .context_fg = ui_render.dim_style,
+            .added_marker_fg = ui_render.diff_added_marker_style,
+            .removed_marker_fg = ui_render.diff_removed_marker_style,
+            .reset = ui_render.reset_style,
+        };
     }
 
     pub fn registerAndEmitDiffBlock(self: *App, payload: agent_runtime.DiffEntryPayload) !void {
@@ -2698,6 +2758,7 @@ const App = struct {
         try self.diff_entries.append(c_alloc, .{
             .id = id,
             .full = payload.full,
+            .deferred = payload.deferred,
         });
         appended = true;
         self.next_diff_id += 1;
@@ -2718,20 +2779,27 @@ const App = struct {
 
     fn fullDiffForMarker(ctx: *anyopaque, id: u32) ?[]const u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
-        for (self.diff_entries.items) |entry| {
+        for (self.diff_entries.items) |*entry| {
             if (entry.id != id) continue;
+            SessionAppRuntime.materializeDeferredDiff(self, entry, persistedDiffStyles());
             const full = entry.full orelse return null;
             return full.content;
         }
         return null;
     }
 
+    /// Builds a matching deferred resumed edit first, so the answer stays
+    /// exact when its saved snapshots are missing.
     fn hasFullDiffForLifecycle(
         ctx: *anyopaque,
         lifecycle_id: types.ToolLifecycleId,
     ) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
-        for (self.diff_entries.items) |entry| {
+        for (self.diff_entries.items) |*entry| {
+            if (entry.deferred) |deferred| {
+                if (!deferred.matches(lifecycle_id)) continue;
+                SessionAppRuntime.materializeDeferredDiff(self, entry, persistedDiffStyles());
+            }
             const full = entry.full orelse continue;
             if (full.lifecycle_id.turn_id != lifecycle_id.turn_id) continue;
             if (std.mem.eql(u8, full.lifecycle_id.call_id, lifecycle_id.call_id)) return true;
@@ -3547,18 +3615,20 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
                 .argv0 = .init(process_args),
                 .environ = .{ .block = env_block },
             });
-            defer threaded.deinit();
             io_mod.setIo(threaded.io());
 
             var owned_launch = launch;
-            defer owned_launch.deinit(alloc);
-            defer debug_trace.shutdown();
-
-            const outcome = try app_entry_runtime.runInteractive(App, alloc, &owned_launch, auth_mode);
-            switch (outcome) {
-                .returned => return,
-                .exit => |code| std.process.exit(code),
-            }
+            // Interactive shutdown has already persisted the session and
+            // terminated child processes. What remains is freeing memory and
+            // joining threads that can still be waiting on DNS, the network,
+            // or a disk scan, so end the process here. The app is declared in
+            // this scope because those threads still reference it.
+            var app: App = undefined;
+            const outcome = app_entry_runtime.runInteractive(App, &app, alloc, &owned_launch, auth_mode) catch exitFast(1);
+            exitFast(switch (outcome) {
+                .returned => 0,
+                .exit => |code| code,
+            });
         },
         .returned => exitFast(0),
         .exit => |code| exitFast(code),
@@ -4209,6 +4279,64 @@ test "diff block writes are classified" {
     );
 }
 
+test "deferred resumed diff builds once and degrades to its preview" {
+    const alloc = std.testing.allocator;
+    const c_alloc = std.heap.c_allocator;
+    const diff_mod = @import("core/output/diff.zig");
+
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+
+    var app = App{
+        .alloc = alloc,
+        .shell = .{
+            .stdout_file = sink,
+            .layout = .{
+                .rows = 24,
+                .cols = 80,
+                .content_bottom = 21,
+                .divider_top_row = 22,
+                .input_row = 23,
+                .divider_bottom_row = 24,
+                .hint_row = 22,
+            },
+        },
+    };
+    defer {
+        for (app.diff_entries.items) |*entry| entry.deinit(c_alloc);
+        app.diff_entries.deinit(c_alloc);
+        app.shell.deinit(alloc);
+        app.session.deinit(alloc);
+    }
+
+    const lifecycle: types.ToolLifecycleId = .{ .turn_id = 3, .call_id = "call_deferred" };
+    var payload = agent_runtime.DiffEntryPayload{
+        .preview = try c_alloc.dupe(u8, "diff preview"),
+    };
+    payload.deferred = diff_mod.DeferredFullDiff.clone(
+        c_alloc,
+        "call_deferred",
+        "diff-0000000000000000-0000000000000000.json",
+        lifecycle,
+    ) catch |err| {
+        diff_mod.freeDiffEntryPayload(c_alloc, payload);
+        return err;
+    };
+    try app.registerAndEmitDiffBlock(payload);
+    const id = app.diff_entries.items[0].id;
+    // Registering and drawing a resumed edit builds nothing; the full diff
+    // waits for the full transcript to ask for it.
+    try std.testing.expect(app.diff_entries.items[0].deferred != null);
+    try std.testing.expect(app.diff_entries.items[0].full == null);
+
+    // No saved session owns the snapshots: the entry falls back to its
+    // preview, and the failed build is not retried on every lookup.
+    try std.testing.expect(!App.hasFullDiffForLifecycle(&app, lifecycle));
+    try std.testing.expect(app.diff_entries.items[0].deferred == null);
+    try std.testing.expect(App.fullDiffForMarker(&app, id) == null);
+    try std.testing.expect(app.diff_entries.items[0].full == null);
+}
+
 test "prompt card wraps image badges in OSC 8 hyperlinks" {
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
@@ -4457,6 +4585,12 @@ test {
     _ = @import("core/permissions/auto_classifier.zig");
     _ = @import("core/permissions/command_admission.zig");
     _ = @import("core/mcp/mcp_runtime.zig");
+    _ = @import("core/mcp/connection_control.zig");
+    _ = @import("core/mcp/server_transport.zig");
+    _ = @import("core/mcp/stdio_dispatcher.zig");
+    _ = @import("core/mcp/tool_operations.zig");
+    _ = @import("core/mcp/tool_result.zig");
+    _ = @import("core/mcp/tool_search.zig");
     _ = @import("core/mcp/elicitation_interaction.zig");
     _ = @import("core/mcp/features/common.zig");
     _ = @import("core/mcp/features/resources.zig");

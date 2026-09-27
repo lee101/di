@@ -2219,7 +2219,7 @@ tmuxTest(
     expect(signInScreen).not.toContain("Code   ");
     expect(signInScreen).not.toContain(`${chatgptOauth.baseUrl}/oauth/authorize?`);
     const signInEscapes = await session.capturePaneEscapes();
-    expect(signInEscapes).toContain(`\x1b]8;;${chatgptOauth.baseUrl}/oauth/authorize?`);
+    expect(signInEscapes).toContain(`\x1b]8;id=fx-codex-auth;${chatgptOauth.baseUrl}/oauth/authorize?`);
     expect(signInEscapes).toContain("\x1b]8;;\x1b\\");
     await session.sendKeys("C-c");
     await session.waitForComposer(TIMEOUT);

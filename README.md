@@ -259,7 +259,7 @@ Slugs are the gateway's provider identifiers (letters, digits, dashes, for examp
 
 ## Themes
 
-fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
+fx ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
 
 ## Embed di
 
@@ -281,12 +281,46 @@ computer. The HTTPS callback at fx.sh returns the authorization to the CLI;
 PKCE state and the verifier stay in memory. The companion web bridge must be
 deployed and configured first.
 
+After the CLI saves the installation, the browser returns to an fx.sh confirmation
+page. You can close that tab or refresh it after the command exits.
+
 `fx slack status --json` reports local installation metadata without tokens.
+Plain-text output omits Slack IDs and shows expiration as a readable UTC date
+and time. JSON output retains the IDs and Unix timestamps for scripts.
 `fx slack refresh` rotates the local bot credentials when needed. Credentials
 live in the owner-only file `~/.fx/slack/installation.json`; no hosted database
 or background refresh service is created. An expired refresh token requires
 installation again. This workspace operation is separate from each employee's
-existing MCP user authorization. Bot installation does not establish whether
+MCP user authorization. Employees connect their own account with
+`/mcp auth slack --open` in an fx session (or `fx mcp auth slack` from a terminal).
+For `https://mcp.slack.com/mcp`, the CLI recognizes the fx app by its public
+Client ID and uses the HTTPS callback for personal login. Changing that Client
+ID requires a CLI update. OAuth uses the canonical form of Slack's advertised
+resource, `https://mcp.slack.com/`, while the MCP transport remains at
+`https://mcp.slack.com/mcp`. First login and reauthorization request the full shared
+`user_scopes` list from fx.sh. If local `scopes` are configured, they must include
+every shared scope; extra local scopes are not requested. A narrower or explicitly
+empty list stops authorization before opening the browser, leaving the configuration
+and stored credentials unchanged. Remove the override only if you want to authorize
+the full shared scope set. Per-user read-only subsets are not supported for the fx app. Saved scopes,
+Slack's advertised capabilities, and scope challenges cannot expand this
+request. The shared list contains nine personal scopes configured for fx and
+advertised by Slack MCP; changing it requires a deliberate configuration update
+and any necessary Slack approval. This does not revoke
+permissions on previously issued tokens or change token refresh behavior. It
+opens an ephemeral loopback listener instead of the configured `callback_port`,
+keeps PKCE and personal tokens in the CLI, and shows “Slack connected” after
+saving to the existing MCP credential store. Other MCP providers and different
+Slack app Client IDs retain their direct callback behavior without contacting
+fx.sh. Fx app authorization requires fx.sh to be available; an unavailable
+metadata endpoint returns `SlackBridgeUnavailable`. Deploy the web
+personal-authorization routes and scope metadata before releasing this CLI.
+Missing or invalid shared scopes stop authorization rather than falling back
+to Slack's broader capabilities. Keep the registered
+localhost callback for older clients until they have upgraded. Slack workspace
+approval requirements still apply to personal authorization.
+
+Bot installation does not establish whether
 Slack will display a hoverable “Sent using @fx” attribution; that requires a
 live message test.
 

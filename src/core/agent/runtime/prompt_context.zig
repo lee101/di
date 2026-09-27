@@ -440,11 +440,9 @@ pub fn usableInputTokens(
 ) ?usize {
     const context_window = capabilities.context_window orelse return null;
     const context_tokens: usize = @intCast(context_window);
-    if (capabilities.max_output_tokens) |output| {
-        const output_tokens: usize = @intCast(output);
-        if (output_tokens < context_tokens) return context_tokens - output_tokens;
-    }
-    return context_tokens;
+    // Reserve exactly what the request asks for; that limit is always below the window.
+    const output_tokens: usize = model_capabilities.requestOutputTokens(capabilities) orelse return context_tokens;
+    return context_tokens - output_tokens;
 }
 
 pub const ProviderPrompt = struct {
@@ -888,7 +886,7 @@ test "compactor input budget follows normal model capacity" {
         usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 203_184 }),
     );
     try std.testing.expectEqual(
-        @as(?usize, 500_000),
+        @as(?usize, 500_000 - 32_768),
         usableInputTokens(.{ .context_window = 500_000, .max_output_tokens = 500_000 }),
     );
     try std.testing.expectEqual(

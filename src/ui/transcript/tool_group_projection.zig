@@ -1279,7 +1279,11 @@ fn buildWithStyleAndStats(
     var index: usize = 0;
     while (index < entries.len) {
         try build_checkpoint.tick(checkpoint);
-        if (projection.entry_actions.items[index] != .keep) {
+        // Hidden entries keep their action, but grouping below skips them, so
+        // they must not anchor a group either.
+        if (projection.entry_actions.items[index] != .keep or
+            !transcript_blocks.isEntryVisibleInCompactPresentation(entries[index]))
+        {
             index += 1;
             continue;
         }
@@ -2493,6 +2497,48 @@ test "entries hidden by compact presentation do not split tool groups" {
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expect(projection.entry_actions.items[2] == .keep);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
+}
+
+test "tool status hidden by a display clear does not start a compact group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "welcome", .class = .welcome } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "command", .class = .tool_status, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 4, .bytes = "4s", .class = .turn_summary, .inline_hidden = true } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 2, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .keep);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[3] == .keep);
+}
+
+test "visible tool status after a display clear keeps its compact group" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "command", .class = .tool_status, .inline_hidden = true } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed },
+        .{ .entry_id = 2, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    try std.testing.expect(projection.entry_actions.items[0] == .keep);
+    try std.testing.expect(projection.entry_actions.items[1] == .override);
+    const block = projection.entry_actions.items[1].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "1 tool call") != null);
+    try std.testing.expect(std.mem.find(u8, block, "run_command") == null);
 }
 
 test "visible assistant messages split groups while silent entries do not" {

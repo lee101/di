@@ -798,20 +798,21 @@ async function waitForMcpServerReady(
     throw new Error(`Timed out waiting for MCP fixture startup: ${serverName}`);
   }
 
-  const hasServerState = (pane: string, state: "ready" | "failed") =>
-    pane.includes(`${serverName} [${state}]`) ||
+  const hasServerState = (pane: string, state: "Ready" | "Failed") =>
     pane.split("\n").some((line) =>
-      line.includes(`${serverName} `) && line.includes(` state=${state}`)
+      line.includes(`${serverName} `) && line.includes(state)
     );
   await session.sendText("/mcp list");
   const status = await session.waitForPane(
-    (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
+    (pane) => hasServerState(pane, "Ready") || hasServerState(pane, "Failed"),
     timeoutMs,
   );
+  await session.sendKeys("Escape");
+  await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
   if (!isProcessAlive(pid)) {
     throw new Error(`MCP fixture process ${pid} exited after startup.\n${status}`);
   }
-  if (hasServerState(status, "failed")) {
+  if (hasServerState(status, "Failed")) {
     throw new Error(`MCP server ${serverName} failed after startup.\n${status}`);
   }
 }
@@ -4661,20 +4662,30 @@ describe("gateway stream lifecycle", () => {
     writeFileSync(clipboardStub, "#!/bin/sh\nexit 1\n");
     chmodSync(clipboardStub, 0o755);
     const marker = join(root.workspace, "executions.txt");
+    const invalidInput = '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"';
     let step = 0;
     const gateway = startGateway((body) => {
       switch (step++) {
         case 0:
           return fakeGatewaySse([
-            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: '{"request":{"action":"run","command":"touch MUST_NOT_EXECUTE"' },
+            { type: "tool-call", toolCallId: "invalid_shell", toolName: "shell", input: invalidInput },
             { type: "tool-call", toolCallId: "valid_shell", toolName: "shell", input: { request: { action: "run", command: "printf 'once\\n' >> executions.txt", profile: "clean" } } },
             { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
           ]);
-        case 1:
-          expect(toolResultOutput(body, "invalid_shell")).toContain("Tool arguments were not valid JSON.");
+        case 1: {
+          const rejection = toolResultOutput(body, "invalid_shell");
+          expect(rejection).not.toContain("MUST_NOT_EXECUTE");
+          const error = JSON.parse(rejection).error;
+          expect(error.message).toContain("Tool arguments ended before the JSON was complete");
+          expect(error.details).toEqual({
+            failure: "truncated",
+            received_bytes: invalidInput.length,
+            error_offset: invalidInput.length,
+          });
           expect(shellResult(body, "valid_shell").exit_code).toBe(0);
           expect(readFileSync(marker, "utf8")).toBe("once\n");
           return fakeGatewayFinalText("REJECTION_RECOVERED");
+        }
         case 2:
           return fakeGatewayToolCall("later_shell", "shell", { request: { action: "run", command: "printf 'later\\n' >> executions.txt", profile: "clean" } });
         case 3:
@@ -5270,6 +5281,119 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
+    }
+  }, 30_000);
+
+  test("shell keeps a detached daemon across calls and stops same-session jobs", async () => {
+    const root = createFixtureRoot("shell-detached-daemon");
+    const tracePath = join(root.root, "trace.log");
+    const daemonPidPath = join(root.workspace, "daemon.pid");
+    const jobPidPath = join(root.workspace, "job.pid");
+    const startCallId = "shell_detached_daemon_start";
+    const probeCallId = "shell_detached_daemon_probe";
+    const startCommand = [
+      `sleep 30 >/dev/null 2>&1 & printf '%s' "$!" > ${JSON.stringify(jobPidPath)}`,
+      "python3 -c 'import os,sys,time",
+      "ready_r,ready_w=os.pipe()",
+      "if os.fork() == 0:",
+      " os.close(ready_r)",
+      " os.setsid()",
+      " if os.fork() > 0: os._exit(0)",
+      " null=os.open(\"/dev/null\",os.O_RDWR)",
+      " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)",
+      ` with open(${JSON.stringify(daemonPidPath)},\"w\") as f: f.write(str(os.getpid()))`,
+      " os.write(ready_w,b\"R\"); os.close(ready_w)",
+      " time.sleep(30)",
+      " os._exit(0)",
+      "os.close(ready_w)",
+      "if os.read(ready_r,1) != b\"R\": sys.exit(1)",
+      "print(\"DAEMON-STARTED\")'",
+    ].join("\n");
+    let step = 0;
+    let daemonPid: number | null = null;
+    let jobPid: number | null = null;
+    let started: ShellResult | null = null;
+    let probed: ShellResult | null = null;
+    let daemonAliveAfterStart = false;
+    let jobAliveAfterStart = true;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeShellRun(startCallId, startCommand, {
+            profile: "clean",
+            timeout_ms: 10_000,
+          });
+        case 1: {
+          try {
+            started = shellResult(body, startCallId);
+            daemonPid = Number.parseInt(readFileSync(daemonPidPath, "utf8"), 10);
+            jobPid = Number.parseInt(readFileSync(jobPidPath, "utf8"), 10);
+            daemonAliveAfterStart = isProcessAlive(daemonPid);
+            jobAliveAfterStart = isProcessAlive(jobPid);
+          } catch (error) {
+            gatewayObservationError = error;
+            return fakeGatewayFinalText("Detached daemon fixture failed.");
+          }
+          return fakeShellRun(
+            probeCallId,
+            `kill -0 ${daemonPid} && printf DAEMON-ALIVE`,
+            { profile: "clean" },
+          );
+        }
+        case 2:
+          try {
+            probed = shellResult(body, probeCallId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("Detached daemon survived.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Run the detached daemon fixture."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      if (gatewayObservationError) throw gatewayObservationError;
+      expect(result.code).toBe(0);
+      expect(json.output).toContain("Detached daemon survived.");
+      expect(gateway.requestCount()).toBe(3);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: expect.stringContaining("DAEMON-STARTED"),
+      });
+      expect(Number.isSafeInteger(daemonPid) && daemonPid! > 0).toBe(true);
+      expect(Number.isSafeInteger(jobPid) && jobPid! > 0).toBe(true);
+      expect(daemonAliveAfterStart).toBe(true);
+      expect(jobAliveAfterStart).toBe(false);
+      expect(probed).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        output_delta: "DAEMON-ALIVE",
+      });
+      expect(isProcessAlive(daemonPid!)).toBe(true);
+    } finally {
+      for (const pid of [daemonPid, jobPid]) {
+        if (pid === null || !Number.isSafeInteger(pid) || pid <= 0) continue;
+        if (!isProcessAlive(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
 

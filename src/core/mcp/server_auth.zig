@@ -427,6 +427,7 @@ pub fn authorizeForChallenge(
             .client_secret = client_secret,
             .client_metadata_url = auth_config.client_metadata_url,
             .scopes = auth_config.scopes,
+            .scopes_configured = auth_config.scopes_configured,
         },
         .previous_scope = source.previous_scope,
     })) {
@@ -707,6 +708,8 @@ pub fn authenticate(
     };
     defer source.challenge.deinit(alloc);
     defer if (source.previous_scope) |value| alloc.free(value);
+    var completion: mcp_auth.InteractiveCompletion = .{};
+    defer completion.finish(false);
     var credentials = switch (try mcp_auth.authorizeInteractive(alloc, .{
         .endpoint = try server.config.remoteUrl(),
         .challenge = source.challenge,
@@ -717,6 +720,7 @@ pub fn authenticate(
             .client_secret = client_secret,
             .client_metadata_url = auth_config.client_metadata_url,
             .scopes = auth_config.scopes,
+            .scopes_configured = auth_config.scopes_configured,
             .callback_port = auth_config.callback_port,
         },
         .previous_scope = source.previous_scope,
@@ -724,6 +728,7 @@ pub fn authenticate(
         .open_url = open_url,
         .cancel_flag = cancel_flag,
         .lifecycle_cancel_flag = server.cancellation(),
+        .completion = &completion,
     })) {
         .credentials => |credentials| credentials,
         .issuer_mismatch => |mismatch| return .{ .issuer_mismatch = mismatch },
@@ -751,6 +756,7 @@ pub fn authenticate(
         server.pending_auth_challenge = null;
         server.auth_challenge_present.store(false, .release);
     }
+    completion.finish(true);
     return .{ .authenticated = .{ .repaired_entries = repaired_entries } };
 }
 

@@ -166,6 +166,11 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("Server started on stdio\n");
+      return;
+    }
     if (
       mode === "crash_then_fail_recovery_once" &&
       recoveryGeneration &&
@@ -577,13 +582,26 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item",
+            text: "Invalid input: labels require at least one item\nretry rejected",
           }],
         },
       });
       return;
     }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "exit_after_result") {
+      // Answer, then exit so the next call finds the connection already closed.
+      const result = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }],
+        },
+      };
+      process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
+      return;
+    }
     if (
       [
         "crash_once",
