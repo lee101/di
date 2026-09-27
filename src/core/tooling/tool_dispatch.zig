@@ -409,6 +409,7 @@ pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 pub const ExecutorKind = enum {
     glob_files,
     grep_files,
+    fuzzy_search,
     read_file,
     read_tool_result,
     write_file,

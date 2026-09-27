@@ -1433,6 +1433,7 @@ pub fn permissionNameForTool(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "write_file") or std.mem.eql(u8, tool_name, "edit_file")) return "edit";
     if (std.mem.eql(u8, tool_name, "glob_files")) return "glob";
     if (std.mem.eql(u8, tool_name, "grep_files")) return "grep";
+    if (std.mem.eql(u8, tool_name, "fuzzy_search")) return "grep";
     if (std.mem.eql(u8, tool_name, "run_command")) return "bash";
     if (isWebFetchToolName(tool_name)) return web_fetch_permission;
     if (std.mem.eql(u8, tool_name, "skill") or std.mem.eql(u8, tool_name, "install_skill")) return "skill";
@@ -2650,6 +2651,19 @@ test "configured command rules match explicit environments by command" {
         RuleDecision.allow,
         try ruleDecisionFor(alloc, rules, "/tmp/workspace", "run_command", target, .command_cwd),
     );
+}
+
+test "fuzzy_search honors grep directory deny rules" {
+    var rules_buf = [_]types.PermissionRule{
+        .{ .permission = @constCast("grep"), .pattern = @constCast("private/**"), .action = .deny },
+    };
+    const rules: types.PermissionRuleSet = .{ .rules = &rules_buf };
+    for ([_][]const u8{ "grep_files", "fuzzy_search" }) |name| {
+        try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", name, "/tmp/workspace/private", .path_optional_existing));
+        try std.testing.expectEqual(RuleDecision.deny, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", name, "/tmp/workspace/private/child", .path_optional_existing));
+        try std.testing.expectEqual(RuleDecision.none, try ruleDecisionFor(std.testing.allocator, rules, "/tmp/workspace", name, "/tmp/workspace/public", .path_optional_existing));
+    }
+    try std.testing.expect(!allowsExternalPath("fuzzy_search"));
 }
 
 test "directory tree permission patterns match directory and descendants only" {

@@ -23,6 +23,7 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
     if (tool_presentation.isProviderSearchAlias(tool_name)) return .search;
     if (std.mem.eql(u8, tool_name, "glob_files")) return .read;
     if (std.mem.eql(u8, tool_name, "grep_files")) return .search;
+    if (std.mem.eql(u8, tool_name, "fuzzy_search")) return .search;
     if (std.mem.eql(u8, tool_name, "read_file")) return .read;
     if (std.mem.eql(u8, tool_name, "web_fetch")) return .fetch;
     if (std.mem.eql(u8, tool_name, "web_search")) return .search;

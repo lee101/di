@@ -102,6 +102,57 @@ ChatGPT/Codex login state for people moving from fx. New provider keys use
 their standard names: `OPENPATHS_API_KEY`, `OPENROUTER_API_KEY`, and
 `AI_GATEWAY_API_KEY`.
 
+## Efficient local searches
+
+The agent can choose among these search tools:
+
+| Tool | Use |
+| --- | --- |
+| `fuzzy_search` | Semantic discovery of local code using an existing zbed index. |
+| `grep_files` | Exact literal matches with bounded output and context. |
+| `shell` with `rg` | Regex search, filename search, or command-line search when preferred. |
+| `gemini_search` | Public web research with a grounded answer and citations; requires `GEMINI_API_KEY`. |
+| `web_search` | Public web search results through the configured search provider. |
+
+To enable `fuzzy_search`, build the zbed checkout with Zig 0.16.0,
+then configure trusted absolute paths before launching di:
+
+```bash
+export FX_ZBED_BIN=/path/to/zbed/zig-out/bin/zbed
+export FX_ZBED_MODEL_DIR=/path/to/zbed/model
+"$FX_ZBED_BIN" index /path/to/project --model-dir "$FX_ZBED_MODEL_DIR"
+```
+
+Index a suitably narrow directory explicitly. `fuzzy_search` takes `query`,
+optional workspace-relative `path`, and `limit` (1–50, default 10). It requires
+the updated backend advertising `zbed-search-readonly-v1`, reads an existing
+index up to 64 MiB, and never creates or refreshes an index. Searches are local,
+use no GPU or daemon, have a 15-second execution deadline and a 64 KiB output
+cap. Results may be stale; verify them against current files. A missing backend
+or index leaves `rg` and `grep_files` available. Existing `grep` permission rules
+also govern `fuzzy_search`, which is restricted to the workspace.
+
+Use `grep_files` for literal search, `glob_files` for discovery, and `rg` for
+shell searches. The agent is guided to narrow search roots, batch independent
+reads, and wait on existing shell sessions instead of repeatedly polling.
+Parallel tool groups run in batches of at most eight, preserving result order
+and keeping mutations behind preceding reads.
+
+In full-access mode, captured `shell` calls with `profile: "clean"` automatically
+translate a conservative subset of recursive text searches to ripgrep. For
+example, `grep -ranFH needle src` uses `rg` when available, with the original
+command as the fallback when it is absent. Hidden and ignored files remain in
+scope; ripgrep config is disabled and the search uses one worker. The executed
+command is recorded in the shell result.
+
+Translation requires explicit text mode (`-a`), recursion (`-r` or `-R`) and
+filename formatting (`-H` or `-h`). It accepts fixed strings (`-F`) or simple
+literal patterns, plus line numbers (`-n`). Other flags, binary detection,
+regexes, expansions, pipelines, interactive shells, user startup profiles, and
+exact-command approval modes retain their original command. No extra model
+round trip is required. See [the op comparison](docs/op-parity.md) for coverage
+and remaining gaps.
+
 ## di infinity
 
 di infinity is the infinite run harness: one `di ask` invocation that keeps working across turns until you interrupt it. After every completed turn, the saved session receives a generated follow-up prompt built from the latest work summary, so progress compounds instead of stopping at the first answer.
