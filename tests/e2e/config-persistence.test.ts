@@ -217,9 +217,6 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     fixture.settings.providers.local.model_metadata["local-model"].context_window = 65536;
     fixture.settings.providers.local.model_metadata["local-model"].max_output_tokens = 4096;
     fixture.save();
-    // Catalog merging can issue a GET for the separately configured Gateway.
-    // Every model POST must still use this configured provider's connection.
-    const completions = () => fixture.requests.filter(request => request.body !== null);
     const stderrPath = join(fixture.home, "stderr.log");
     try {
       session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env, stderrPath });
@@ -229,7 +226,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText(`local reply ${turn}`, TIMEOUT);
         await session.waitForComposer(TIMEOUT);
       }
-      expect(completions()).toHaveLength(5);
+      expect(fixture.requests).toHaveLength(5);
       await session.sendText("/status");
       await session.waitForText(`provider_endpoint=${fixture.settings.providers.local.base_url}`, TIMEOUT);
       await session.waitForComposer(TIMEOUT);
@@ -245,9 +242,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         if (committed) break;
         await Bun.sleep(25);
       }
-      if (!committed) throw new Error(`compaction did not commit; requests=${JSON.stringify(completions().map(request => ({ bytes: JSON.stringify(request.body).length, tools: request.body.tools?.length, messageBytes: JSON.stringify(request.body.messages).length })))}\n${(await session.captureFullScrollback()).slice(-1500)}`);
-      expect(completions().length).toBeGreaterThanOrEqual(6);
-      expect(completions().every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      if (!committed) throw new Error(`compaction did not commit; requests=${JSON.stringify(fixture.requests.map(request => ({ bytes: JSON.stringify(request.body).length, tools: request.body.tools?.length, messageBytes: JSON.stringify(request.body.messages).length })))}\n${(await session.captureFullScrollback()).slice(-1500)}`);
+      expect(fixture.requests.length).toBeGreaterThanOrEqual(6);
+      expect(fixture.requests.every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
       const scrollback = await session.captureFullScrollbackEscapes();
       expect(scrollback).toContain("local reply");
       await session.sendText("/quit");
