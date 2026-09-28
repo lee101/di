@@ -44,6 +44,13 @@ The existing `file-tool-paths.test.ts` owns deterministic runtime coverage and
 retains its PGSO training classification. Unit tests cover syntax boundaries,
 allocation failures, exact approvals, and bounded scheduling.
 
+## Catalog warmup
+
+Repeated startup/resume warmups reuse an unchanged in-flight fetch. Changing a
+secondary catalog or credential cancels and joins its old reader, then allows
+immediate reload. This prevents an optimization from dropping reasoning/Fast
+capabilities during the first resumed request.
+
 ## Next parity work
 
 1. Add native regex search with fixtures for Unicode, ignored/hidden files,

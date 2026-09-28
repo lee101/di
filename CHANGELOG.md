@@ -46,6 +46,8 @@
 
 ### Bug Fixes
 
+- **Resumed model settings:** Reopening a session preserves reasoning and Fast options by keeping an unchanged model-catalog fetch alive.
+
 - **Multiple images:** Reading multiple images in one turn no longer crashes fx, and images returned by tools now reach vision models through Gateway.
 - **Image accounting:** Tool images no longer count as text during request estimation. Automatic compaction now uses the real image cost.
 - **Session titles:** Resuming an untitled session now generates a title from its first committed prompt instead of preserving `Untitled session`.

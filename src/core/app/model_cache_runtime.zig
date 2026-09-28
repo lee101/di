@@ -67,6 +67,7 @@ const OwnedCatalogAccess = struct {
                             .credential = credential,
                             .team_context = team_context,
                             .account_id = account_id,
+                            .authority = authenticated.authority,
                         },
                     },
                 };
@@ -195,6 +196,24 @@ pub const MergeSource = struct {
     catalog: model_catalog.Provider,
     access: credentials.CatalogAccess,
 };
+
+fn sameOptionalText(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a) |value| return if (b) |other| std.mem.eql(u8, value, other) else false;
+    return b == null;
+}
+
+fn sameCatalogAccess(a: credentials.CatalogAccess, b: credentials.CatalogAccess) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .host_managed => true,
+        .public_only => |value| std.meta.eql(value, b.public_only),
+        .authenticated => |value| value.source == b.authenticated.source and
+            value.authority == b.authenticated.authority and
+            std.mem.eql(u8, value.credential, b.authenticated.credential) and
+            sameOptionalText(value.team_context, b.authenticated.team_context) and
+            sameOptionalText(value.account_id, b.authenticated.account_id),
+    };
+}
 
 const OwnedMergeSource = struct {
     origin: ModelOrigin,
@@ -537,7 +556,16 @@ pub const Runtime = struct {
     /// Sources are owned copies; call before `startWarmup`. Any in-flight load
     /// is cancelled first so sources are never freed under the loader thread.
     pub fn setMergeSources(self: *Self, sources: []const MergeSource) !void {
-        self.cancelAndJoin();
+        // Startup and resume may request the same warmup more than once.
+        // Keep its in-flight fetch alive when the source values are unchanged.
+        if (sources.len == self.owned_merge_sources.len) {
+            const unchanged = for (sources, self.owned_merge_sources) |next, current| {
+                if (next.origin != current.origin or
+                    !std.meta.eql(next.catalog, current.catalog) or
+                    !sameCatalogAccess(next.access, current.access.access)) break false;
+            } else true;
+            if (unchanged) return;
+        }
         const owned = try self.alloc.alloc(OwnedMergeSource, sources.len);
         var count: usize = 0;
         errdefer {
@@ -548,6 +576,9 @@ pub const Runtime = struct {
             owned[count] = try OwnedMergeSource.init(self.alloc, source);
             count += 1;
         }
+        // Allocate first, then stop the old reader before replacing its sources.
+        // A cancelled load must be immediately restartable, without failure backoff.
+        self.reset();
         freeMergeSources(self.alloc, &self.owned_merge_sources);
         self.owned_merge_sources = owned;
     }
@@ -1625,6 +1656,41 @@ const StaleCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
+
+test "model cache repeated merge sources preserve in-flight warmup and changed sources restart" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    defer runtime.reset();
+    var stalled = StaleCatalog{};
+    runtime.startWarmup(stalled.provider(), .{ .public_only = .no_credential });
+    while (!stalled.started.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+    try runtime.setMergeSources(&.{});
+    try std.testing.expect(!stalled.observed_cancel.load(.seq_cst));
+    try std.testing.expect(runtime.isLoading());
+
+    var secondary = StaticCatalog{ .ids = &.{"secondary/model"} };
+    const sources = [_]MergeSource{.{
+        .origin = .ai_gateway_api_key,
+        .catalog = secondary.provider(),
+        .access = authenticatedCatalogAccess("key-one", "team_123").withExplicitAuthority(),
+    }};
+    try runtime.setMergeSources(&sources);
+    try std.testing.expect(stalled.observed_cancel.load(.seq_cst));
+    try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
+    try std.testing.expect(!runtime.cancel_requested.load(.seq_cst));
+    try std.testing.expect(runtime.owned_merge_sources[0].access.access.authenticated.authority == .explicit);
+    var primary = StaticCatalog{ .ids = &.{"primary/model"} };
+    runtime.startWarmup(primary.provider(), .{ .public_only = .no_credential });
+    try waitForWarmup(&runtime);
+    try runtime.setMergeSources(&sources);
+    try std.testing.expectEqual(ModelCacheState.ready, runtime.state);
+    var changed = sources;
+    changed[0].access.authenticated.credential = "key-two";
+    try runtime.setMergeSources(&changed);
+    try std.testing.expectEqual(ModelCacheState.idle, runtime.state);
+    try std.testing.expectEqualStrings("key-two", runtime.owned_merge_sources[0].access.access.authenticated.credential);
+}
 
 test "model cache expires successful catalogs only when the provider requests refresh" {
     for ([_]bool{ false, true }) |expires| {
