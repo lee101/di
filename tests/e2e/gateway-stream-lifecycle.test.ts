@@ -2228,7 +2228,7 @@ describe("gateway stream lifecycle", () => {
         gateway.requests[1]!.body,
         installCallId,
       );
-      expect(installOutput).toContain("Installed 1 skill(s) into fx.");
+      expect(installOutput).toContain("Installed 1 skill(s) into di.");
       expect(installOutput).toContain(`- ${skillName}\n`);
       expect(installOutput).not.toContain(bodySentinel);
       expect(installOutput).not.toContain(companionSentinel);
@@ -2881,7 +2881,7 @@ describe("gateway stream lifecycle", () => {
           writeFileSync(resourcePath, `${resourceSentinel}\n`);
           if (scenario.cancel) {
             await tui.sendKeys("C-c");
-            await tui.waitForText("What can fx do differently?", 10_000);
+            await tui.waitForText("What can di do differently?", 10_000);
             await tui.waitForStableComposer(10_000);
             expect(gateway.requestCount()).toBe(heldRequestCount);
             releaseFinish();

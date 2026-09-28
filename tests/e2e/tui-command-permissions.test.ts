@@ -856,7 +856,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.sendText("Run the prepared two-command history fixture.");
       await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
       await activeSession.sendKeys("Tab");
-      await activeSession.waitForText("Yes, and tell fx what to do next", TIMEOUT);
+      await activeSession.waitForText("Yes, and tell di what to do next", TIMEOUT);
       await activeSession.sendLiteralText(feedback);
       await activeSession.waitForText(`Yes, ${feedback}`, TIMEOUT);
       await activeSession.sendKeys("Enter");

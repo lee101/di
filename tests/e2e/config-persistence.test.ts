@@ -137,7 +137,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("must not send with an unreadable profile");
-      await session.waitForText("restart fx before sending a message", TIMEOUT);
+      await session.waitForText("restart di before sending a message", TIMEOUT);
       expect(fixture.requests).toHaveLength(0);
       rmSync(profile);
       renameSync(target, profile);
