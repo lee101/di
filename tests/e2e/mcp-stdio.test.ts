@@ -548,7 +548,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(approval).toContain("Allow this MCP tool call?");
       expect(approval).toContain(TOOL_NAME);
       expect(approval).toContain(
-        "This MCP tool needs approval before fx can send the request.",
+        "This MCP tool needs approval before di can send the request.",
       );
       expect(approval).toContain("3. Deny");
       expect(
@@ -5166,7 +5166,11 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
         "retry_attempt=0",
         "discovery=completed",
       ]) expect(pane).toContain(expected);
-      expect(pane).not.toContain(root.workspace);
+      // The status line intentionally displays the workspace. Only the MCP
+      // health message must omit its configured working directory.
+      const health = pane.slice(pane.indexOf("MCP health (")).split("\n\n")[0]!;
+      expect(health).toContain("discovery=completed");
+      expect(health).not.toContain(root.workspace);
       for (const forbidden of [
         "captured_at_ms=",
         "runtime_generation=",

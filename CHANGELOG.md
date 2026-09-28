@@ -12,6 +12,7 @@
 
 ### New Features
 
+- **Semantic code discovery:** `fuzzy_search` queries an existing local zbed index with bounded results. Exact search through `grep_files` or `rg` and grounded web research through `gemini_search` remain available.
 - **Default model:** fx now uses Grok 4.7 as its default model. Fast mode remains opt-in.
 - **Custom connections:** fx now supports named OpenAI Chat Completions connections for local servers and other gateways. Configure them in `~/.fx/settings.json`, then select one with `fx provider <name>` or `FX_PROVIDER`.
 - **Provider routing:** Gateway users can set `provider_order` and `provider_strict`, or pass `--provider-order` and `--provider-strict`, to prefer or restrict which providers serve a model.
@@ -26,6 +27,8 @@
 
 ### Improvements
 
+- **Bounded parallel work:** Large groups of independent tool calls run in batches of at most eight to reduce thread and memory spikes while preserving result order.
+- **Search efficiency:** Eligible recursive text searches in clean full-access shells use ripgrep with an automatic fallback when it is unavailable. Other grep commands and exact approvals retain their original behavior.
 - **Recovery:** Transient model failures now retry until the connection recovers. Silent streams use liveness checks, and retries slow to once a minute after 15 minutes.
 - **Session resume:** `/resume` opens up to 60× faster with better session caching.
 - **File suggestions:** `@` file suggestions are 6–40× faster with a saved index and background scanning.
@@ -42,6 +45,8 @@
 - **Command rendering:** Command rows now resize with the terminal, giving long shell commands cleaner rendering.
 
 ### Bug Fixes
+
+- **Resumed model settings:** Reopening a session preserves reasoning and Fast options by keeping an unchanged model-catalog fetch alive.
 
 - **Multiple images:** Reading multiple images in one turn no longer crashes fx, and images returned by tools now reach vision models through Gateway.
 - **Image accounting:** Tool images no longer count as text during request estimation. Automatic compaction now uses the real image cost.

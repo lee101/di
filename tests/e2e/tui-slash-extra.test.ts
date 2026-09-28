@@ -69,7 +69,7 @@ describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
 
         await session.sendText("/skills create ../escape-attempt");
         const rejected = await session.waitForText("Invalid skill name.", 5_000);
-        expect(rejected).toContain(
+        expect(rejected.replace(/\s+/g, " ")).toContain(
           "Use a single directory name without '/' or '\\'.",
         );
         expect(session.isAlive()).toBe(true);
@@ -77,7 +77,7 @@ describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
         expect(existsSync(join(home, ".fx", "escape-attempt"))).toBe(false);
 
         await session.sendText("/skills path");
-        const recovered = await session.waitForText("fx managed install root:", 5_000);
+        const recovered = await session.waitForText("di managed install root:", 5_000);
         expect(hasEmptyComposer(recovered)).toBe(true);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {

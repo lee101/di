@@ -328,6 +328,26 @@ When a tmux or tape-based scenario exposes a bug, reproduce it as a Zig unit tes
 
 ## Benchmarks
 
+Search command acceleration lives in `src/core/shell_command/search_rewrite.zig`
+and is gated by `src/tools/shell/shell.zig`. Preserve exact-command authority:
+only clean captured bash/zsh commands with matching full-access authority may
+be rewritten. Keep unsupported grep semantics unchanged and test actual search
+output as well as parsing. Runtime parallel tool groups are capped at eight in
+`src/core/agent/runtime/parallel_execution.zig`; preserve mutation barriers and
+ordered result delivery when changing scheduling. See `docs/op-parity.md` for
+the local op comparison and remaining gaps.
+
+`fuzzy_search` is the optional zbed semantic-search adapter in
+`src/tools/filesystem/fuzzy_search.zig`. Keep it read-only: require the backend's
+`zbed-search-readonly-v1` marker, pass query text as one argv item, preserve
+timeouts/output limits and workspace/grep permissions, and never auto-index.
+The zbed checkout and di both use Zig 0.16.0. Exact
+search through `grep_files` or shell `rg` and web search through `gemini_search`
+remain independent choices. Runtime fixture coverage belongs to the existing
+`file-tool-paths.test.ts` PGSO training owner. Set `FX_E2E_ZBED_BIN` and
+`FX_E2E_ZBED_MODEL_DIR` when running its optional real-backend fixture; it
+creates and removes its own small index. The default fixtures use a fake backend.
+
 Startup latency benchmarks live in `benchmarks/` and run in CI via `.github/workflows/bench.yml`.
 
 ```bash

@@ -471,7 +471,7 @@ fn applicableTargetsFromPermissionTargets(
 
 fn filesystemTargetKind(kind: tool_dispatch.ExecutorKind) ?context_contract.TargetKind {
     return switch (kind) {
-        .glob_files, .grep_files => .directory,
+        .glob_files, .grep_files, .fuzzy_search => .directory,
         .read_file => .file,
         else => null,
     };
@@ -576,7 +576,7 @@ const RetainedTargetCollector = struct {
         if (call.provenance == .provider_executed or call.argument_integrity != .valid or call.arguments_json.len > 64 * 1024) return;
         const tool = self.registry.lookup(call.name) orelse return;
         const is_directory = switch (tool.executor_kind) {
-            .glob_files, .grep_files, .terminal, .run_command => true,
+            .glob_files, .grep_files, .fuzzy_search, .terminal, .run_command => true,
             .read_file, .write_file, .edit_file => false,
             else => return,
         };

@@ -20,6 +20,7 @@ const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
+const fuzzy_search_impl = @import("../tools/filesystem/fuzzy_search.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -39,7 +40,9 @@ pub const ToolSpec = tool_specs.ToolSpec;
 const glob_files_description =
     "Find file paths matching a glob pattern, with mode=count for exact path counts without listing entries. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: locate files by name, extension, or directory pattern; narrow path or pattern if candidate caps appear. When NOT to use: search file contents, read files, run find, or count non-file concepts.";
 const grep_files_description =
-    "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
+    "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites; shell rg remains available for regex or preferred command-line searches. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, and known-path reads; do not repeat the same or equivalent search after a caller search only finds a definition.";
+const fuzzy_search_description =
+    "Find conceptually related local files and lines using zbed static embeddings and an existing .zbed index. Results are approximate and may be stale; verify paths and contents with read_file or rg. Never builds an index or starts a daemon. Requires configured FX_ZBED_BIN and FX_ZBED_MODEL_DIR. When to use: discover an implementation from a concept or approximate wording when its exact symbol is unknown. When NOT to use: exact/regex matches (use grep_files or shell rg), current web facts (use gemini_search or web_search), or automatic indexing of a large workspace.";
 const read_file_description =
     "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
 const write_file_description =
@@ -288,6 +291,37 @@ pub const grep_files = ToolSpec{
     .call = grep_files_impl.call,
     .reads_only_fn = grep_files_impl.readsOnly,
     .irreversible_fn = grep_files_impl.isIrreversible,
+};
+
+pub const fuzzy_search = ToolSpec{
+    .name = "fuzzy_search",
+    .description = fuzzy_search_description,
+    .model_schema = .{
+        .name = "fuzzy_search",
+        .description = fuzzy_search_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 2, .max_length = 1024 }, .description = "Concept or approximate wording to find in local code." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 4096 }, .description = "Indexed directory inside the workspace; defaults to the workspace root. Its .zbed/index.bin must already exist." },
+                .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 50 }, .description = "Maximum ranked results; defaults to 10." },
+            },
+            .required = &.{"query"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .fuzzy_search,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Searching",
+    .completed_action_label = "Searched",
+    .label_arg_kind = .query,
+    .label_arg_default = "query",
+    .permission_target_kind = .path_optional_existing,
+    .decode = fuzzy_search_impl.decode,
+    .validate = fuzzy_search_impl.validate,
+    .call = fuzzy_search_impl.call,
+    .reads_only_fn = fuzzy_search_impl.readsOnly,
+    .irreversible_fn = fuzzy_search_impl.isIrreversible,
 };
 
 pub const read_file = ToolSpec{
@@ -895,6 +929,7 @@ pub const read_tool_result = ToolSpec{
 pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
+    fuzzy_search,
     read_file,
     write_file,
     edit_file,
@@ -920,6 +955,7 @@ pub const advertisement_order = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "fuzzy_search",
     "edit_file",
     "write_file",
     "shell",
@@ -940,6 +976,7 @@ pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "fuzzy_search",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -1004,7 +1041,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "5dc5f0b22c2b166bd8d8140dd4ac382d5f4bf61231b0dc57cfc759ff00dbb00b",
+        "12281e6da5d6cd05c72ae183eef10ed3342e3f00f1d297110b5af06a6676b3f3",
         &actual_hex,
     );
 }
@@ -1045,6 +1082,7 @@ test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
         "glob_files",
         "grep_files",
+        "fuzzy_search",
         "read_file",
         "write_file",
         "edit_file",
@@ -1865,6 +1903,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "fuzzy_search",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

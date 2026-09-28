@@ -201,7 +201,7 @@ test(
         logoutResult.code,
         `stdout: ${logoutResult.stdout}\nstderr: ${logoutResult.stderr}`,
       ).toBe(0);
-      expect(logoutResult.stdout).toBe("Signed out of fx.\n");
+      expect(logoutResult.stdout).toBe("Signed out of di.\n");
       expect(tokenRequestCount).toBe(1);
       expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
       const revocations = oauth.requests.filter(
@@ -329,14 +329,14 @@ test(
         `stdout: ${status.stdout}\nstderr: ${status.stderr}`,
       ).toBe(0);
       const statusJson = JSON.parse(status.stdout);
-      expect(statusJson.auth).toBe("fx login");
+      expect(statusJson.auth).toBe("di login");
       expect(statusJson.auth_expired).toBe(true);
       expect(statusJson.auth_refreshable).toBe(true);
 
       const doctor = await runFx(["doctor", "--json"], { env, timeoutMs: TIMEOUT });
       expect(doctor.code).toBe(0);
       const doctorJson = JSON.parse(doctor.stdout);
-      expect(doctorJson.auth).toBe("fx login");
+      expect(doctorJson.auth).toBe("di login");
       expect(doctorJson.auth_expired).toBe(true);
       const authCheck = doctorJson.checks.find(
         (check: { name: string }) => check.name === "auth",
@@ -478,7 +478,7 @@ test(
       );
       expect(rejected.code).toBe(1);
       expect(rejected.stderr).toBe(
-        "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
+        "di ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
       );
       const rejectedJson = JSON.parse(rejected.stdout);
       expect(rejectedJson).toMatchObject({
@@ -591,7 +591,7 @@ test(
 
       const logout = await runFx(["logout"], { env, timeoutMs: TIMEOUT });
       expect(logout.code).toBe(0);
-      expect(logout.stdout).toBe("Signed out of fx.\n");
+      expect(logout.stdout).toBe("Signed out of di.\n");
       expect(logout.stderr).toBe("");
 
       expect(
@@ -661,7 +661,7 @@ test(
       });
 
       expect(logout.code).toBe(0);
-      expect(logout.stdout).toBe("Signed out of fx.\n");
+      expect(logout.stdout).toBe("Signed out of di.\n");
       expect(logout.stderr).toBe("");
       expect(invalidIssuer.requests).toEqual([]);
       expect(logout.stdout).not.toContain("expired-access-token");

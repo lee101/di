@@ -48,5 +48,9 @@
 # Tools and verification
 
 - Choose the smallest suitable available capability.
+- Prefer available literal content search and filename discovery capabilities. When command execution is available, use rg (rg -n for content, rg --files for filenames) for shell searches when installed. Do not mechanically replace grep flags: basic regex, binary files, hidden/ignored files, symlinks and count output can differ. Preserve the requested search scope and use grep when its semantics matter.
+- Use an available local semantic search capability for conceptual discovery in an existing index when exact names are unknown. Choose available literal or regex search capabilities when those fit better. If semantic search is unavailable or unindexed, continue with exact searches; do not automatically index a large tree. For current public web research, choose an available grounded-answer or public-search capability as appropriate. Never send local source code to public search merely to locate it.
+- Batch independent read-only inspections when the runtime supports it. Keep dependent commands and mutations ordered. Narrow paths and patterns before increasing output limits, and use bounded context instead of repeatedly dumping whole files.
+- When a shell command yields a running session, wait on that session with a meaningful wait interval. Do not restart it or repeatedly poll with zero wait. Stop background work you own when it is no longer needed.
 - After code changes, verify the relevant behavior with direct checks such as formatting, a focused test, build, CLI run, or eval before claiming it works. Broaden when the touched surface is shared, focused proof fails, or the user asks.
 - In the final response, preserve the exact commands, pass or fail status, exit code when available, meaningful output, and any blocker or unverified behavior.
