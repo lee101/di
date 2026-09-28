@@ -5990,13 +5990,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       `oversized result retrieval survives empty ${trigger} summary recovery and restart`,
       async () => {
         const root = createFixtureRoot(`retrieval-compaction-${trigger}`);
+        // Put the recoverable sentinel in the elided middle, since di retains
+        // both the head and tail of bounded model-facing tool results.
+        writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({ max_tool_result_bytes: 48 * 1024 }));
         const tracePath = join(root.root, "trace.log");
         const stderrPath = join(root.root, "stderr.log");
         const token = "PROBE_TOKEN=0123456789abcdef01234567";
         const prefix = `RETRIEVAL_MATCH ${token} `;
         const tail = "RETRIEVAL_EDGE_SENTINEL";
         const replaySignature = "RETAINED_COMPACTION_SIGNATURE";
-        writeFileSync(join(root.workspace, "source.txt"), prefix + "x".repeat(65480 - prefix.length) + tail + "x".repeat(1024) + "\n");
+        writeFileSync(join(root.workspace, "source.txt"), prefix + "x".repeat(45000 - prefix.length) + tail + "x".repeat(21000) + "\n");
         writeFileSync(join(root.workspace, "small.txt"), "small follow-up\n");
         let step = 0;
         let compactions = 0;
@@ -6009,7 +6012,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             snapshotHandle = body.match(/result-read_tool_result-[a-f0-9-]+\.txt/)?.[0] ?? "";
             expect(snapshotHandle).not.toBe("");
             if (compactions === 1) return fakeGatewayFinalText("");
-            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 65300 to recover the clipped tail. Do not repeat the command.`);
+            return fakeGatewayFinalText(`The command ran once. Read ${snapshotHandle} at byte 44800 to recover the clipped tail. Do not repeat the command.`);
           }
           switch (step++) {
             case 0:
@@ -6047,7 +6050,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               expect(body).toContain(replaySignature);
               expect(body).toContain(snapshotHandle);
               return fakeGatewayToolCall("retrieval-tail", "read_tool_result", {
-                request: { handle: snapshotHandle, start_byte: 65300, byte_count: 1024 },
+                request: { handle: snapshotHandle, start_byte: 44800, byte_count: 1024 },
               });
             case 5:
               expect(toolResultOutput(body, "retrieval-tail")).toContain(tail);

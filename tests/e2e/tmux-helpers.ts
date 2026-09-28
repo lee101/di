@@ -859,16 +859,13 @@ export class TmuxSession {
   // (the hint reappearing means the second press re-armed instead of firing).
   async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
     await this.sendKeys("Escape");
-    await this.waitForText("esc again to interrupt", hintTimeoutMs);
+    const interruptHint = /esc (?:again to interrupt|esc(?: (?:to )?interrupt)?)/;
+    await this.waitForPane(pane => interruptHint.test(pane), hintTimeoutMs);
     await sleep(150);
     await this.sendKeys("Escape");
     await sleep(250);
     const pane = await this.capturePane();
-    if (
-      pane.includes("esc again to interrupt") ||
-      pane.includes("esc esc interrupt") ||
-      pane.includes("esc esc to interrupt")
-    ) {
+    if (interruptHint.test(pane)) {
       await this.sendKeys("Escape");
     }
   }

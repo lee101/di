@@ -64,7 +64,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
   test(
-    "statusline hides the workspace identity by default",
+    "statusline shows the workspace identity by default",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-default-")));
       const home = join(root, "home");
@@ -92,8 +92,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
 
         const pane = await session.waitForComposer(10_000);
-        expect(pane).not.toContain("workspace-default-hidden");
-        expect(pane).not.toContain("default-hidden-branch");
+        expect(pane).toContain("workspace-default-hidden");
+        expect(pane).toContain("default-hidden-branch");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {

@@ -87,7 +87,7 @@ function captureViewportEscapes(session: TmuxSession): string {
 function runningBinaryTitle(workspace: string): string {
   const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
   expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
-  return `fx v${version} | ${basename(workspace)}`;
+  return `di v${version} | ${basename(workspace)}`;
 }
 
 async function waitForPaneTitle(
@@ -1774,7 +1774,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { sandbox: false, context: false, workspace: false },
+          statusLine: { sandbox: false, context: false, session: false, workspace: false },
         })}\n`,
       );
 
@@ -2897,11 +2897,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("BTab");
       await waitForModelsMenu(session, 4);
       await session.sendLiteralText("no-such-model");
-      await session.waitForText("No models found.", 5_000);
+      await session.waitForText("Use no-such-model", 5_000);
       await session.sendKeys("C-u");
       await waitForModelsMenu(session, 4);
       await session.sendLiteralText("gemini");
-      grid = await waitForModelsMenu(session, 1);
+      grid = await waitForModelsMenu(session, 2);
       pane = grid.join("\n");
       expect(composerContains(pane, "gemini")).toBe(true);
       expect(pane).toContain("google/gemini-3-pro");
@@ -3020,11 +3020,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      // Enter on a filtered row applies the model directly and still returns
-      // the draft instead of seeding the inline /model stages.
+      // An exact catalog ID applies the model and returns the draft. Nonempty
+      // queries also accept custom IDs, so use the full ID rather than a fragment.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
-      await session.sendLiteralText("plain");
+      await session.sendLiteralText(selectedModel);
       await session.waitForPane(
         (current) => current.includes(selectedModel) && !current.includes(currentModel),
         5_000,

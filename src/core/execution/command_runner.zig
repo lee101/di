@@ -4836,7 +4836,7 @@ test "cancel and timeout tie chooses cancellation" {
     }, std.testing.allocator, "sleep 5", "/tmp"));
 }
 
-test "runtime cancellation observed at the timeout deadline stays graceful" {
+test "runtime cancellation grace crosses the timeout deadline" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     for (0..10) |_| {
@@ -4867,7 +4867,8 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
                 flag.store(true, .seq_cst);
             }
         };
-        const request_at_ms = started_ms + @as(i64, @intCast(timeout_ms)) - 25;
+        // Leave scheduling margin while the 700 ms grace crosses the deadline.
+        const request_at_ms = started_ms + @as(i64, @intCast(timeout_ms)) - 400;
         const thread = try std.Thread.spawn(
             .{},
             CancelNearDeadline.run,
@@ -4876,12 +4877,13 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer thread.join();
         var result: ?CommandExecutionResult = null;
         var cancelled = false;
-        if (executeCommand(.{
+        // Login startup scripts are unrelated to this runtime timing check.
+        if (executeCommandInEnvironment(.{
             .max_command_output_bytes = 4096,
             .cancel_flag = &cancel,
             .timeout_ms = timeout_ms,
             .timeout_started_ms = started_ms,
-        }, alloc, command, workspace)) |value| {
+        }, alloc, command, workspace, .{ .clean = "/bin/bash" })) |value| {
             result = value;
             cancelled = value.cancelled;
         } else |err| switch (err) {
