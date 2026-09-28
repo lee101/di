@@ -68,6 +68,14 @@ catalog is cached under `~/.fx` so the menu opens instantly and refreshes in the
 background, and a typed id that is not listed still selects through the
 `Use <query>` row.
 
+Only language models are listed. OpenPaths serves embeddings, speech
+transcription and synthesis, music, image, video, and 3D models from the same
+catalog, and those answer a different endpoint, so a row for one is a
+selection that cannot work once it is made. Providers that publish a model
+type are taken at their word; for the rest the same pricing and id signals
+OpenPaths itself classifies on decide. A model you know is served but is not
+listed can still be typed directly through the `Use <query>` row.
+
 Sign in with one of:
 
 - `fx login`: Vercel AI Gateway

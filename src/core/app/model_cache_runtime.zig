@@ -2105,9 +2105,9 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.moveVisibleItems(-1, 2));
     try std.testing.expectEqual(@as(usize, 3), runtime.menu.selected_index);
     try std.testing.expectEqual(@as(usize, 2), runtime.menu.window_start);
-    const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
-    defer alloc.free(selected);
-    try std.testing.expectEqualStrings("standalone", selected);
+    const selected = (try runtime.menu.selectedItemAlloc(alloc)).?;
+    defer alloc.free(selected.id);
+    try std.testing.expectEqualStrings("standalone", selected.id);
 }
 
 test "model menu provider navigation skips absent and redundant filters" {
