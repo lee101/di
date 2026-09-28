@@ -1264,8 +1264,10 @@ for (const provider of ["gateway", "codex", "grok"] as const) {
       expect(scrollback.slice(scrollback.lastIndexOf(prompt) + prompt.length)).toContain("Saved credential storage is unavailable");
       expect(gateway.requests).toHaveLength(0);
       expect(oauth.requests).toHaveLength(0);
-      expect(chatgptOauth.requests).toHaveLength(0);
-      expect(grok.requests).toHaveLength(0);
+      // Other saved credentials may warm their catalogs; no OAuth or model
+      // POST may escape the pending prompt's storage failure.
+      expect(chatgptOauth.requests.filter(request => request.method !== "GET" || request.path !== "/chatgpt/models")).toHaveLength(0);
+      expect(grok.requests.filter(request => request.method !== "GET" || (request.path !== "/v1/models" && request.path !== "/v1/language-models"))).toHaveLength(0);
 
       unlinkSync(alias);
       await session.sendKeys("Enter");
@@ -1362,8 +1364,7 @@ for (const provider of ["codex", "grok"] as const) {
       await session.waitForText("What can di do differently?", TIMEOUT);
       release();
       await openProviderPicker(session);
-      await session.sendKeys("Down");
-      if (provider === "grok") await session.sendKeys("Down");
+      await session.sendLiteral(provider);
       await session.sendKeys("Enter");
       if (provider === "codex") await completeDisplayedCodexLogin(session, chatgptOauth);
       else await completeDisplayedGrokLogin(session, grok);
@@ -2203,7 +2204,7 @@ tmuxTest(
       (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
       TIMEOUT,
     );
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     const signInScreen = await session.waitForPane(
       (pane) =>
@@ -2311,7 +2312,9 @@ for (const [provider, previousProvider] of [
             (pane) => pane.includes("Models") && pane.includes(model) && pane.includes(otherModel),
             10_000,
           );
-          if (provider !== "gateway") expect(catalog).not.toContain(FAKE_GATEWAY_MODEL);
+          // The menu merges other saved credentials; routing remains the
+          // resumed provider's and is checked on the actual request below.
+          if (provider !== "gateway") expect(catalog).toContain("Merged:");
           const direct = provider === "codex" ? chatgptOauth : grok;
           const catalogPath = provider === "codex" ? "/chatgpt/models" : "/v1/models";
           const responsePath = provider === "codex" ? "/chatgpt/responses" : "/v1/responses";
@@ -2395,7 +2398,7 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
     await waitForTrace(tracePath, "prompt credential prewarm start outcome=started");
     await openProviderPicker(session);
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
 
@@ -2440,7 +2443,7 @@ tmuxTest(
     await session.sendText("/model openai/gpt-5.6-sol");
     await session.waitForText("Switched to openai/gpt-5.6-sol", TIMEOUT);
     await openProviderPicker(session);
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await session.waitForText("Sign in with Codex", TIMEOUT);
     await completeDisplayedCodexLogin(session, chatgptOauth);
@@ -2506,11 +2509,13 @@ tmuxTest(
         pane.includes("Models") &&
         pane.includes("gpt-5.6-sol") &&
         pane.includes("gpt-5.4-mini") &&
-        !pane.includes("openai/gpt-5.6-sol"),
+        pane.includes("openai/gpt-5.6-sol"),
       TIMEOUT,
     );
     expect(codexCatalog).toContain("[All]");
-    for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
+    expect(codexCatalog).toContain("Merged:");
+    expect(codexCatalog).toContain("OpenAI");
+    for (const vendor of ["Anthropic", "xAI", "Z.AI"]) {
       expect(codexCatalog).not.toContain(vendor);
     }
     await session.sendKeys("Escape");
@@ -2550,7 +2555,7 @@ tmuxTest(
     expect(savedGateway.models.gateway).toBe(gatewayModelBefore);
     expect(savedGateway.models.codex).toBe("gpt-5.6-sol");
     await openProviderPicker(session);
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await session.waitForText("Switched to Codex subscription", TIMEOUT);
     const restoredCodex = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -2570,7 +2575,7 @@ tmuxTest(
       { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, supported_reasoning_levels: [{ effort: "medium" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
     ]);
     await openProviderPicker(session);
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await session.waitForText("Sign in with Codex", TIMEOUT);
     await completeDisplayedCodexLogin(session, chatgptOauth);
@@ -2611,7 +2616,7 @@ tmuxTest(
       (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
       TIMEOUT,
     );
-    await session.sendKeys("Down");
+    await session.sendLiteral("codex");
     await session.sendKeys("Enter");
     await completeDisplayedCodexLogin(session, chatgptOauth);
     await session.waitForText("Switched to Codex subscription with gpt-5.6-sol.", TIMEOUT);
@@ -3170,6 +3175,17 @@ async function enterSwitchCredential(pickerSession: TmuxSession): Promise<void> 
   );
 }
 
+async function settleModelCatalog(pickerSession: TmuxSession): Promise<void> {
+  await pickerSession.sendText("/model");
+  await pickerSession.waitForPane(pane => pane.includes("Models ") &&
+    (pane.includes("catalog: authenticated") || pane.includes("catalog is authenticated")) &&
+    pane.includes("esc close"), TIMEOUT);
+  await pickerSession.sendKeys("Escape");
+  // The composer also exists inside the menu; observe menu closure before
+  // typing the next slash command.
+  await pickerSession.waitForPane(pane => !pane.includes("tab provider") && pane.includes("┃"), TIMEOUT);
+}
+
 async function openProviderPicker(pickerSession: TmuxSession): Promise<void> {
   await pickerSession.sendText("/provider");
   await pickerSession.waitForPane(
@@ -3711,7 +3727,7 @@ tmuxTest(
 );
 
 tmuxTest(
-  "model catalog warmup follows auth source changes exactly once",
+  "model catalog warmup loads each selected and merged credential once",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-catalog-lifecycle-"));
     stderrPath = join(home, "stderr.log");
@@ -3722,21 +3738,23 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
     await session.waitForComposer(TIMEOUT);
-    await waitForModelRequestCount(gateway, 1);
-    expect(gateway.modelRequests).toHaveLength(1);
-    expect(gateway.modelRequests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
-
-    await selectFxLoginCredential(session);
     await waitForModelRequestCount(gateway, 2);
     expect(gateway.modelRequests).toHaveLength(2);
     expect(gateway.modelRequests[1].headers.get("authorization")).toBeNull();
-    expect(gateway.modelRequests[1].headers.get("x-vercel-ai-gateway-team")).toBeNull();
+    expect(gateway.modelRequests[0].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+
+    await selectFxLoginCredential(session);
+    await waitForModelRequestCount(gateway, 4);
+    expect(gateway.modelRequests).toHaveLength(4);
+    expect(gateway.modelRequests[2].headers.get("authorization")).toBeNull();
+    expect(gateway.modelRequests[2].headers.get("x-vercel-ai-gateway-team")).toBeNull();
+    expect(gateway.modelRequests[3].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
 
     await session.sendText("/logout");
     await session.waitForText("Signed out of di.", TIMEOUT);
-    await waitForModelRequestCount(gateway, 3);
-    expect(gateway.modelRequests).toHaveLength(3);
-    expect(gateway.modelRequests[2].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
+    await waitForModelRequestCount(gateway, 5);
+    expect(gateway.modelRequests).toHaveLength(5);
+    expect(gateway.modelRequests[4].headers.get("authorization")).toBe(`Bearer ${ENV_TOKEN}`);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -4405,8 +4423,7 @@ tmuxTest(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
         TIMEOUT,
       );
-      await session.sendKeys("Down");
-      await session.sendKeys("Down");
+      await session.sendLiteral("grok");
       await session.sendKeys("Enter");
       const collapsed = await session.waitForPane(
         (pane) =>
@@ -4428,8 +4445,7 @@ tmuxTest(
       await selectEnvKeyCredential(session);
       await session.waitForText("Switched to Vercel AI Gateway", TIMEOUT);
       await openProviderPicker(session);
-      await session.sendKeys("Down");
-      await session.sendKeys("Down");
+      await session.sendLiteral("grok");
       await session.sendKeys("Enter");
       await session.waitForText("Switched to Grok subscription with grok-4.20.", TIMEOUT);
       await session.sendText("/model");
@@ -4438,7 +4454,9 @@ tmuxTest(
         TIMEOUT,
       );
       expect(grokCatalog).toContain("[All]");
-      for (const vendor of ["Anthropic", "OpenAI", "xAI", "Z.AI", "Others"]) {
+      expect(grokCatalog).toContain("Merged:");
+      expect(grokCatalog).toContain("OpenAI");
+      for (const vendor of ["Anthropic", "xAI", "Z.AI"]) {
         expect(grokCatalog).not.toContain(vendor);
       }
       await session.sendKeys("Escape");
@@ -4487,8 +4505,7 @@ tmuxTest(
         (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
         TIMEOUT,
       );
-      await session.sendKeys("Down");
-      await session.sendKeys("Down");
+      await session.sendLiteral("grok");
       await session.sendKeys("Enter");
       await session.waitForText("Browser didn't return? press tab to enter a code", TIMEOUT);
       await session.pasteText("grok-code");
@@ -6450,7 +6467,7 @@ tmuxTest(
 
     await session.sendText("/logout");
     const failed = await session.waitForText(
-      "Could not confirm durable fx logout. The active source was recalculated.",
+      "Could not confirm durable di logout. The active source was recalculated.",
       TIMEOUT,
     );
     expect(failed).not.toContain("Signed out of di.");
@@ -7228,13 +7245,15 @@ tmuxTest(
       TIMEOUT,
     );
     expect(failedPane).not.toContain("private/blue-hornbill");
-    expect(gateway.modelRequests).toHaveLength(2);
+    expect(gateway.modelRequests).toHaveLength(3);
+    expect(gateway.modelRequests[2].headers.get("authorization")).toBeNull();
+    expect(new URL(gateway.modelRequests[2].url).searchParams.get("teamId")).toBeNull();
 
     const trace = readFileSync(tracePath, "utf8");
     const catalogEvents = trace.split("\n").filter((line) =>
       line.includes("[catalog] event=model_catalog_load ")
     );
-    expect(catalogEvents).toHaveLength(2);
+    expect(catalogEvents).toHaveLength(3);
     expect(catalogEvents[0]).toContain(
       "requested_access=authenticated credential_source=fx_login effective_access=authenticated",
     );
@@ -7821,10 +7840,13 @@ for (const provider of ["codex", "grok"] as const) {
       stderrPath = join(home, "stderr.log");
       writeFileSync(stderrPath, "");
       gateway = startFakeGateway([fakeGatewayFinalText("PREPARATION_GATEWAY_RECOVERY")]);
+      let preparing = false;
+
       let entered = 0;
       let release!: () => void;
       const held = new Promise<void>((resolve) => { release = resolve; });
       const modelsResponse = async () => {
+        if (!preparing) return;
         entered++;
         if (entered !== 1) return;
         await held;
@@ -7841,6 +7863,8 @@ for (const provider of ["codex", "grok"] as const) {
           ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,prompt,input,provider",
         });
         await session.waitForComposer(TIMEOUT);
+        await settleModelCatalog(session);
+        preparing = true;
         await openProviderPicker(session);
         await session.sendLiteral(provider);
         await session.sendKeys("Enter");
@@ -7908,14 +7932,18 @@ tmuxTest("provider preparation does not delay double Ctrl+C shutdown", async () 
   stderrPath = join(home, "stderr.log");
   writeFileSync(stderrPath, "");
   gateway = startFakeGateway([]);
+  let preparing = false;
+
   let entered = false;
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
-  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => { entered = true; await held; } });
+  chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => { if (preparing) { entered = true; await held; } } });
   try {
     writeSeededChatGptLogin(home, chatgptOauth.accessToken);
     session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, FX_SOUND: "0" });
     await session.waitForComposer(TIMEOUT);
+    await settleModelCatalog(session);
+    preparing = true;
     await openProviderPicker(session);
     await session.sendLiteral("codex");
     await session.sendKeys("Enter");
@@ -7935,12 +7963,14 @@ for (const outcome of ["cancel", "failure"] as const) {
     home = mkdtempSync(join(tmpdir(), "fx-team-preparation-"));
     stderrPath = join(home, "stderr.log");
     writeFileSync(stderrPath, "");
+    let preparing = false;
+
     let entered = 0;
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     gateway = startFakeGateway([fakeGatewayFinalText("TEAM_PREPARATION_OK")], { models: async () => {
-      entered++;
-      if (entered === 1) {
+      if (preparing) entered++;
+      if (preparing && entered === 1) {
         await held;
         if (outcome === "failure") return new Response("unavailable", { status: 503 });
       }
@@ -7959,6 +7989,8 @@ for (const outcome of ["cancel", "failure"] as const) {
     try {
       session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0" });
       await session.waitForComposer(TIMEOUT);
+      await settleModelCatalog(session);
+      preparing = true;
       const chooseTeam = async () => {
         await session!.sendKeys("C-u");
         await openProviderPicker(session!);
@@ -8006,12 +8038,13 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
   home = mkdtempSync(join(tmpdir(), "fx-logout-preparation-cancel-"));
   stderrPath = join(home, "stderr.log");
   writeFileSync(stderrPath, "");
+  let preparing = false;
+
   let entered = false;
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   gateway = startFakeGateway([], { models: async () => {
-    entered = true;
-    await held;
+    if (preparing) { entered = true; await held; }
     return new Response("unavailable", { status: 503 });
   } });
   chatgptOauth = startFakeChatGptOAuth();
@@ -8022,13 +8055,16 @@ tmuxTest("provider preparation cancellation stops logout fallback", async () => 
     writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ provider: "codex", models: { codex: "gpt-5.6-sol" } }));
     session = await startFx(home, stderrPath, gateway, undefined, undefined, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0" });
     await session.waitForComposer(TIMEOUT);
+    await settleModelCatalog(session);
+    preparing = true;
+    const catalogRequestsBeforeLogout = grok.requests.filter(request => request.path === "/v1/models").length;
     await session.sendText("/logout");
     await session.waitForPane(() => entered, 5000);
     await session.sendKeys("C-c");
     await session.waitForText("Provider preparation cancelled.", 1500);
     release();
     await Bun.sleep(100);
-    expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(0);
+    expect(grok.requests.filter((request) => request.path === "/v1/models")).toHaveLength(catalogRequestsBeforeLogout);
     expect(existsSync(join(home, ".fx", "chatgpt-auth.json"))).toBe(false);
     expect(existsSync(join(home, ".fx", "grok-auth.json"))).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -8042,12 +8078,13 @@ tmuxTest("provider recovery continues after a held prompt and failed catalog", a
   home = mkdtempSync(join(tmpdir(), "fx-provider-fallback-prompt-"));
   stderrPath = join(home, "stderr.log");
   writeFileSync(stderrPath, "");
+  let preparing = false;
+
   let entered = false;
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   gateway = startFakeGateway([], { models: async () => {
-    entered = true;
-    await held;
+    if (preparing) { entered = true; await held; }
     return new Response("unavailable", { status: 503 });
   } });
   chatgptOauth = startFakeChatGptOAuth();
@@ -8059,6 +8096,8 @@ tmuxTest("provider recovery continues after a held prompt and failed catalog", a
     const trace = join(home, "trace.log");
     session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
     await session.waitForComposer(TIMEOUT);
+    await settleModelCatalog(session);
+    preparing = true;
     await session.sendText("/logout");
     await session.waitForPane(() => entered, 5000);
     await session.sendText("Use the remaining subscription after recovery.");
@@ -8077,11 +8116,14 @@ tmuxTest("provider preparation resumes a held prompt after explicit provider ret
   home = mkdtempSync(join(tmpdir(), "fx-preparation-explicit-retry-"));
   stderrPath = join(home, "stderr.log");
   writeFileSync(stderrPath, "");
+  let preparing = false;
+
   let entered = 0;
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   gateway = startFakeGateway([]);
   chatgptOauth = startFakeChatGptOAuth({ modelsResponse: async () => {
+    if (!preparing) return;
     entered++;
     if (entered === 1) {
       await held;
@@ -8093,6 +8135,8 @@ tmuxTest("provider preparation resumes a held prompt after explicit provider ret
     const trace = join(home, "trace.log");
     session = await startFx(home, stderrPath, gateway, undefined, trace, { ...chatgptOauth.env, FX_MODEL: undefined, FX_SOUND: "0", FX_TRACE_SCOPES: "auth,provider,input,prompt" });
     await session.waitForComposer(TIMEOUT);
+    await settleModelCatalog(session);
+    preparing = true;
     await openProviderPicker(session);
     await session.sendLiteral("codex");
     await session.sendKeys("Enter");

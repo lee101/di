@@ -524,7 +524,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await waitForCondition(() => held.started, "held response start");
       await session.waitForText(VISIBLE_PARTIAL_CHUNKS.at(-1)!.trim(), TIMEOUT);
       await session.sendKeys("Escape");
-      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await session.waitForInterruptHint(TIMEOUT);
       await Bun.sleep(150);
       expect(held.cancelled).toBe(false);
       await session.sendKeys("Escape");
@@ -727,7 +727,7 @@ while :; do sleep 1; done
 
       const command = `/workspace add ${sharedRoot}`;
       await session.sendKeys("Escape");
-      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await session.waitForInterruptHint(TIMEOUT);
       await Bun.sleep(150);
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");
@@ -839,7 +839,7 @@ while :; do sleep 1; done
       );
 
       await session.sendKeys("Escape");
-      await session.waitForText("esc again to interrupt", TIMEOUT);
+      await session.waitForInterruptHint(TIMEOUT);
       await Bun.sleep(150);
       const cancelStartedAt = Date.now();
       await session.sendKeys("Escape");

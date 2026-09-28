@@ -857,10 +857,14 @@ export class TmuxSession {
   // confirming press within the one-second window cancels. The confirm press
   // is retried once when a runner stall let the arm expire between presses
   // (the hint reappearing means the second press re-armed instead of firing).
+  async waitForInterruptHint(timeoutMs = 15_000): Promise<string> {
+    return this.waitForPane(pane => /esc (?:again to interrupt|esc(?: (?:to )?interrupt)?)/.test(pane), timeoutMs);
+  }
+
   async sendInterruptEscapePair(hintTimeoutMs = 15_000): Promise<void> {
     await this.sendKeys("Escape");
     const interruptHint = /esc (?:again to interrupt|esc(?: (?:to )?interrupt)?)/;
-    await this.waitForPane(pane => interruptHint.test(pane), hintTimeoutMs);
+    await this.waitForInterruptHint(hintTimeoutMs);
     await sleep(150);
     await this.sendKeys("Escape");
     await sleep(250);

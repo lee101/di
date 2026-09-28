@@ -1825,7 +1825,9 @@ describe("effect-aware command permissions", () => {
       const clipboardPath = join(root.root, "trace-clipboard-path.txt");
       installClipboardFixture(
         root,
-        '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_TRACE_CLIPBOARD_OUTPUT"\n',
+        process.platform === "darwin"
+          ? '#!/bin/sh\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$FX_TRACE_CLIPBOARD_OUTPUT"\n'
+          : '#!/bin/sh\n/bin/cat > "$FX_TRACE_CLIPBOARD_OUTPUT"\n',
       );
       writeFileSync(stderrPath, "");
 
@@ -1852,9 +1854,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForStableComposer(TIMEOUT);
       await activeSession.sendText("/trace");
       await activeSession.waitForText(
-        process.platform === "darwin"
-          ? "Trace copied to clipboard"
-          : "Trace saved at",
+        "Trace copied to clipboard",
         TIMEOUT,
       );
 
@@ -1879,11 +1879,7 @@ describe("effect-aware command permissions", () => {
       expect(rendererEvents).not.toContain("[truncated]");
       expect(existsSync(join(root.home, ".fx", "logs", "trace.log"))).toBe(false);
       expect(statSync(reportPath).mode & 0o077).toBe(0);
-      if (process.platform === "darwin") {
-        expect(readFileSync(clipboardPath, "utf8")).toBe(reportPath);
-      } else {
-        expect(existsSync(clipboardPath)).toBe(false);
-      }
+      expect(readFileSync(clipboardPath, "utf8")).toBe(process.platform === "darwin" ? reportPath : report);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

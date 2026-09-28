@@ -5908,7 +5908,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(compact).not.toContain("Managed subagent");
         await session.resizeWindow(45, 30);
         await session.waitForText(finalText, TIMEOUT);
-        const narrow = await session.capturePane();
+        const narrow = await session.captureFullScrollback();
         expect(narrow).toContain("reviewer replied · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
