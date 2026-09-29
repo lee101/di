@@ -25,12 +25,17 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
   mkdirSync(workspace);
   mkdirSync(join(home, ".fx"), { mode: 0o700 });
   const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
+  const catalogRequests: typeof requests = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       const path = new URL(request.url).pathname;
       const body = request.method === "POST" ? await request.json() : null;
-      requests.push({ path, authorization: request.headers.get("authorization"), body });
+      const observed = { path, authorization: request.headers.get("authorization"), body };
+      // Independent provider discovery can run during TUI warmup. Keep model
+      // request assertions exact, including POSTs to unexpected endpoints.
+      if (request.method === "GET" && path.endsWith("/models")) catalogRequests.push(observed);
+      else requests.push(observed);
       if (path !== "/v1/chat/completions") return new Response("unexpected endpoint", { status: 500 });
       return respond ? respond(body) : completion((body as any).model);
     },
@@ -53,5 +58,5 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
     FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}/unexpected-gateway`,
     FX_TEST_PROVIDER_TOKEN: "own-provider-token", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", NO_COLOR: "1",
   };
-  return { home, workspace, requests, env, settings, settingsPath, save, close() { server.stop(true); cleanupIsolatedTestHome(home); } };
+  return { home, workspace, requests, catalogRequests, env, settings, settingsPath, save, close() { server.stop(true); cleanupIsolatedTestHome(home); } };
 }

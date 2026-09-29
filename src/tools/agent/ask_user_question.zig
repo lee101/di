@@ -12,6 +12,7 @@ const legacy_permission_request_sentinel =
 
 pub const cancel_sentinel = "(user cancelled the question)";
 pub const not_available_sentinel = "(ask_user_question is only available in the interactive shell; ask the user freeform instead)";
+pub const auto_answer_sentinel = "(ask_user_question: auto answer mode is active and no question screen opened; answer this question yourself now, choose the most conservative option that still completes the task, state the assumption and its basis in one line, then continue without asking)";
 
 const invalid_args_sentinel = "(ask_user_question: invalid arguments; provide {questions})";
 
@@ -92,6 +93,9 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const request = ctx.ask_question_batch orelse {
         return .{ .success = try ctx.allocator.dupe(u8, not_available_sentinel) };
     };
+    if (ctx.permission_mode != .ask) {
+        return .{ .success = try ctx.allocator.dupe(u8, auto_answer_sentinel) };
+    }
     const input = erased.as(Input);
     const output = executeWithRequester(ctx.allocator, input.args_json, .{
         .ctx = ctx.ask_question_ctx,
@@ -428,4 +432,62 @@ test "ask_user_question noninteractive returns sentinel before parsing" {
         .success => |body| try std.testing.expectEqualStrings(not_available_sentinel, body),
         .failure => return error.TestExpectedEqual,
     }
+}
+
+test "ask_user_question auto answers outside ask mode without opening a question" {
+    const alloc = std.testing.allocator;
+    const args_json = "{\"questions\":[{\"question\":\"Ship it?\",\"options\":[{\"label\":\"Yes\"},{\"label\":\"No\"}]}]}";
+    for ([_]core_types.PermissionMode{ .auto, .yolo }) |mode| {
+        var fake = FakeRequester{};
+        const decoded = try decode(.{ .allocator = alloc }, args_json);
+        const input = switch (decoded) {
+            .failure => return error.TestExpectedEqual,
+            .input => |owned| owned,
+        };
+        defer input.deinit(alloc);
+
+        const result = try call(.{
+            .allocator = alloc,
+            .permission_mode = mode,
+            .ask_question_ctx = &fake,
+            .ask_question_batch = FakeRequester.request,
+        }, input);
+        defer result.deinit(alloc);
+
+        switch (result) {
+            .rich => return error.TestUnexpectedRichResult,
+            .success => |body| try std.testing.expectEqualStrings(auto_answer_sentinel, body),
+            .failure => return error.TestExpectedEqual,
+        }
+        try std.testing.expect(!fake.saw_trimmed);
+    }
+}
+
+test "ask_user_question still asks the user in ask mode" {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const decoded = try decode(.{ .allocator = alloc }, "{\"questions\":[{\"question\":\" Choose? \",\"options\":[{\"label\":\" Yes \",\"description\":\" Go ahead \"},{\"label\":\"No\",\"description\":3}]}]}");
+    const input = switch (decoded) {
+        .failure => return error.TestExpectedEqual,
+        .input => |owned| owned,
+    };
+    defer input.deinit(alloc);
+
+    const result = try call(.{
+        .allocator = alloc,
+        .permission_mode = .ask,
+        .ask_question_ctx = &fake,
+        .ask_question_batch = FakeRequester.request,
+    }, input);
+    defer result.deinit(alloc);
+
+    switch (result) {
+        .rich => return error.TestUnexpectedRichResult,
+        .success => |body| try std.testing.expectEqualStrings(
+            "[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]",
+            body,
+        ),
+        .failure => return error.TestExpectedEqual,
+    }
+    try std.testing.expect(fake.saw_trimmed);
 }

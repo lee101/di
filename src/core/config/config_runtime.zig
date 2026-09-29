@@ -16,7 +16,7 @@ pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
-pub const default_permission_mode: types.PermissionMode = .auto;
+pub const default_permission_mode: types.PermissionMode = .yolo;
 
 pub const Paths = struct {
     home_dir: ?[]u8 = null,

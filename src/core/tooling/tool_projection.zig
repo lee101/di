@@ -560,6 +560,10 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    // Only the ask permission mode opens a real question screen. Every other
+    // mode auto answers, so advertising the tool would promise an interaction
+    // the turn cannot have.
+    if (std.mem.eql(u8, tool.name, "ask_user_question") and options.permission_mode != .ask) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
         if (permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return;
@@ -783,4 +787,20 @@ test "subagent and shell selection follow host capability" {
     try expectContainsName(available.advertised_names, "subagent");
     try expectNotContainsName(available.advertised_names, "task");
     try expectContainsName(available.advertised_names, "shell");
+}
+
+test "question tool is advertised only in ask mode" {
+    for ([_]types.PermissionMode{ .ask, .auto, .yolo }) |mode| {
+        var projection = try buildTestModelToolProjection(std.testing.allocator, .{
+            .permission_mode = mode,
+        });
+        defer projection.deinit(std.testing.allocator);
+        try std.testing.expectEqual(
+            mode == .ask,
+            containsName(projection.advertised_names, "ask_user_question"),
+        );
+        // Every other built-in stays advertised so the gate is question-scoped.
+        try expectContainsName(projection.advertised_names, "shell");
+        try expectContainsName(projection.advertised_names, "read_file");
+    }
 }

@@ -13,8 +13,9 @@
 ### New Features
 
 - **Semantic code discovery:** `fuzzy_search` queries an existing local zbed index with bounded results. Exact search through `grep_files` or `rg` and grounded web research through `gemini_search` remain available.
-- **Default model:** fx now uses Grok 4.7 as its default model. Fast mode remains opt-in.
-- **OpenRouter default:** With only `OPENROUTER_API_KEY` set, fx now starts on Space Bunny Alpha without a setup command. An OpenPaths key keeps MiMo 2.6 Pro, and both stealth routes fail over to it.
+- **Full access by default:** fx now starts in full access. Tool lookup, argument validation, cancellation, limits, operating-system permissions, and remote authentication stay authoritative, and no approval screen or automatic safety review gates an action. Press `BTab` or set `permission_mode` to `auto` or `ask` when you want the bounded safety review or approval-before-change behavior back.
+- **Auto answer:** Questions no longer interrupt. Outside `ask` mode the question tool is not advertised and no question screen opens, so the agent answers its own question with the most conservative option that still completes the task, states the assumption, and continues. `ask` mode still opens the real screen.
+- **Default model:** fx now starts on Space Bunny Alpha on either route, so an OpenPaths key no longer switches the default away from it. Both stealth routes still fail over to MiMo 2.6 Pro.
 - **Task planning:** The agent now has a `todo` tool that keeps a phased task list for the session and reports the active phase and open work after every change.
 - **Custom connections:** fx now supports named OpenAI Chat Completions connections for local servers and other gateways. Configure them in `~/.fx/settings.json`, then select one with `fx provider <name>` or `FX_PROVIDER`.
 - **Provider routing:** Gateway users can set `provider_order` and `provider_strict`, or pass `--provider-order` and `--provider-strict`, to prefer or restrict which providers serve a model.
@@ -49,6 +50,8 @@
 - **Codex models:** The permission reviewer and session titles follow the subscription's own catalog, preferring the newest `gpt-6-luna` / `gpt-5.6-luna` a plan serves. A catalog that stops carrying a pinned model no longer disables the Codex model list.
 
 ### Bug Fixes
+
+- **Resumed model settings:** Reopening a session preserves reasoning and Fast options by keeping an unchanged model-catalog fetch alive.
 
 - **Multiple images:** Reading multiple images in one turn no longer crashes fx, and images returned by tools now reach vision models through Gateway.
 - **Image accounting:** Tool images no longer count as text during request estimation. Automatic compaction now uses the real image cost.

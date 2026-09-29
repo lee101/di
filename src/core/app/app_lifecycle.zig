@@ -1580,11 +1580,11 @@ test "permission mode parser accepts known modes" {
     try std.testing.expect(config_runtime.parsePermissionMode("weird") == null);
 }
 
-test "permission mode loader defaults to auto" {
+test "permission mode loader defaults to full access" {
     var env = try TestEnv.install(std.testing.allocator, &.{});
     defer env.deinit();
 
-    try std.testing.expectEqual(PermissionMode.auto, loadPermissionMode(null));
+    try std.testing.expectEqual(PermissionMode.yolo, loadPermissionMode(null));
     try std.testing.expectEqual(PermissionMode.ask, loadPermissionMode(.ask));
 }
 

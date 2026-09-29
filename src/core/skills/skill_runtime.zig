@@ -443,34 +443,60 @@ fn collectRootFingerprints(
             root.path,
             .{ .follow_symlinks = false },
         ) catch |err| {
-            if (err == error.FileNotFound or err == error.NotDir) {
-                fingerprints[filled] = .{ .path = path, .exists = false };
-                continue;
-            }
-            return err;
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            fingerprints[filled] = if (err == error.FileNotFound or err == error.NotDir)
+                .{ .path = path, .exists = false }
+            else
+                .{ .path = path, .exists = false, .unreadable = true };
+            continue;
         };
-        const candidate_digest = if (stat.kind == .directory)
+        const candidates = if (stat.kind == .directory)
             try candidateDirectoryDigest(alloc, root)
         else
-            [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+            CandidateDirectoryDigest{
+                .value = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+            };
         fingerprints[filled] = .{
             .path = path,
             .exists = true,
+            .unreadable = candidates.unreadable,
             .inode = stat.inode,
             .mtime = stat.mtime,
-            .candidate_digest = candidate_digest,
+            .candidate_digest = candidates.value,
         };
     }
     return fingerprints;
 }
 
+const unavailable_candidate_digest =
+    [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+
+const CandidateDirectoryDigest = struct {
+    value: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// The root could not be opened or listed. A root in this state still
+    /// fingerprints, but never as equal to a readable one, so the next refresh
+    /// reruns discovery and reports the root as a discovery diagnostic.
+    unreadable: bool = false,
+};
+
+/// Digests a root's candidate directories so a refresh can detect added,
+/// removed, or rewritten skills without rescanning the catalog. Per-candidate
+/// failures fold into the digest as `unavailable`; a root-level failure is
+/// reported through `unreadable` rather than raised, because the discovery
+/// pass that follows already converts an unreadable root into a diagnostic.
 fn candidateDirectoryDigest(
     alloc: Allocator,
     root: SkillRoot,
-) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
-    var dir = try openSkillRoot(alloc, root, .{ .iterate = true });
+) error{OutOfMemory}!CandidateDirectoryDigest {
+    var dir = openSkillRoot(alloc, root, .{ .iterate = true }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .value = unavailable_candidate_digest, .unreadable = true };
+    };
     defer dir.close(io_mod.getIo());
-    var entries = try collectSkillEntries(alloc, &dir, root.read_authority != null);
+    var entries = collectSkillEntries(alloc, &dir, root.read_authority != null) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .value = unavailable_candidate_digest, .unreadable = true };
+    };
     defer freeSkillEntries(alloc, &entries);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -505,7 +531,7 @@ fn candidateDirectoryDigest(
         hash.update(std.mem.asBytes(&stat.inode));
         hash.update(std.mem.asBytes(&stat.mtime.nanoseconds));
     }
-    return hash.finalResult();
+    return .{ .value = hash.finalResult() };
 }
 
 fn appendWorkspaceRoots(
@@ -1495,6 +1521,11 @@ pub const SkillMenu = struct {
 const RootFingerprint = struct {
     path: []u8,
     exists: bool,
+    /// A stat or directory read failed for this root. Distinct from `exists:
+    /// false`, which means the root is simply missing: an unreadable root must
+    /// never fingerprint-equal a missing one, or the fast path would report a
+    /// catalog that discovery could not read as unchanged.
+    unreadable: bool = false,
     inode: std.Io.File.INode = 0,
     mtime: std.Io.Timestamp = .zero,
     candidate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
@@ -2068,6 +2099,7 @@ fn rootFingerprintsEqual(
     for (left, right) |a, b| {
         if (!std.mem.eql(u8, a.path, b.path) or
             a.exists != b.exists or
+            a.unreadable != b.unreadable or
             a.inode != b.inode or
             !std.meta.eql(a.mtime, b.mtime) or
             !std.mem.eql(u8, &a.candidate_digest, &b.candidate_digest)) return false;
@@ -5884,4 +5916,109 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
     try std.testing.expectEqualStrings(logical_path, discovery.diagnostics[0].path);
     try std.testing.expectEqual(SkillDiagnosticScope.candidate, discovery.diagnostics[0].scope);
     try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+}
+
+/// A root path past the kernel's path limit, so stat and open fail with
+/// NameTooLong instead of the FileNotFound that discovery already tolerates.
+fn writeOverlongRootName(alloc: std.mem.Allocator) ![]u8 {
+    const name = try alloc.alloc(u8, std.fs.max_path_bytes * 2);
+    @memset(name, 'r');
+    return name;
+}
+
+test "an unstattable skill root is fingerprinted unreadable instead of failing the scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const overlong = try writeOverlongRootName(alloc);
+    defer alloc.free(overlong);
+
+    const policy: skill_contract.RootPolicy = .{
+        .managed_root_source = .global_fx,
+        .global_roots = &.{.{
+            .source = .global_fx,
+            .path = overlong,
+        }},
+    };
+    const fingerprints = try collectRootFingerprints(alloc, home, home, "", policy);
+    defer freeRootFingerprints(alloc, fingerprints);
+
+    var unreadable_count: usize = 0;
+    var missing_count: usize = 0;
+    for (fingerprints) |fingerprint| {
+        if (fingerprint.unreadable) unreadable_count += 1;
+        if (!fingerprint.exists and !fingerprint.unreadable) missing_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), unreadable_count);
+    try std.testing.expect(missing_count >= 1);
+}
+
+test "an unreadable root never fingerprints equal to a missing one" {
+    const missing = [_]RootFingerprint{.{ .path = @constCast("/skills/root"), .exists = false }};
+    const unreadable = [_]RootFingerprint{.{
+        .path = @constCast("/skills/root"),
+        .exists = false,
+        .unreadable = true,
+    }};
+
+    try std.testing.expect(!rootFingerprintsEqual(&missing, &unreadable));
+    try std.testing.expect(rootFingerprintsEqual(&missing, &missing));
+    try std.testing.expect(rootFingerprintsEqual(&unreadable, &unreadable));
+}
+
+test "a refresh over an unreadable skill root adopts a diagnostic catalog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/readable/SKILL.md",
+        "---\nname: readable\ndescription: root that stays readable\n---\nbody\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const overlong = try writeOverlongRootName(alloc);
+    defer alloc.free(overlong);
+
+    const managed = try std.fs.path.join(alloc, &.{ home, ".fx", "skills" });
+    defer alloc.free(managed);
+    const policy: skill_contract.RootPolicy = .{
+        .managed_root_source = .global_fx,
+        .global_roots = &.{ .{ .source = .global_fx, .path = managed }, .{
+            .source = .global_fx,
+            .path = overlong,
+        } },
+    };
+    var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
+    defer runtime.deinit(alloc);
+
+    _ = try runtime.requestRefresh(alloc, home, home, policy);
+    var terminal: RefreshCompletion = .none;
+    for (0..100_000) |_| {
+        terminal = try runtime.pollRefresh(alloc, home, policy);
+        if (terminal != .none) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+
+    // An unreadable root degrades to a discovery diagnostic; the refresh itself
+    // still publishes a generation so prompt submission never stalls on it.
+    try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("readable", runtime.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), runtime.diagnostics.len);
+    try std.testing.expectEqual(SkillDiagnosticCause.unreadable, runtime.diagnostics[0].cause);
+
+    // A second pass over the same unreadable root is a no-op, not a rescan.
+    const generation = try runtime.requestRefresh(alloc, home, home, policy);
+    terminal = .none;
+    for (0..100_000) |_| {
+        terminal = try runtime.pollRefresh(alloc, home, policy);
+        if (terminal != .none) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expectEqual(RefreshCompletion.unchanged, terminal);
+    try std.testing.expectEqual(Runtime.GenerationStatus.current, runtime.generationStatus(generation));
 }

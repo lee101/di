@@ -478,7 +478,7 @@ test(
       );
       expect(rejected.code).toBe(1);
       expect(rejected.stderr).toBe(
-        "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
+        "di ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
       );
       const rejectedJson = JSON.parse(rejected.stdout);
       expect(rejectedJson).toMatchObject({

@@ -1050,7 +1050,7 @@ describe("cli: status", () => {
         });
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
-        expect(json.permission_mode).toBe("auto");
+        expect(json.permission_mode).toBe("yolo");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

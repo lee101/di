@@ -224,7 +224,9 @@ The script builds a Debug binary with symbols, reports the memcheck error
 summary per command, and exits nonzero on definite leaks or invalid accesses.
 `zig build test -Dtest-filter=NAME` runs a subset of tests without valgrind.
 
-di starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to di's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
+di starts in full-access permission mode. Tool lookup, argument validation, cancellation, limits, operating-system permissions, and remote authentication stay authoritative, and no approval screen or automatic safety review gates an action. Switch to `auto` for the bounded safety review of unresolved sensitive actions, or to `ask` to require approval before changes. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for the other modes and persistent rules.
+
+Questions follow the same dial. The question tool is advertised only in `ask` mode, where it opens the real question screen. In `auto` and full access no question screen opens and the tool is not advertised: the agent answers its own question with the most conservative option that still completes the task, states the assumption and its basis, and keeps going instead of stopping the turn.
 
 Inside the shell, run `/help` to browse interactive commands.
 

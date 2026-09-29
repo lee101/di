@@ -87,7 +87,7 @@ function captureViewportEscapes(session: TmuxSession): string {
 function runningBinaryTitle(workspace: string): string {
   const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
   expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
-  return `fx v${version} | ${basename(workspace)}`;
+  return `di v${version} | ${basename(workspace)}`;
 }
 
 async function waitForPaneTitle(
@@ -1774,7 +1774,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       writeFileSync(
         settingsPath,
         `${JSON.stringify({
-          statusLine: { sandbox: false, context: false, workspace: false },
+          statusLine: { sandbox: false, context: false, session: false, workspace: false },
         })}\n`,
       );
 

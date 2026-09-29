@@ -373,9 +373,10 @@ pub fn SubmitRuntime(comptime App: type) type {
             }
 
             if (comptime @hasDecl(App, "collectPendingSkillRefresh")) {
-                const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| {
-                    finishPendingSubmissionFailure(app, err);
-                    return;
+                const readiness = App.collectPendingSkillRefresh(app, pending) catch |err| blk: {
+                    noteSkillRefreshDegraded(app, pending.draft.turn_id, err);
+                    pending = &app.submission.pending.?;
+                    break :blk .current;
                 };
                 if (readiness == .pending) return;
             }
@@ -608,6 +609,45 @@ pub fn SubmitRuntime(comptime App: type) type {
                 .{@errorName(err)},
             );
             clearPendingSubmission(app, "finalization_failure");
+        }
+
+        /// A background skill-catalog refresh is an optimization over the
+        /// catalog the session already loaded, not a precondition for the
+        /// prompt. The refresh reports its own failure as a discovery
+        /// diagnostic, so a failure here degrades to the last loaded catalog
+        /// instead of discarding text the user already submitted.
+        fn noteSkillRefreshDegraded(app: *App, turn_id: u64, err: anyerror) void {
+            debug_trace.eventf(
+                "input",
+                "pending_prompt_skill_refresh_degraded",
+                .{ .turn_id = turn_id },
+                "err={s}",
+                .{@errorName(err)},
+            );
+            const body = std.fmt.allocPrint(
+                app.alloc,
+                "skill catalog refresh failed ({s}); continuing with the last loaded catalog",
+                .{@errorName(err)},
+            ) catch |notice_err| {
+                debug_trace.logf(
+                    "input",
+                    "skill refresh degradation notice allocation failed err={s}",
+                    .{@errorName(notice_err)},
+                );
+                return;
+            };
+            defer app.alloc.free(body);
+            app.writeDomainNotice(.{
+                .topic = "skills",
+                .tone = .warning,
+                .body = body,
+            }, true) catch |notice_err| {
+                debug_trace.logf(
+                    "input",
+                    "skill refresh degradation notice output failed err={s}",
+                    .{@errorName(notice_err)},
+                );
+            };
         }
 
         fn transferPendingImageSnapshotsToComposerHistory(app: *App) bool {
@@ -2245,6 +2285,8 @@ const PendingLifecycleFake = struct {
     finalization_error: bool = false,
     notice_count: usize = 0,
     credential_checks: usize = 0,
+    last_notice_topic: ?[]const u8 = null,
+    last_notice_tone: ?types.NoticeTone = null,
     skill_refresh: enum { pending, current, failed } = .current,
     skill_refresh_checks: usize = 0,
 
@@ -2296,10 +2338,12 @@ const PendingLifecycleFake = struct {
 
     pub fn writeDomainNotice(
         self: *PendingLifecycleFake,
-        _: types.SemanticNotice,
+        notice: types.SemanticNotice,
         _: bool,
     ) !void {
         self.notice_count += 1;
+        self.last_notice_topic = notice.topic;
+        self.last_notice_tone = notice.tone;
     }
 };
 
@@ -2526,4 +2570,44 @@ test "pending terminal cleanup deletes snapshots until a worker claims the turn"
     try Runtime.acceptPresentedPrompt(&claimed, 904);
     var retained = try std.Io.Dir.openFileAbsolute(std.testing.io, claimed_path, .{});
     retained.close(std.testing.io);
+}
+
+test "failed skill catalog refresh still queues the presented prompt" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 506);
+    defer app.deinit();
+    app.skill_refresh = .failed;
+
+    Runtime.noteCommittedFrame(&app);
+    Runtime.collectPendingSubmissionFacts(&app);
+
+    try std.testing.expectEqual(PendingPhase.queued, app.submission.pending.?.phase);
+    try std.testing.expectEqual(@as(?u64, 506), app.worker.queued_turn_id);
+    try std.testing.expectEqual(@as(usize, 1), app.finalization_count);
+    try std.testing.expectEqual(@as(usize, 1), app.adoption_count);
+    try std.testing.expect(!app.worker.held);
+    try std.testing.expectEqual(@as(usize, 1), app.worker.release_count);
+
+    // The degradation is reported as a skills warning, never as a lost prompt.
+    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
+    try std.testing.expectEqualStrings("skills", app.last_notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.warning, app.last_notice_tone.?);
+}
+
+test "a real finalization failure still reports the prompt error" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    var app = try pendingLifecycleFake(std.testing.allocator, 507);
+    defer app.deinit();
+    app.skill_refresh = .failed;
+    app.finalization_error = true;
+
+    Runtime.noteCommittedFrame(&app);
+    Runtime.collectPendingSubmissionFacts(&app);
+
+    // The degradation notice must not mask a genuine submission failure, and
+    // the genuine failure must not be downgraded to a skills warning.
+    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
+    try std.testing.expectEqualStrings("prompt", app.last_notice_topic.?);
+    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_notice_tone.?);
+    try std.testing.expect(app.submission.pending == null);
 }

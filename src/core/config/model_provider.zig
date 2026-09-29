@@ -102,26 +102,16 @@ pub const NameKey = struct {
 };
 
 /// Default model served when the OpenPaths provider is active and the user has
-/// not chosen one. Verified against the OpenPaths catalog.
-pub const openpaths_default_model = "xiaomi/mimo-v2.6-pro";
+/// not chosen one. Verified against the OpenPaths catalog. OpenPaths serves
+/// the same stealth route the OpenRouter catalog exposes, so this id is
+/// reachable on either route.
+pub const openpaths_default_model = "stealth/space-bunny-alpha";
 
-/// Stealth Space Bunny Alpha is the current stealth route on the OpenRouter
-/// catalog. OpenRouter may retire or replace it without notice, so
-/// `model_fallback.zig` pairs it with the OpenPaths default.
+/// The stealth route can be retired or replaced without notice, so
+/// `model_fallback.zig` pairs it with the MiMo pro id it fails over to.
 pub const openrouter_default_model = "stealth/space-bunny-alpha";
 
-/// Key order mirrors `credentials.resolveForProvider`, which tries the
-/// OpenPaths key before the OpenRouter key, so the stealth id leads only when
-/// the OpenRouter key is the sole route to the catalog.
 pub fn openpathsDefaultModel() []const u8 {
-    return openpathsDefaultModelFor(
-        hasNonEmptyEnv("OPENPATHS_API_KEY"),
-        hasNonEmptyEnv("OPENROUTER_API_KEY"),
-    );
-}
-
-fn openpathsDefaultModelFor(openpaths_key: bool, openrouter_key: bool) []const u8 {
-    if (!openpaths_key and openrouter_key) return openrouter_default_model;
     return openpaths_default_model;
 }
 
@@ -244,19 +234,13 @@ fn hasNonEmptyEnv(name: []const u8) bool {
     const value = io_mod.getenv(name) orelse return false;
     return std.mem.trim(u8, value, " \t\r\n").len != 0;
 }
-test "openpaths default model is the MiMo pro id" {
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpaths_default_model);
-}
-
-test "stealth space bunny leads only when the OpenRouter key is the sole route" {
-    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModelFor(false, true));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(true, true));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(true, false));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", openpathsDefaultModelFor(false, false));
+test "the compiled default model is the stealth space bunny id" {
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpaths_default_model);
+    try std.testing.expectEqualStrings(openrouter_default_model, openpathsDefaultModel());
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModel());
 }
 
 test "an unconfigured provider falls back to the compiled default" {
-    try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(true, false));
     try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(false, true));
     try std.testing.expectEqual(ProviderId.openpaths, defaultIdFor(true, true));
     try std.testing.expectEqual(ProviderId.gateway, defaultIdFor(false, false));

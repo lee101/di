@@ -334,9 +334,11 @@ fn modelFactsColumn(projection: ModelMenuProjection, width: u16) ?usize {
     const content_width: usize = width;
     var facts_width: usize = 0;
     var longest_name_width: usize = 8;
+    const show_origin = hasMultipleOrigins(projection.items);
     for (projection.items) |item| {
         facts_width = @max(facts_width, compactFactsWidth(item.capabilities));
-        longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id));
+        const origin_width = if (show_origin) (if (item.origin) |origin| 3 + display_width.visibleWidth(origin.label()) else 0) else 0;
+        longest_name_width = @max(longest_name_width, display_width.visibleWidth(item.id) + origin_width);
     }
     if (facts_width == 0 or content_width < indent_width + 8 + 2 + facts_width) return null;
     const natural_column = indent_width + longest_name_width + 2;
@@ -972,4 +974,22 @@ test "model menu keeps only compact facts beside the model" {
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
+}
+
+test "merged model menu preserves full IDs when source labels fit" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("gpt-5.6-sol"), .provider = "openai", .origin = .chatgpt_subscription, .capabilities = .{ .context_window = 272_000, .supports_fast_mode = true } },
+        .{ .id = @constCast("grok-4.6"), .provider = "xai", .origin = .grok_subscription, .capabilities = .{ .context_window = 500_000 } },
+    };
+    const projection: ModelMenuProjection = .{ .active = true, .load_state = .ready, .items = &items };
+    const rows = menuRowCount(projection, 100, 10);
+    for (items, 0..) |item, index| {
+        var row = try composeModelMenuRow(alloc, projection, @intCast(2 + index), 100, rows);
+        defer row.deinit(alloc);
+        try std.testing.expect(std.mem.find(u8, row.items, item.id) != null);
+        try std.testing.expect(std.mem.find(u8, row.items, item.origin.?.label()) != null);
+        try std.testing.expect(std.mem.find(u8, row.items, "context") != null);
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(row.items) <= 100);
+    }
 }

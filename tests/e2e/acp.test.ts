@@ -1669,7 +1669,7 @@ describe("acp: model-independent", () => {
           .map((message) => acpContentText(message.content))
           .join("\n");
         expect(prompt).toContain(submitted);
-        expect(request.tools).toHaveLength(17);
+        expect(request.tools).toHaveLength(AUTO_EXA_SERIALIZED_TOOL_NAMES.length);
         const toolNames = serializedToolNames(oracleRequest);
         expect(toolNames).toEqual(
           AUTO_EXA_SERIALIZED_TOOL_NAMES,
@@ -1679,7 +1679,7 @@ describe("acp: model-independent", () => {
           .toHaveLength(1);
         expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
         expect(customProviderGuidanceState(oracleRequest)).toEqual({
-          providerToolIndices: [14],
+          providerToolIndices: [AUTO_EXA_SERIALIZED_TOOL_NAMES.indexOf("exa_search")],
           guidanceMessageIndices: [1],
         });
         expect(gateway.requests[0]!.body).not.toContain(
@@ -2777,7 +2777,7 @@ describe("acp: model-independent", () => {
         expect(resp.jsonrpc).toBe("2.0");
         expect(resp.id).toBe(1);
         expect(resp.result.protocolVersion).toBe(1);
-        expect(resp.result.agentInfo.name).toBe("fx");
+        expect(resp.result.agentInfo.name).toBe("di");
         expect(resp.result.agentInfo.version).toBe(version.stdout.trim());
         expect(resp.result.agentCapabilities.loadSession).toBe(true);
         expect(resp.result.agentCapabilities.promptCapabilities.image).toBe(true);
@@ -9131,7 +9131,7 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
         expect(loadResp.result).toBeDefined();
         expect(Array.isArray(loadResp.result.configOptions)).toBe(true);
         expect(loadResp.result.modes).toBeDefined();
-        expect(loadResp.result.modes.currentModeId).toBe("ask");
+        expect(loadResp.result.modes.currentModeId).toBe("code");
       } finally {
         await client?.close();
         gateway.stop();

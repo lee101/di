@@ -917,6 +917,7 @@ test.skipIf(!tmuxAvailable())(
         if (mode === "picker") {
           await active.sendText("/resume");
           await waitForSessionPicker(active);
+          await active.waitForText("ARCHIVED_VISIBLE_REQUEST", TIMEOUT);
           await active.sendKeys("Enter");
         }
         const resumed = await waitForScrollback(active, "RECENT_VISIBLE_REPLY");
@@ -3099,7 +3100,7 @@ test.skipIf(!tmuxAvailable())(
         if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
-        if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
+        if (/^(?:auto · )?gpt-5(?: · |$)/.test(row)) return "<status line>";
         return row;
       });
       const normalizedBefore = normalizeLiveMetadata(readingBefore);
@@ -3527,6 +3528,10 @@ test.skipIf(!tmuxAvailable())(
         const stderrPath = join(root, String(width), "stderr.log");
         mkdirSync(join(home, ".fx"), { recursive: true });
         mkdirSync(workspace);
+        // Compare transcript layout across different workspace directories.
+        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+          statusLine: { workspace: false },
+        }));
         const gateway = startFakeGateway([fakeGatewayFinalText(response)]);
         let active: TmuxSession | null = null;
         try {
@@ -4546,7 +4551,7 @@ test.skipIf(!tmuxAvailable())(
 
       expect(paneExitMatches(contender.paneStatus(), 1)).toBe(true);
       expect(readFileSync(contenderStderrPath, "utf8")).toBe(
-        "fx: another fx process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
+        "di: another di process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n",
       );
       expect(owner.isPaneAlive()).toBe(true);
       const contenderScrollback = await contender.captureFullScrollback();
@@ -5017,7 +5022,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(home);
     mkdirSync(workspace);
     mkdirSync(binDir);
-    symlinkSync(FX_BIN, join(binDir, "fx"));
+    symlinkSync(FX_BIN, join(binDir, "di"));
     writeFileSync(stderrPath, "");
     writeFileSync(resumedStderrPath, "");
     const initialGateway = startFakeGateway([fakeGatewayFinalText(marker)]);
@@ -5055,7 +5060,7 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: di --resume ${sessionId}`;
       expect(scrollback).toContain(expected);
       expect(scrollback).not.toContain("To continue this session, run:");
       expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
@@ -5069,7 +5074,7 @@ test.skipIf(!tmuxAvailable())(
         .map((line) => line.trim())
         .find((line) => line === expected);
       const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`fx --resume ${sessionId}`);
+      expect(printedCommand).toBe(`di --resume ${sessionId}`);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -5159,7 +5164,7 @@ test.skipIf(!tmuxAvailable())(
         "the rapid Ctrl-C exit pane to stop",
       );
       const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: fx --resume ${sessionId}`;
+      const expected = `Continue session with: di --resume ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.kill();
@@ -5501,7 +5506,7 @@ test.skipIf(!tmuxAvailable())(
       mkdirSync(toolWorkspace);
       writeFileSync(
         join(toolHome, ".fx", "settings.json"),
-        JSON.stringify({}),
+        JSON.stringify({ statusLine: { workspace: false } }),
       );
       const toolWorkspaceRoot = realpathSync(toolWorkspace);
       const toolReply = "TOOL_RESUME_FINAL_REPLY";
@@ -5621,7 +5626,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     expect(devExitCode).toBe(0);
     const buildRevision = JSON.parse(currentRevision).build_revision;
     expect(await new Response(dev.stdout).text()).toContain(
-      `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
+      `changes: https://github.com/lee101/di/compare/${buildRevision}...${revision}`,
     );
   } finally {
     release.stop();
@@ -5710,7 +5715,7 @@ test.skipIf(!tmuxAvailable())(
       const version = (await runFx(["--version"])).stdout.trim();
       await active.sendHexBytes(["07"]);
 
-      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      const updatedNotice = `✓ di has been updated to v${version} (notes)`;
       await active.waitForText(updatedNotice, TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
@@ -7285,7 +7290,7 @@ test.skipIf(!tmuxAvailable())(
         height: 40,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.waitForText("What can fx do differently?", TIMEOUT);
+      await active.waitForText("What can di do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
       const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
@@ -7565,13 +7570,13 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForComposer(TIMEOUT);
       const resumed = stripAnsi(await waitForScrollback(
         active,
-        "What can fx do differently?",
+        "What can di do differently?",
         timeout,
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
       expect(resumed).toContain("■ Cancelled");
-      expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
+      expect(countOccurrences(resumed, "What can di do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
       expect(resumed).not.toContain("Interrupted by user after completing");
@@ -7997,7 +8002,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     other = await open(["--continue"], "busy");
     await other.waitForPane(() => other!.paneStatus().dead, TIMEOUT);
     expect(other.paneStatus().status).toBe(1);
-    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another fx process");
+    expect(readFileSync(join(root, "busy.stderr"), "utf8")).toContain("another di process");
     await other.kill(); other = null;
     await active.sendText("/resume");
     await active.waitForText("enter resume", TIMEOUT);
