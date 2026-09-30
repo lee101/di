@@ -11,11 +11,13 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const file_index = @import("file_index.zig");
+const compress_mod = @import("../shared/compress.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const magic = "fx-file-index-v1\n";
+const magic_v1 = "fx-file-index-v1\n";
+const magic = "fx-file-index-v2\n";
 pub const max_bytes = 64 * 1024 * 1024;
 
 const Candidate = file_index.Candidate;
@@ -82,14 +84,10 @@ pub fn loadFrom(alloc: Allocator, home: []const u8, roots: []const []const u8) !
     };
 }
 
-fn loadPath(alloc: Allocator, path: []const u8, roots: []const []const u8) !?Loaded {
+fn readAllBounded(alloc: Allocator, file: *std.Io.File, size: u64) ![]u8 {
     const zio = io_mod.getIo();
-    var file = try std.Io.Dir.openFileAbsolute(zio, path, .{ .follow_symlinks = false, .allow_directory = false });
-    defer file.close(zio);
-    const stat = try file.stat(zio);
-    if (stat.kind != .file or stat.nlink != 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidIndexCache;
-    const bytes = try alloc.alloc(u8, @intCast(stat.size));
-    defer alloc.free(bytes);
+    const bytes = try alloc.alloc(u8, @intCast(size));
+    errdefer alloc.free(bytes);
     var offset: usize = 0;
     while (offset < bytes.len) {
         const end = @min(bytes.len, offset + 64 * 1024);
@@ -97,11 +95,93 @@ fn loadPath(alloc: Allocator, path: []const u8, roots: []const []const u8) !?Loa
         if (read != end - offset) return error.InvalidIndexCache;
         offset = end;
     }
-    if (bytes.len < magic.len + Sha256.digest_length or !std.mem.startsWith(u8, bytes, magic)) return error.InvalidIndexCache;
-    const payload = bytes[magic.len + Sha256.digest_length ..];
+    return bytes;
+}
+
+pub const MigrateResult = struct { before: u64, after: u64 };
+
+/// Rewrites a v1 cache file as v2 (compressed) after a verified round trip.
+/// Already-v2 or invalid files are left untouched (`before == after`).
+pub fn migrateFile(alloc: Allocator, path: []const u8) !MigrateResult {
+    const zio = io_mod.getIo();
+    var file = try std.Io.Dir.openFileAbsolute(zio, path, .{ .follow_symlinks = false, .allow_directory = false });
+    const stat = try file.stat(zio);
+    if (stat.kind != .file or stat.nlink != 1 or stat.size > max_bytes) {
+        file.close(zio);
+        return .{ .before = stat.size, .after = stat.size };
+    }
+    const bytes = readAllBounded(alloc, &file, stat.size) catch |err| {
+        file.close(zio);
+        return err;
+    };
+    file.close(zio);
+    defer alloc.free(bytes);
+    if (!std.mem.startsWith(u8, bytes, magic_v1)) return .{ .before = stat.size, .after = stat.size };
+    const payload = decodePayload(alloc, bytes) catch return .{ .before = stat.size, .after = stat.size };
+    defer alloc.free(payload);
+    var out = try encodeFile(alloc, payload);
+    defer out.deinit();
+    const check = try decodePayload(alloc, out.written());
+    defer alloc.free(check);
+    if (!std.mem.eql(u8, check, payload)) return error.InvalidIndexCache;
+    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidIndexCache;
+    var dir = try std.Io.Dir.openDirAbsolute(zio, dir_path, .{ .follow_symlinks = false, .iterate = true });
+    defer dir.close(zio);
+    var verified: io_mod.VerifiedDir = .{ .dir = dir };
+    try io_mod.durableReplaceVerified(alloc, &verified, std.fs.path.basename(path), out.written());
+    return .{ .before = stat.size, .after = out.written().len };
+}
+
+/// Returns the verified uncompressed JSON payload of a v1 (plain) or v2
+/// (codec byte + digest + possibly compressed) file. Caller owns the slice.
+fn decodePayload(alloc: Allocator, bytes: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, bytes, magic_v1)) {
+        if (bytes.len < magic_v1.len + Sha256.digest_length) return error.InvalidIndexCache;
+        const payload = bytes[magic_v1.len + Sha256.digest_length ..];
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(payload, &digest, .{});
+        if (!std.mem.eql(u8, &digest, bytes[magic_v1.len..][0..Sha256.digest_length])) return error.InvalidIndexCache;
+        return alloc.dupe(u8, payload);
+    }
+    if (!std.mem.startsWith(u8, bytes, magic) or bytes.len < magic.len + 1 + Sha256.digest_length) return error.InvalidIndexCache;
+    const codec = std.enums.fromInt(compress_mod.Codec, bytes[magic.len]) orelse return error.InvalidIndexCache;
+    const digest_at = magic.len + 1;
+    const body = bytes[digest_at + Sha256.digest_length ..];
+    const payload = compress_mod.decompress(alloc, codec, body, max_bytes + 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidIndexCache,
+    };
+    errdefer alloc.free(payload);
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(payload, &digest, .{});
-    if (!std.mem.eql(u8, &digest, bytes[magic.len..][0..Sha256.digest_length])) return error.InvalidIndexCache;
+    if (!std.mem.eql(u8, &digest, bytes[digest_at..][0..Sha256.digest_length])) return error.InvalidIndexCache;
+    return payload;
+}
+
+fn encodeFile(alloc: Allocator, payload: []const u8) !std.Io.Writer.Allocating {
+    const packed_payload = try compress_mod.compress(alloc, payload, .{});
+    defer alloc.free(packed_payload.bytes);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(magic);
+    try out.writer.writeByte(@intFromEnum(packed_payload.codec));
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(payload, &digest, .{});
+    try out.writer.writeAll(&digest);
+    try out.writer.writeAll(packed_payload.bytes);
+    return out;
+}
+
+fn loadPath(alloc: Allocator, path: []const u8, roots: []const []const u8) !?Loaded {
+    const zio = io_mod.getIo();
+    var file = try std.Io.Dir.openFileAbsolute(zio, path, .{ .follow_symlinks = false, .allow_directory = false });
+    defer file.close(zio);
+    const stat = try file.stat(zio);
+    if (stat.kind != .file or stat.nlink != 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidIndexCache;
+    const bytes = try readAllBounded(alloc, &file, stat.size);
+    defer alloc.free(bytes);
+    const payload = try decodePayload(alloc, bytes);
+    defer alloc.free(payload);
     var parsed = try std.json.parseFromSlice(Payload, alloc, payload, .{ .allocate = .alloc_if_needed, .ignore_unknown_fields = false, .max_value_len = max_bytes });
     defer parsed.deinit();
     const value = parsed.value;
@@ -183,13 +263,8 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
     }
     try writer.writeAll("]}");
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
+    var out = try encodeFile(alloc, payload.written());
     defer out.deinit();
-    try out.writer.writeAll(magic);
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(payload.written(), &digest, .{});
-    try out.writer.writeAll(&digest);
-    try out.writer.writeAll(payload.written());
 
     // `.iterate` matters on Linux: without it the descriptor is O_PATH and
     // the directory fsync inside durableReplaceVerified fails with EBADF.
@@ -228,7 +303,7 @@ test "file index cache round trips and rejects tampering" {
     const path = try cachePath(alloc, home, &roots);
     defer alloc.free(path);
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_write });
-    try file.writePositionalAll(std.testing.io, "X", magic.len + Sha256.digest_length + 4);
+    try file.writePositionalAll(std.testing.io, "X", magic.len + 1 + Sha256.digest_length + 4);
     file.close(std.testing.io);
     try std.testing.expect((try loadFrom(alloc, home, &roots)) == null);
 
@@ -243,4 +318,59 @@ test "file index cache round trips and rejects tampering" {
     // An empty scan deletes the persisted index rather than serving ghosts.
     try saveTo(alloc, home, &roots, &.{});
     try std.testing.expect((try loadFrom(alloc, home, &roots)) == null);
+}
+
+test "v1 cache files still load and migrate to smaller v2 files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const roots = [_][]const u8{"/legacy"};
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |c| alloc.free(c.path);
+        candidates.deinit(alloc);
+    }
+    for (0..3000) |i| try candidates.append(alloc, .{ .path = try std.fmt.allocPrint(alloc, "src/pkg{d}/module{d}.zig", .{ i % 30, i }), .kind = .file });
+
+    var payload: std.Io.Writer.Allocating = .init(alloc);
+    defer payload.deinit();
+    try payload.writer.print("{{\"written_at_ms\":5,\"roots\":[\"/legacy\"],\"entries\":[", .{});
+    for (candidates.items, 0..) |c, i| {
+        if (i > 0) try payload.writer.writeByte(',');
+        try payload.writer.print("{{\"path\":\"{s}\",\"kind\":0}}", .{c.path});
+    }
+    try payload.writer.writeAll("]}");
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(payload.written(), &digest, .{});
+    var v1: std.Io.Writer.Allocating = .init(alloc);
+    defer v1.deinit();
+    try v1.writer.writeAll(magic_v1);
+    try v1.writer.writeAll(&digest);
+    try v1.writer.writeAll(payload.written());
+
+    const path = try cachePath(alloc, home, &roots);
+    defer alloc.free(path);
+    try io_mod.makeDirRecursive(std.fs.path.dirname(path).?);
+    try io_mod.writeFileAtomic(alloc, path, v1.written());
+    {
+        var file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.setPermissions(std.testing.io, .fromMode(0o600));
+    }
+
+    var loaded = (try loadFrom(alloc, home, &roots)).?;
+    try std.testing.expectEqual(@as(usize, 3000), loaded.candidates.len);
+    loaded.deinit(alloc);
+
+    const result = try migrateFile(alloc, path);
+    try std.testing.expectEqual(@as(u64, v1.written().len), result.before);
+    try std.testing.expect(result.after * 4 < result.before);
+    var again = (try loadFrom(alloc, home, &roots)).?;
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3000), again.candidates.len);
+    try std.testing.expectEqualStrings("src/pkg0/module0.zig", again.candidates[0].path);
+    const second = try migrateFile(alloc, path);
+    try std.testing.expectEqual(second.before, second.after);
 }

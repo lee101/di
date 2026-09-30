@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const cold_archive = @import("../storage/cold_archive.zig");
 
 const Allocator = std.mem.Allocator;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
@@ -923,12 +924,7 @@ pub const SessionChildCapability = struct {
         try validateName(name);
         const route_dir = try self.impl.route(kind, false) orelse
             return error.FileNotFound;
-        const file = try openPrivateFile(
-            route_dir,
-            name,
-            .read_only,
-            self.impl.mode,
-        );
+        const file = try openReadOnlyRestoring(alloc, route_dir, kind, name, self.impl.mode);
         return wrapManagedFile(
             alloc,
             file,
@@ -948,12 +944,7 @@ pub const SessionChildCapability = struct {
         try validateName(name);
         const route_dir = try self.impl.route(kind, false) orelse
             return error.FileNotFound;
-        var file = try openPrivateFile(
-            route_dir,
-            name,
-            .read_only,
-            self.impl.mode,
-        );
+        var file = try openReadOnlyRestoring(self.impl.alloc, route_dir, kind, name, self.impl.mode);
         defer file.close(io_mod.getIo());
         return managedStat(file);
     }
@@ -1255,6 +1246,21 @@ fn verifyPrivateStat(stat: std.Io.File.Stat) !void {
     if (stat.permissions.toMode() & 0o777 != 0o600) {
         return error.PrivateStatePermissionsUnsupported;
     }
+}
+
+fn openReadOnlyRestoring(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    kind: ManagedChildKind,
+    name: []const u8,
+    capability_mode: Mode,
+) !std.Io.File {
+    return openPrivateFile(dir, name, .read_only, capability_mode) catch |err| {
+        if (err != error.FileNotFound or kind != .tool_results) return err;
+        const restored = cold_archive.restoreInDir(alloc, dir.dir, name) catch return err;
+        if (!restored) return err;
+        return openPrivateFile(dir, name, .read_only, capability_mode);
+    };
 }
 
 fn openPrivateFile(
@@ -1897,4 +1903,43 @@ test "rename confirms the recorded target before publication" {
         "target.log",
     ));
     try capability.delete(.command_artifacts, "target.log");
+}
+
+test "archived tool result restores lazily on read and stat" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var session = try openTestSession(alloc, &tmp);
+    defer session.dir.close(io_mod.getIo());
+    defer alloc.free(session.display_path);
+    var capability = try SessionChildCapability.initForTesting(
+        alloc,
+        session.dir,
+        session.display_path,
+        .writable,
+        .{},
+    );
+    defer capability.deinit();
+
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    for (0..2000) |i| try text.writer.print("row {d} of a repetitive tool result\n", .{i % 50});
+    var artifact = try capability.atomicReplace(alloc, .tool_results, "result-1.txt", text.written());
+    artifact.deinit(alloc);
+
+    var results = try session.dir.openDir(io_mod.getIo(), "tool-results", .{ .iterate = true });
+    defer results.close(io_mod.getIo());
+    var saved: cold_archive.Saved = .{};
+    try std.testing.expectEqual(cold_archive.ArchiveOutcome.archived, try cold_archive.archiveInDir(alloc, results, "result-1.txt", 1024, .{}, &saved));
+    try std.testing.expectError(error.FileNotFound, results.statFile(io_mod.getIo(), "result-1.txt", .{}));
+
+    const stat = try capability.stat(.tool_results, "result-1.txt");
+    try std.testing.expectEqual(@as(u64, text.written().len), stat.size);
+    var file = try capability.openFileReadOnly(alloc, .tool_results, "result-1.txt");
+    defer file.deinit();
+    const back = try file.readToEnd(alloc, 1 << 20);
+    defer alloc.free(back);
+    try std.testing.expectEqualStrings(text.written(), back);
+    try std.testing.expectError(error.FileNotFound, results.statFile(io_mod.getIo(), "result-1.txt.fxz", .{}));
 }

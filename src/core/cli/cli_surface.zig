@@ -8,6 +8,7 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const cli_storage = @import("cli_storage.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -83,6 +84,7 @@ pub const Command = union(enum) {
     usage: []const [:0]const u8,
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
+    storage: []const [:0]const u8,
     workspace: []const [:0]const u8,
     unknown: []const u8,
 };
@@ -586,6 +588,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .setup)) return .{ .setup = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .status)) return .{ .status = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .sessions)) return .{ .sessions = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .storage)) return .{ .storage = args[1..] };
             if (command_specs.matchesTopLevel(command_catalog, command, .session)) {
                 if (args.len > 1 and std.mem.eql(u8, args[1], "resume")) {
                     return .{ .resume_session = .{ .args = args[2..] } };
@@ -1923,6 +1926,10 @@ fn runNonInteractiveWithDeps(
         },
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
+            return if (exit_code == 0) .handled_success else .handled_failure;
+        },
+        .storage => |rest| {
+            const exit_code = try cli_storage.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
         },
         .unknown => |command| {

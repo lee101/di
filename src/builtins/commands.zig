@@ -265,6 +265,21 @@ pub const top_level_specs = [_]TopLevelSpec{
         },
     },
     .{
+        .kind = .storage,
+        .token = "storage",
+        .usage = "storage [stats|compact|restore] [--json] [--older-than <d>] [--dry-run]",
+        .summary = "Inspect and compress cold local storage",
+        .hidden_from_top_level_help = true,
+        .options = &.{
+            .{ .flag = "stats", .description = "Show disk usage by category (default)" },
+            .{ .flag = "compact", .description = "Compress file-index caches and cold session tool results" },
+            .{ .flag = "restore [session-id]", .description = "Restore archived tool results" },
+            .{ .flag = "--older-than <d>", .description = "Only compact sessions idle at least this long (default 7d)" },
+            .{ .flag = "--dry-run", .description = "Report without modifying files" },
+            json_option,
+        },
+    },
+    .{
         .kind = .replay,
         .token = "replay",
         .usage = "replay <tape> [--frames] [--json] [--golden <path>] [--frames-dir <path>]",

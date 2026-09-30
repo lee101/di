@@ -624,6 +624,9 @@ const AskContext = struct {
     raw_trailing_newlines: u8 = 0,
     raw_has_output: bool = false,
     command_output_line_open: bool = false,
+    command_output_buf: std.ArrayList(u8) = .empty,
+    command_output_flushed_ms: i64 = 0,
+    command_output_mutex: std.Io.Mutex = .init,
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
@@ -790,6 +793,8 @@ const AskContext = struct {
             image_attachments.cleanupSnapshotDir(path);
             self.alloc.free(path);
         }
+        self.flushCommandOutput() catch {};
+        self.command_output_buf.deinit(self.alloc);
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
@@ -1158,7 +1163,29 @@ const AskContext = struct {
         try self.deps.write_stdout(self.deps.stdout_ctx, text);
     }
 
+    fn flushCommandOutput(self: *AskContext) !void {
+        self.command_output_mutex.lockUncancelable(io_mod.getIo());
+        defer self.command_output_mutex.unlock(io_mod.getIo());
+        if (self.command_output_buf.items.len == 0) return;
+        defer self.command_output_buf.clearRetainingCapacity();
+        try self.deps.write_stderr(self.deps.stderr_ctx, self.command_output_buf.items);
+    }
+
+    fn bufferCommandOutput(self: *AskContext, chunk: []const u8) !void {
+        const now = io_mod.milliTimestamp();
+        {
+            self.command_output_mutex.lockUncancelable(io_mod.getIo());
+            defer self.command_output_mutex.unlock(io_mod.getIo());
+            try self.command_output_buf.appendSlice(self.alloc, chunk);
+            if (self.command_output_buf.items.len < command_output_flush_bytes and
+                now - self.command_output_flushed_ms < command_output_flush_ms) return;
+        }
+        try self.flushCommandOutput();
+        self.command_output_flushed_ms = now;
+    }
+
     fn writeStderr(self: *AskContext, text: []const u8) !void {
+        try self.flushCommandOutput();
         try self.deps.write_stderr(self.deps.stderr_ctx, text);
     }
 
@@ -1523,6 +1550,8 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
 }
 
 const goal_retry_limit: usize = 5;
+const command_output_flush_bytes: usize = 16 * 1024;
+const command_output_flush_ms: i64 = 50;
 
 fn beginGoal(alloc: Allocator, options: *AskOptions, deps: RunDeps) !goal_run.Begin {
     const home = io_mod.getenv("HOME") orelse {
@@ -3714,6 +3743,7 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
 
 fn pushCommandOutputComplete(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    try ctx.flushCommandOutput();
     if (ctx.output_mode.isTerminal() or !ctx.command_output_line_open) return;
     try ctx.writeStderr("\n");
     ctx.command_output_line_open = false;
@@ -3745,7 +3775,7 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     if (ctx.output_mode.isTerminal()) return;
-    try ctx.writeStderr(chunk);
+    try ctx.bufferCommandOutput(chunk);
     if (chunk.len > 0) ctx.command_output_line_open = chunk[chunk.len - 1] != '\n';
 }
 
