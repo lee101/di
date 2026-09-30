@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
+const login_snapshot = @import("../terminal/login_snapshot.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -683,6 +684,13 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    if (environment == .user) {
+        if (login_snapshot.warmArgv(scratch, environment.user, command)) |argv| {
+            debug_trace.logf("core", "command runner warm user shell={s}", .{environment.user});
+            const warm = try executeProcessWithScript(scratch, effective_cfg, argv, cwd, "");
+            return formatCollectedOutput(arena, command, cwd, warm);
+        }
+    }
     const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
