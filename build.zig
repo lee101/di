@@ -102,6 +102,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
+    // Login shells spawned by command tests source the host's profile files;
+    // an isolated HOME keeps their startup independent of the developer's
+    // (possibly multi-second) dotfiles.
+    b.cache_root.handle.createDirPath(b.graph.io, "test-home") catch |err|
+        std.debug.panic("cannot create test HOME: {t}", .{err});
+    run_exe_tests.setEnvironmentVariable(
+        "HOME",
+        b.pathFromRoot(b.cache_root.join(b.allocator, &.{"test-home"}) catch @panic("OOM")),
+    );
     run_exe_tests.setEnvironmentVariable(
         "FX_TEST_PRODUCT_EXE",
         b.getInstallPath(.bin, "di"),

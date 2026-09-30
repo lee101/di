@@ -1150,7 +1150,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.",
+        "Run commands with shell.run. Fast commands finish in one call; commands still running after yield_time_ms return a session_id. Use shell.interact with that session_id (omit chars to observe, or send chars as input) and shell.stop only when termination is requested. full_output_handle retains exact output. Never detach with &, nohup, setsid, or double-forking.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
@@ -1785,6 +1785,76 @@ describe("gateway stream lifecycle", () => {
       expect(result.stderr).not.toContain("symlinked rule file");
     } finally {
       gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("skill_symlink_authorities setting admits external skill links", async () => {
+    const root = createFixtureRoot("skill-symlink-authorities");
+    const tracePath = join(root.root, "trace.log");
+    const externalStore = join(root.root, "external-store");
+    const skillsRoot = join(root.home, ".agents", "skills");
+    mkdirSync(join(externalStore, "external-skill"), { recursive: true });
+    mkdirSync(skillsRoot, { recursive: true });
+    writeFileSync(
+      join(externalStore, "external-skill", "SKILL.md"),
+      "---\nname: external-skill\ndescription: skill outside every root\n---\n\nEXTERNAL_SKILL_SENTINEL\n",
+    );
+    symlinkSync(
+      join(externalStore, "external-skill"),
+      join(skillsRoot, "external-skill"),
+      "dir",
+    );
+    const settingsPath = join(root.home, ".fx", "settings.json");
+
+    const ask = async (settings: unknown) => {
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      const gateway = startGateway(() =>
+        fakeGatewayFinalText("EXTERNAL_SKILL_COMPLETE")
+      );
+      try {
+        const result = await runFx(
+          [
+            "ask",
+            "--json",
+            "--auto",
+            "--no-save",
+            "$external-skill apply the external skill.",
+          ],
+          {
+            cwd: root.workspace,
+            env: {
+              ...fixtureEnv(root, gateway, tracePath),
+              FX_SKILL_SYMLINK_AUTHORITIES: undefined,
+            },
+            timeoutMs: 30_000,
+          },
+        );
+        return {
+          result,
+          prompt: promptText(gateway.requests[0]!.body),
+        };
+      } finally {
+        gateway.stop();
+      }
+    };
+
+    try {
+      const allowed = await ask({ skill_symlink_authorities: [externalStore] });
+      expect(allowed.result.code).toBe(0);
+      expect(allowed.prompt).toContain("EXTERNAL_SKILL_SENTINEL");
+      expect(allowed.prompt).toContain('<skill_content name="external-skill"');
+      expect(allowed.result.stdout + allowed.result.stderr).not.toContain(
+        "authorize its external location",
+      );
+
+      const rejected = await ask({});
+      expect(rejected.result.code).toBe(0);
+      expect(rejected.prompt).not.toContain("EXTERNAL_SKILL_SENTINEL");
+      expect(rejected.result.stdout + rejected.result.stderr).toContain(
+        "authorize its external location",
+      );
+    } finally {
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 60_000);

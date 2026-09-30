@@ -1141,6 +1141,7 @@ fn parseCatalog(
 /// prefixes, aliases, and re-spellings; the id fallback keeps catalogs that
 /// omit the field from filling the picker with unusable models.
 fn isChatModel(object: std.json.ObjectMap, id: []const u8) bool {
+    if (toolsCapability(object) == false) return false;
     if (object.get("type")) |type_value| {
         if (type_value == .string) return std.ascii.eqlIgnoreCase(type_value.string, "language");
         return true;
@@ -1158,6 +1159,7 @@ fn billedForNonChatWork(object: std.json.ObjectMap) bool {
     if (unsignedField(object, "max_output_tokens") == 0) return true;
     const pricing = objectMapField(object, "pricing") orelse return false;
     if (costField(pricing, "output_per_1m_tokens") == 0) return true;
+    if (!pricing.contains("output_per_1m_tokens") and toolsCapability(object) != true) return true;
     for ([_][]const u8{
         "per_image",
         "per_megapixel",
@@ -1173,6 +1175,14 @@ fn billedForNonChatWork(object: std.json.ObjectMap) bool {
         if ((costField(pricing, key) orelse 0) > 0) return true;
     }
     return false;
+}
+
+/// Tri-state from capabilities.tools: OpenPaths labels speech and 3D models
+/// "language", but they advertise no tool use, which an agent turn requires.
+fn toolsCapability(object: std.json.ObjectMap) ?bool {
+    const capabilities = objectMapField(object, "capabilities") orelse return null;
+    const value = capabilities.get("tools") orelse return null;
+    return if (value == .bool) value.bool else null;
 }
 
 fn namesNonChatService(id: []const u8) bool {
@@ -1469,6 +1479,20 @@ test "parse catalog drops media models priced per unit the id never names" {
     try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
     try std.testing.expectEqualStrings("vendor/chat-with-pricing", catalog.items[0].id);
     try std.testing.expectEqualStrings("vendor/chat-without-pricing", catalog.items[1].id);
+}
+
+test "parse catalog drops language-typed entries that advertise no tool use" {
+    const body =
+        \\{"data":[
+        \\  {"id":"trellis-2-retexture","type":"language","pricing":{"per_request":0.24},"capabilities":{"tools":false}},
+        \\  {"id":"speech-2.8-hd","type":"language","pricing":{"input_per_1m_tokens":100},"capabilities":{"tools":false}},
+        \\  {"id":"inkling-small","type":"language","pricing":{"input_per_1m_tokens":0.5,"output_per_1m_tokens":1.2},"capabilities":{"tools":true}}
+        \\]}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 1), catalog.items.len);
+    try std.testing.expectEqualStrings("inkling-small", catalog.items[0].id);
 }
 
 test "parse catalog trusts a provider type over the id" {

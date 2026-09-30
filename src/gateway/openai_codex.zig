@@ -87,6 +87,10 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    if (request.session_id) |session_id| if (session_id.len > 0) {
+        try writer.writeAll(",\"prompt_cache_key\":");
+        try std.json.Stringify.value(session_id, .{}, writer);
+    };
     // Codex exposes Fast mode as its priority service tier for supported
     // ChatGPT subscription models.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
@@ -662,6 +666,30 @@ test "host-managed Codex request auth omits bearer and account headers" {
 
     try std.testing.expect(headers.authorization == null);
     try std.testing.expect(headers.account_id == null);
+}
+
+test "OpenAI Codex request carries a stable prompt cache key only for a real session" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "hi" }};
+    const with_session = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.4",
+        .session_id = "sess-1",
+        .messages = &messages,
+        .tool_choice = .auto,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(with_session);
+    try std.testing.expect(std.mem.find(u8, with_session, "\"prompt_cache_key\":\"sess-1\"") != null);
+    for ([_]?[]const u8{ null, "" }) |session_id| {
+        const body = try buildRequest(std.testing.allocator, .{
+            .model = "gpt-5.4",
+            .session_id = session_id,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = .{},
+        });
+        defer std.testing.allocator.free(body);
+        try std.testing.expect(std.mem.find(u8, body, "prompt_cache_key") == null);
+    }
 }
 
 test "OpenAI Codex SSE maps text reasoning tools and usage" {
