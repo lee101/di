@@ -1,4 +1,5 @@
 const std = @import("std");
+const goal_tui = @import("../goal/goal_tui.zig");
 const credentials = @import("../auth/credentials.zig");
 const activity_status = @import("../output/activity_status.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -1205,6 +1206,15 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         const delivery = try handlers.append_history_turn(handlers.ctx, finished);
                         accepted = true;
+                        if (comptime @hasField(App, "goal_tui")) {
+                            if (finished.terminal_outcome == .completed) switch (finished.turn) {
+                                .assistant => |turn| {
+                                    app.goal_tui.turn_done = true;
+                                    app.goal_tui.setReply(finished.presentation_text orelse turn.assistant);
+                                },
+                                else => {},
+                            };
+                        }
                         switch (delivery) {
                             .retained => {},
                             .settled => |result| switch (result) {
@@ -1246,6 +1256,12 @@ pub fn Runtime(comptime App: type) type {
 
             lifecycle_cleanup_attempted = true;
             try handlers.tool_lifecycle.finish_batch(app.alloc);
+            if (comptime @hasField(App, "goal_tui")) {
+                if (app.goal_tui.turn_done) {
+                    app.goal_tui.turn_done = false;
+                    goal_tui.turnEnded(App, app);
+                }
+            }
         }
 
         fn flushPendingCommandOutputAtTurnBoundary(

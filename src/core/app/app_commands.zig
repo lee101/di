@@ -1,4 +1,5 @@
 const std = @import("std");
+const goal_tui = @import("../goal/goal_tui.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -390,6 +391,7 @@ pub fn Handlers(comptime App: type) type {
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
                 .handle_workspace = commandHandleWorkspace,
+                .handle_goal = commandHandleGoal,
                 .show_version = commandShowVersion,
                 .unknown = commandUnknown,
             };
@@ -2070,6 +2072,11 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try handleWorkspaceCommand(app, rest);
+        }
+
+        fn commandHandleGoal(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try goal_tui.handle(App, app, rest);
         }
 
         fn commandShowVersion(ctx: *anyopaque) !void {

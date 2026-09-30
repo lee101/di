@@ -29,7 +29,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .ask,
         .token = "ask",
-        .usage = "ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
+        .usage = "ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--auto-next-goal [--goal-tokens N] [--goal-turns N] [--goal-time D]] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>",
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
@@ -37,6 +37,10 @@ pub const top_level_specs = [_]TopLevelSpec{
             .{ .flag = "--yolo", .description = "Alias for --full-access" },
             .{ .flag = "--auto-next-steps", .description = "Continue with the next logical implementation steps after each turn" },
             .{ .flag = "--auto-next-idea", .description = "Brainstorm and implement follow-up improvements after each turn" },
+            .{ .flag = "--auto-next-goal", .description = "Pursue the prompt as a persistent workspace goal until complete, blocked, stalled or over budget; omit the prompt to resume" },
+            .{ .flag = "--goal-tokens <n>", .description = "Goal token budget (k and m suffixes)" },
+            .{ .flag = "--goal-turns <n>", .description = "Goal turn budget" },
+            .{ .flag = "--goal-time <d>", .description = "Goal time budget (s, m, h)" },
             .{ .flag = "--model <id>", .description = "Override the model for this request" },
             .{ .flag = "--effort <level>", .description = "Override the reasoning effort for this request" },
             .{ .flag = "--fast", .description = "Enable Fast mode for this request when the model supports it" },
@@ -482,6 +486,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
+    .{ .kind = .goal, .command = "/goal", .help_entry = "/goal [OBJECTIVE] [--tokens N] [--turns N] [--time D] | pause | resume | clear | budget ...", .completion_description = "set, show, pause, resume, clear or budget the workspace goal", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the di version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },
 };
@@ -568,6 +573,7 @@ test "built-in slash commands register exact active order" {
         "/statusline",
         "/sound",
         "/workspace",
+        "/goal",
         "/version",
         "/quit",
     };

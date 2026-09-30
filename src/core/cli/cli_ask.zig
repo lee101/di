@@ -32,6 +32,8 @@ const image_attachments = @import("../images/image_attachments.zig");
 const hooks = @import("../hooks/hooks.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const io_mod = @import("../shared/io.zig");
+const goal_mod = @import("../goal/goal.zig");
+const goal_run = @import("../goal/goal_run.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -357,6 +359,8 @@ const AskOptions = struct {
     continue_recovery: bool = false,
     auto_next_steps: bool = false,
     auto_next_idea: bool = false,
+    auto_next_goal: bool = false,
+    goal_budget: goal_mod.Budget = .{},
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -1345,12 +1349,31 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         deps.stdout_is_tty(deps.stdout_ctx),
         options.no_color,
     );
-    var current_prompt = try alloc.dupe(u8, options.prompt);
-    defer alloc.free(current_prompt);
+    const autonomous = options.auto_next_steps or options.auto_next_idea or options.auto_next_goal;
+    var goal_state: ?goal_run.Run = null;
+    defer if (goal_state) |*g| g.deinit();
+    var current_prompt: []u8 = undefined;
     var follow_up_session_id: ?[]u8 = null;
     defer if (follow_up_session_id) |session_id| alloc.free(session_id);
-
     var first_turn = true;
+    if (options.auto_next_goal) {
+        const begun = try beginGoal(alloc, &options, deps);
+        switch (begun) {
+            .exit => |code| return code,
+            .ready => |ready| goal_state = ready,
+        }
+        const g = &goal_state.?;
+        try g.persist();
+        current_prompt = try g.prompt(true);
+        if (g.resumed and g.owned.goal.session.len > 0 and goal_run.sessionExists(io_mod.getenv("HOME") orelse "", g.owned.goal.session)) {
+            follow_up_session_id = try alloc.dupe(u8, g.owned.goal.session);
+            first_turn = false;
+        }
+    } else {
+        current_prompt = try alloc.dupe(u8, options.prompt);
+    }
+    defer alloc.free(current_prompt);
+
     var autonomous_turn: usize = 0;
     var retry_attempt: usize = 0;
     while (true) {
@@ -1359,6 +1382,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             options.resume_target
         else
             ResumeTarget{ .id = follow_up_session_id.? };
+        if (goal_state) |*g| g.turnStarted();
         const images = if (first_turn and options.images.items.len > 0) options.images.items else &.{};
         const continue_recovery = first_turn and options.continue_recovery;
         const result = runPromptInternal(alloc, current_prompt, options.permission_override, effective_cfg, .{
@@ -1379,7 +1403,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         }) catch |err| {
             if (interrupt_scope.requested() or err == error.Cancelled) return headless_interrupt.exitCode();
             if (err == error.OutOfMemory) return err;
-            if (!options.auto_next_steps and !options.auto_next_idea) {
+            if (!autonomous) {
                 if (err == error.OneOffSessionNotResumable and !options.json_output) {
                     try deps.write_stderr(
                         deps.stderr_ctx,
@@ -1401,6 +1425,10 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             }
 
             retry_attempt += 1;
+            if (goal_state != null and retry_attempt > goal_retry_limit) {
+                try deps.write_stderr(deps.stderr_ctx, "[goal] too many consecutive failures; goal saved, rerun to resume\n");
+                return 1;
+            }
             try writeAutonomousRetryNotice(deps, retry_attempt, @errorName(err));
             io_mod.sleep(autonomousRetryDelayNs(retry_attempt));
             continue;
@@ -1421,7 +1449,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
             try deps.write_stdout(deps.stdout_ctx, json);
         }
 
-        if (!options.auto_next_steps and !options.auto_next_idea) {
+        if (!autonomous) {
             const exit_code = result.exit_code;
             return if (interrupt_scope.requested()) headless_interrupt.exitCode() else exit_code;
         }
@@ -1437,6 +1465,10 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
                 follow_up_session_id = try alloc.dupe(u8, result.session_id);
             }
             retry_attempt += 1;
+            if (goal_state != null and retry_attempt > goal_retry_limit) {
+                try deps.write_stderr(deps.stderr_ctx, "[goal] too many consecutive failures; goal saved, rerun to resume\n");
+                return result.exit_code;
+            }
             const retry_prompt = try buildAutonomousRetryPrompt(alloc, result.assistant_output, retry_attempt);
             alloc.free(current_prompt);
             current_prompt = retry_prompt;
@@ -1454,6 +1486,29 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         if (follow_up_session_id) |session_id| alloc.free(session_id);
         follow_up_session_id = try alloc.dupe(u8, result.session_id);
         autonomous_turn += 1;
+        if (goal_state) |*g| {
+            var line: std.Io.Writer.Allocating = .init(alloc);
+            defer line.deinit();
+            const verdict = try g.finishTurn(
+                if (result.final_output.len > 0) result.final_output else result.assistant_output,
+                (result.usage.input_tokens orelse 0) +| (result.usage.output_tokens orelse 0),
+                result.tool_calls.len,
+                result.session_id,
+                &line.writer,
+            );
+            try deps.write_stderr(deps.stderr_ctx, line.written());
+            if (verdict != .keep_going) return g.owned.goal.status.exitCode();
+            line.clearRetainingCapacity();
+            if (try g.externallyStopped(&line.writer)) {
+                try deps.write_stderr(deps.stderr_ctx, line.written());
+                return goal_mod.Status.paused.exitCode();
+            }
+            const goal_prompt = try g.prompt(false);
+            alloc.free(current_prompt);
+            current_prompt = goal_prompt;
+            first_turn = false;
+            continue;
+        }
         const next_prompt = try buildAutonomousFollowUpPrompt(
             alloc,
             options.auto_next_steps,
@@ -1465,6 +1520,22 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         current_prompt = next_prompt;
         first_turn = false;
     }
+}
+
+const goal_retry_limit: usize = 5;
+
+fn beginGoal(alloc: Allocator, options: *AskOptions, deps: RunDeps) !goal_run.Begin {
+    const home = io_mod.getenv("HOME") orelse {
+        try deps.write_stderr(deps.stderr_ctx, "di ask: HOME is not set\n");
+        return .{ .exit = 1 };
+    };
+    const workspace = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace);
+    var msg: std.Io.Writer.Allocating = .init(alloc);
+    defer msg.deinit();
+    const begun = try goal_run.Run.begin(alloc, home, workspace, options.prompt, options.goal_budget, &msg.writer);
+    if (msg.written().len > 0) try deps.write_stderr(deps.stderr_ctx, msg.written());
+    return begun;
 }
 
 fn autonomousRetryDelayNs(attempt: usize) u64 {
@@ -4109,6 +4180,21 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
             opts.auto_next_steps = true;
         } else if (std.mem.eql(u8, arg, "--auto-next-idea")) {
             opts.auto_next_idea = true;
+        } else if (std.mem.eql(u8, arg, "--auto-next-goal")) {
+            opts.auto_next_goal = true;
+        } else if (std.mem.eql(u8, arg, "--goal-tokens") or std.mem.eql(u8, arg, "--goal-turns") or std.mem.eql(u8, arg, "--goal-time")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            if (std.mem.eql(u8, arg, "--goal-time")) {
+                opts.goal_budget.time_s = goal_mod.parseDuration(args[i]) orelse return error.InvalidAskArgs;
+            } else {
+                const n = goal_mod.parseCount(args[i]) orelse return error.InvalidAskArgs;
+                if (std.mem.eql(u8, arg, "--goal-tokens")) {
+                    opts.goal_budget.tokens = n;
+                } else {
+                    opts.goal_budget.turns = std.math.cast(u32, n) orelse return error.InvalidAskArgs;
+                }
+            }
         } else if (arg.len > 1 and arg[0] == '-') {
             return error.InvalidAskArgs;
         } else {
@@ -4125,12 +4211,16 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         opts.prompt = try alloc.dupe(u8, "");
     } else if (prompt_parts.items.len > 0) {
         opts.prompt = try joinPromptSlices(alloc, prompt_parts.items);
+    } else if (opts.auto_next_goal and opts.image_paths.items.len == 0) {
+        opts.prompt = try alloc.dupe(u8, "");
     } else {
         opts.prompt = try readPromptFromStdinSource(alloc, stdin);
     }
     if (!text_utils.isModelSafeText(opts.prompt)) return error.InvalidPromptText;
     if (opts.no_save and opts.resume_target != null) return error.NoSaveResumeConflict;
-    if (opts.no_save and (opts.auto_next_steps or opts.auto_next_idea)) return error.InvalidAskArgs;
+    if (opts.no_save and (opts.auto_next_steps or opts.auto_next_idea or opts.auto_next_goal)) return error.InvalidAskArgs;
+    if (opts.auto_next_goal and (opts.auto_next_steps or opts.auto_next_idea or opts.continue_recovery)) return error.InvalidAskArgs;
+    if (!opts.auto_next_goal and opts.goal_budget.any()) return error.InvalidAskArgs;
 
     return opts;
 }
@@ -5736,6 +5826,26 @@ test "parse options preserves model effort and fast overrides" {
     var last_model = try parseOptionsWithStdin(alloc, &.{ "--model", "first/model", "--model", "second/model", "hello" }, .tty);
     defer last_model.deinit(alloc);
     try std.testing.expectEqualStrings("second/model", last_model.model_override.?);
+}
+
+test "parse options accepts goal flags and budgets" {
+    const alloc = std.testing.allocator;
+    var options = try parseOptionsWithStdin(alloc, &.{ "--auto-next-goal", "--goal-tokens", "200k", "--goal-turns", "8", "--goal-time", "30m", "ship it" }, .tty);
+    defer options.deinit(alloc);
+    try std.testing.expect(options.auto_next_goal);
+    try std.testing.expectEqual(@as(?u64, 200_000), options.goal_budget.tokens);
+    try std.testing.expectEqual(@as(?u32, 8), options.goal_budget.turns);
+    try std.testing.expectEqual(@as(?u64, 1800), options.goal_budget.time_s);
+    try std.testing.expectEqualStrings("ship it", options.prompt);
+
+    var resume_only = try parseOptionsWithStdin(alloc, &.{"--auto-next-goal"}, .tty);
+    defer resume_only.deinit(alloc);
+    try std.testing.expectEqualStrings("", resume_only.prompt);
+
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--no-save", "--auto-next-goal", "x" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--auto-next-goal", "--auto-next-steps", "x" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--goal-turns", "3", "x" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--auto-next-goal", "--goal-turns", "zero", "x" }, .tty));
 }
 
 test "parse options accepts provider routing flags and rejects malformed values" {

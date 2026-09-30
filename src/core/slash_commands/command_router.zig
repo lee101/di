@@ -38,6 +38,7 @@ pub const ParsedCommand = union(enum) {
     statusline: []const u8,
     notifications: []const u8,
     workspace: []const u8,
+    goal: []const u8,
     version,
     unknown,
 };
@@ -77,6 +78,7 @@ pub const CommandHandlers = struct {
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_notifications: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_workspace: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_goal: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_version: *const fn (ctx: *anyopaque) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -120,6 +122,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
         .workspace => .{ .workspace = payload },
+        .goal => .{ .goal = payload },
         .version => .version,
     };
 }
@@ -172,6 +175,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
         .workspace => |rest| try handlers.handle_workspace(handlers.ctx, rest),
+        .goal => |rest| try handlers.handle_goal(handlers.ctx, rest),
         .version => try handlers.show_version(handlers.ctx),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -480,6 +484,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .rename_session = unexpectedPayload,
         .handle_notifications = unexpectedPayload,
         .handle_workspace = unexpectedPayload,
+        .handle_goal = unexpectedPayload,
         .show_version = unexpectedNoPayload,
         .unknown = unexpectedPayload,
     };
