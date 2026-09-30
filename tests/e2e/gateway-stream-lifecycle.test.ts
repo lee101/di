@@ -1150,7 +1150,7 @@ describe("gateway stream lifecycle", () => {
       expectOnlyLeadingSystemMessages(gateway.requests[0]!.body);
       expect(contentText(request.prompt[1]?.content)).toBe(WEB_SEARCH_GUIDANCE);
       expect(toolByName(oracleRequest, "shell")?.description).toBe(
-        "Run commands with action=run. Fast commands finish in one call; commands still running after yield_time_ms return a session_id. Use action=interact with that session_id (omit chars to observe, or send chars as input) and action=stop only when termination is requested. full_output_handle retains exact output. Never detach with &, nohup, setsid, or double-forking.",
+        "Run commands with shell.run. Fast commands finish in one call; commands still running after yield_time_ms return a session_id. Use shell.interact with that session_id (omit chars to observe, or send chars as input) and shell.stop only when termination is requested. full_output_handle retains exact output. Never detach with &, nohup, setsid, or double-forking.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
         "the task clearly matches one",
