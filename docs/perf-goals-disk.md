@@ -157,8 +157,10 @@ Not done:
   `clean` profile, and the default `user` profile requires the shell route by design (aliases and
   profile PATH), so new builtins would change semantics for little gain over the warm shell.
 - Adaptive backoff of the 1 ms completion poll (which still scans `/proc` every iteration) was not
-  attempted: the `command_runner` process-tree tests already fail on this host at the base commit
-  (14 failures in `zig build test`, none from this branch), so a change there cannot be validated.
+  attempted: it changes when leftover descendants are noticed, and the `command_runner`
+  process-tree tests that guard that failed at the base commit (14 failures on this host); they
+  pass after merging main (full `zig build test` on the merged branch: 9754 passed, 19 skipped,
+  0 failed), so this is a candidate for a follow-up.
 - A persistent warm shell process (one bash reused across commands) was replaced by the snapshot
   approach because commands need their own process group, pipes and cancellation.
 
