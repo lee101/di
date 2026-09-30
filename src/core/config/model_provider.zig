@@ -102,17 +102,24 @@ pub const NameKey = struct {
 };
 
 /// Default model served when the OpenPaths provider is active and the user has
-/// not chosen one. Verified against the OpenPaths catalog. OpenPaths serves
-/// the same stealth route the OpenRouter catalog exposes, so this id is
-/// reachable on either route.
+/// not chosen one and only an OpenRouter key is present. OpenRouter alone
+/// serves the stealth route.
 pub const openpaths_default_model = "stealth/space-bunny-alpha";
 
 /// The stealth route can be retired or replaced without notice, so
 /// `model_fallback.zig` pairs it with the MiMo pro id it fails over to.
 pub const openrouter_default_model = "stealth/space-bunny-alpha";
 
+/// The OpenPaths catalog does not serve the stealth route (HTTP 502
+/// model_not_found), so an OpenPaths key selects this id instead.
+pub const openpaths_catalog_default_model = "xiaomi/mimo-v2.6-pro";
+
 pub fn openpathsDefaultModel() []const u8 {
-    return openpaths_default_model;
+    return defaultModelFor(hasNonEmptyEnv("OPENPATHS_API_KEY"));
+}
+
+fn defaultModelFor(has_openpaths_key: bool) []const u8 {
+    return if (has_openpaths_key) openpaths_catalog_default_model else openrouter_default_model;
 }
 
 pub const ProviderSelection = struct {
@@ -236,8 +243,8 @@ fn hasNonEmptyEnv(name: []const u8) bool {
 }
 test "the compiled default model is the stealth space bunny id" {
     try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpaths_default_model);
-    try std.testing.expectEqualStrings(openrouter_default_model, openpathsDefaultModel());
-    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModel());
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", defaultModelFor(false));
+    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", defaultModelFor(true));
 }
 
 test "an unconfigured provider falls back to the compiled default" {
