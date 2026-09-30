@@ -3546,7 +3546,7 @@ test "gateway_system_prompt: compact ordered sections" {
         previous_index = found_index;
     }
 
-    try std.testing.expect(gateway_system_prompt.len < 8 * 1024);
+    try std.testing.expect(gateway_system_prompt.len < 6 * 1024);
 }
 
 test "gateway_system_prompt: local workspace authority" {
@@ -3561,7 +3561,7 @@ test "gateway_system_prompt: evidence-led scoped execution" {
     try expectDefaultPromptContains("gather local evidence before answering");
     try expectDefaultPromptContains("make at least one safe local inspection before the final answer");
     try expectDefaultPromptContains("If the user names available skills, use every named skill for that query.");
-    try expectDefaultPromptContains("load each selected skill that is not already supplied as explicit skill content");
+    try expectDefaultPromptContains("Load each selected skill that is not already supplied as explicit skill content");
     try expectDefaultPromptContains("read its complete instructions and required resources, and follow its workflow");
     try expectDefaultPromptContains("If a selected skill cannot be followed, state the blocker before using a fallback.");
     try expectDefaultPromptContains("When no skill clearly matches, start with direct file, search, or local git inspection.");
@@ -3589,11 +3589,11 @@ test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Keep responses short and practical.");
     try expectDefaultPromptDoesNotContain("use markdown unless requested");
     try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which di renders in the terminal.");
-    try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
+    try expectDefaultPromptContains("Use a table for comparisons");
     try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
-    try expectDefaultPromptContains("answer simple questions in plain sentences");
+    try expectDefaultPromptContains("Answer simple questions in plain sentences");
     try expectDefaultPromptContains("Use bold sparingly, and never inside tables");
-    try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
+    try expectDefaultPromptContains("Before the first tool call in a tool-driven task, send one brief user-visible update");
     try expectDefaultPromptContains("Never start the first tool silently.");
     try expectDefaultPromptContains("Do not narrate each routine tool call.");
     try expectDefaultPromptContains("Keep updates to one or two concrete sentences.");
@@ -3614,6 +3614,11 @@ test "gateway_system_prompt: safety and permission boundaries" {
     try expectDefaultPromptContains("report the blocker and do not imply success");
     try expectDefaultPromptDoesNotContain("will always be approved");
     try expectDefaultPromptDoesNotContain("bypass approval");
+}
+
+test "gateway_system_prompt: parallel batching and no verify re-read" {
+    try expectDefaultPromptContains("independent tool calls in a single turn so they run in parallel");
+    try expectDefaultPromptContains("Do not re-read a file after a successful edit");
 }
 
 test "gateway_system_prompt: focused tools and live verification" {

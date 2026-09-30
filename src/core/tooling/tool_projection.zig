@@ -11,6 +11,10 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// False hides MCP-only tools when the host knows no MCP server exists.
+    mcp_available: bool = true,
+    /// False hides skill discovery tools when the host knows no skill exists.
+    skills_available: bool = true,
 };
 
 const BuildKind = enum { full, read_only };
@@ -560,6 +564,8 @@ fn appendBuiltinTool(
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
+    if (!options.mcp_available and (std.mem.eql(u8, tool.name, "mcp_select_tool") or std.mem.eql(u8, tool.name, "mcp_features"))) return;
+    if (!options.mcp_available and !options.skills_available and std.mem.eql(u8, tool.name, "capability_search")) return;
     // Only the ask permission mode opens a real question screen. Every other
     // mode auto answers, so advertising the tool would promise an interaction
     // the turn cannot have.
@@ -771,6 +777,24 @@ test "base tool projection includes MCP discovery and explicit selection" {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "capability_search");
     try expectContainsName(projection.advertised_names, "mcp_select_tool");
+}
+
+test "MCP and capability discovery tools are hidden only when host reports none" {
+    var none = try buildTestModelToolProjection(std.testing.allocator, .{ .mcp_available = false, .skills_available = false });
+    defer none.deinit(std.testing.allocator);
+    try expectNotContainsName(none.advertised_names, "mcp_select_tool");
+    try expectNotContainsName(none.advertised_names, "capability_search");
+    try expectContainsName(none.advertised_names, "read_file");
+
+    var skills_only = try buildTestModelToolProjection(std.testing.allocator, .{ .mcp_available = false });
+    defer skills_only.deinit(std.testing.allocator);
+    try expectNotContainsName(skills_only.advertised_names, "mcp_select_tool");
+    try expectContainsName(skills_only.advertised_names, "capability_search");
+
+    var mcp_only = try buildTestModelToolProjection(std.testing.allocator, .{ .skills_available = false });
+    defer mcp_only.deinit(std.testing.allocator);
+    try expectContainsName(mcp_only.advertised_names, "mcp_select_tool");
+    try expectContainsName(mcp_only.advertised_names, "capability_search");
 }
 
 test "subagent and shell selection follow host capability" {

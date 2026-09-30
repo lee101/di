@@ -629,7 +629,7 @@ describe("web_search Gateway fixture", () => {
           ).toHaveLength(1);
         }
         expect(toolByName(initial, "web_fetch")?.description).toContain(
-          "broad or current web research",
+          "known public HTTP(S) URL",
         );
         expect(toolByName(initial, "web_fetch")?.description).not.toContain(
           "web_search",
