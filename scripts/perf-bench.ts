@@ -27,6 +27,7 @@ if (process.env.MIRRORHOME) {
     } catch {}
   }
 }
+if (process.env.PROFILE_SLEEP) writeFileSync(join(home, ".bash_profile"), `sleep ${process.env.PROFILE_SLEEP}\nexport FX_HEAVY=1\n`);
 writeFileSync(join(ws, "big.txt"), "x".repeat(200) + "\n");
 const t0 = performance.now();
 let n = 0;

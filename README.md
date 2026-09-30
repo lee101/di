@@ -192,6 +192,25 @@ How the cycle runs:
 
 Autonomous mode requires session saving and cannot be combined with `--no-save`. Pair it with `--json` to get one parseable result object per turn on stdout.
 
+### Goal mode
+
+`--auto-next-goal` pursues one persistent objective per workspace until the model reports it done, blocked, or a budget runs out. State lives in a one-line JSON file under `~/.fx/goals/`, so a later `di ask --auto-next-goal` with no prompt resumes it (same saved session when it still exists).
+
+```bash
+di ask --auto-next-goal --goal-turns 12 --goal-tokens 400k --goal-time 45m --yolo "migrate the parser to the new AST"
+di ask --auto-next-goal --yolo                # resume the saved goal for this workspace
+```
+
+Each iteration prints one status line to stderr, for example `[goal] #3 continue | tok 41.2k/400.0k | turns 3/12 | 4m12s | wrote parser tests`.
+
+Protocol: every reply ends with `GOAL: continue|complete|blocked`, `PROGRESS: <one line>`, and `EVIDENCE:` (required for `complete`) or `BLOCKER:` (for `blocked`). `complete` without evidence is ignored; `blocked` must be reported on two consecutive turns. Guards: an unchanged `PROGRESS` line, or replies with no protocol lines and no tool calls, count as no progress and stop the loop after three in a row (`stalled`); a token, turn or time budget stops it as `budget-limited` after a wrap-up hint on the last turn. Exit status is 0 only for `complete`; the final status line and `~/.fx/goals` record the exact state.
+
+In the TUI, `/goal OBJECTIVE [--tokens N] [--turns N] [--time D]` starts a goal and continues automatically after each completed turn; `/goal` shows it, and `/goal pause`, `/goal resume`, `/goal clear` and `/goal budget --tokens N --turns N --time D` manage it. Pausing from another terminal also stops a running `di ask` loop after its current turn.
+
+### Storage and shell performance
+
+`di storage` (hidden) reports `~/.fx` usage, compresses file-index caches and cold session tool results with zstd (`compact`, reversible with `restore`, results are restored lazily on read), and never deletes data. The user login shell environment is captured once and cached in `~/.fx/cache/shell-snapshot` so later commands skip the login profile; set `FX_SHELL_SNAPSHOT=0` to disable. See `docs/perf-goals-disk.md`.
+
 ## di improves di
 
 di can act as a subagent on its own repository. Every iteration starts from a
