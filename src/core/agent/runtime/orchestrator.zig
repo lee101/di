@@ -7515,6 +7515,7 @@ fn processQueuedPromptLoop(
                 .auto;
             const request_data = agent_stream_provider.RequestData{
                 .model = gateway_model,
+                .session_id = lifecycle.scope.session_id,
                 .instructions = gateway_instructions.items,
                 .messages = request_messages,
                 .tools = .{

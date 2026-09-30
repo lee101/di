@@ -270,6 +270,8 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .mcp_available = ctx.mcp != null,
+            .skills_available = ctx.loaded_skills.skills.len > 0,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -1999,6 +2001,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .mcp_available = ctx.mcp != null,
+        .skills_available = ctx.loaded_skills.skills.len > 0,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
