@@ -9105,7 +9105,7 @@ test "app_input_runtime ctrl+p catalog enter failure restores the draft without 
     // Called directly, so no ingress settle runs after the failure.
     try std.testing.expectError(
         error.OutOfMemory,
-        Runtime(RoutingFakeApp).submitModelMenuSelection(&app),
+        Runtime(RoutingFakeApp).submitModelMenuSelection(&app, 100),
     );
 
     try std.testing.expect(!app.model_cache.menu.active);

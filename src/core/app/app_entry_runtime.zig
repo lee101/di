@@ -1080,7 +1080,7 @@ test "a v2 handoff relaunches and hints with --sessions-v2" {
     try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
     try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
     try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx --sessions-v2 --resume session-123") != null);
+    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "di --sessions-v2 --resume session-123") != null);
 }
 
 test "app entry relaunches only after teardown with the validated handoff" {
@@ -1433,10 +1433,10 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         init_error: anyerror,
         message: []const u8,
     }{
-        .{ .init_error = error.AccessDenied, .message = "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
-        .{ .init_error = error.ReadOnlyFileSystem, .message = "fx: this session cannot be opened for writing: the disk is read-only.\n" },
-        .{ .init_error = error.NoSpaceLeft, .message = "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
-        .{ .init_error = error.FileTooBig, .message = "fx: this session cannot be saved: a file-size limit was reached.\n" },
+        .{ .init_error = error.AccessDenied, .message = "di: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n" },
+        .{ .init_error = error.ReadOnlyFileSystem, .message = "di: this session cannot be opened for writing: the disk is read-only.\n" },
+        .{ .init_error = error.NoSpaceLeft, .message = "di: this session cannot be saved: the disk is full. Free some space, then resume again.\n" },
+        .{ .init_error = error.FileTooBig, .message = "di: this session cannot be saved: a file-size limit was reached.\n" },
     };
     for (cases) |case| {
         var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{ .sessions_v2 = true } } });
@@ -1456,7 +1456,7 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
     defer capture.deinit();
     capture.init_error = error.AccessDenied;
     try std.testing.expectError(error.AccessDenied, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: AccessDenied\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("di: AccessDenied\n", capture.stderr.written());
 }
 
 test "app entry returns failure when terminal closure cannot save the session" {

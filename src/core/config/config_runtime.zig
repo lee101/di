@@ -2806,7 +2806,7 @@ test "skill_symlink_authorities is profile-only and workspace overrides replace 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
 
@@ -2846,7 +2846,7 @@ test "invalid skill_symlink_authorities reports a specific diagnostic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);

@@ -952,7 +952,7 @@ test "resume handoff uses one row only when the full instruction fits" {
     var v2_buffer: [128]u8 = undefined;
     const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        "\x1b[38;5;245mContinue session with: di --sessions-v2 --resume session-123\x1b[0m\n",
         v2,
     );
 }

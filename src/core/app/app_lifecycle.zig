@@ -1539,7 +1539,7 @@ test "loadStartupStatus reports where the selected model came from" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
 
