@@ -3552,8 +3552,11 @@ fn connectServerCancellable(
         // The startup deadline is the connection timeout of record: once the
         // budget is spent without a completed handshake the connection timed
         // out even when the transport wrapped the terminal failure.
-        else => if (control.deadline != null and connectionStartupExpired(io_mod.getIo(), control.deadline.?))
-            error.McpConnectionTimedOut
+        else => if (control.deadline) |deadline|
+            if (connectionStartupExpired(io_mod.getIo(), deadline))
+                error.McpConnectionTimedOut
+            else
+                err
         else
             err,
     };

@@ -6,6 +6,8 @@ const std = @import("std");
 const pairs = [_][2][]const u8{
     .{ "openpaths/stealth/ox-alpha", "xiaomi/mimo-v2.6-pro" },
     .{ "stealth/ox-alpha", "xiaomi/mimo-v2.6-pro" },
+    .{ "openpaths/stealth/space-bunny-alpha", "xiaomi/mimo-v2.6-pro" },
+    .{ "stealth/space-bunny-alpha", "xiaomi/mimo-v2.6-pro" },
 };
 
 pub fn fallbackFor(model: []const u8) ?[]const u8 {
@@ -15,7 +17,7 @@ pub fn fallbackFor(model: []const u8) ?[]const u8 {
     return null;
 }
 
-test "circuit breaker maps stealth ox alpha to the MiMo pro fallback" {
+test "circuit breaker maps the stealth models to the MiMo pro fallback" {
     try std.testing.expectEqualStrings(
         "xiaomi/mimo-v2.6-pro",
         fallbackFor("openpaths/stealth/ox-alpha").?,
@@ -23,6 +25,14 @@ test "circuit breaker maps stealth ox alpha to the MiMo pro fallback" {
     try std.testing.expectEqualStrings(
         "xiaomi/mimo-v2.6-pro",
         fallbackFor("stealth/ox-alpha").?,
+    );
+    try std.testing.expectEqualStrings(
+        "xiaomi/mimo-v2.6-pro",
+        fallbackFor("openpaths/stealth/space-bunny-alpha").?,
+    );
+    try std.testing.expectEqualStrings(
+        "xiaomi/mimo-v2.6-pro",
+        fallbackFor("stealth/space-bunny-alpha").?,
     );
 }
 

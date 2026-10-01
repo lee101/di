@@ -65,5 +65,14 @@
   { "file": "web-search-fake-gateway.test.ts", "weight": 5 },
   { "file": "web-search-live.test.ts", "weight": 1 },
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
-  { "file": "yolo-permission-mode.test.ts", "weight": 29 }
+  { "file": "yolo-permission-mode.test.ts", "weight": 29 },
+  {"file": "capability-search.test.ts", "weight": 5},
+  {"file": "context-files.test.ts", "weight": 5},
+  {"file": "gemini-search-fake.test.ts", "weight": 5},
+  {"file": "gemini-search-live.test.ts", "weight": 1},
+  {"file": "mcp-failure-modes.test.ts", "weight": 30},
+  {"file": "read-tool-result.test.ts", "weight": 5},
+  {"file": "settings-permissions-warning.test.ts", "weight": 5},
+  {"file": "think-tool.test.ts", "weight": 5},
+  {"file": "tui-slash-preferences.test.ts", "weight": 30}
 ]

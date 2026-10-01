@@ -2,6 +2,7 @@ export const CANONICAL_BUILTIN_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "fuzzy_search",
   "edit_file",
   "write_file",
   "shell",
@@ -16,6 +17,7 @@ export const CANONICAL_BUILTIN_NAMES = [
   "web_search",
   "gemini_search",
   "think",
+  "todo",
   "read_tool_result",
   "vision",
 ] as const;
@@ -24,6 +26,7 @@ export const READ_ONLY_SERIALIZED_TOOL_NAMES = [
   "read_file",
   "glob_files",
   "grep_files",
+  "fuzzy_search",
 ] as const;
 
 export const VERIFY_SERIALIZED_TOOL_NAMES = [
@@ -37,9 +40,11 @@ export const WEB_EXA_SERIALIZED_TOOL_NAMES = [
   "exa_search",
 ] as const;
 
-export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES.map(
-  (name) => (name === "web_search" ? "exa_search" : name),
-);
+// Outside ask permission mode the question tool is not advertised, so
+// capability guidance may not reference it.
+export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES
+  .filter((name) => name !== "ask_user_question")
+  .map((name) => (name === "web_search" ? "exa_search" : name));
 
 // Durable-only tools are capability-gated on a writable session. Process-local
 // shell actions remain available without a session store.

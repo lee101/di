@@ -23,6 +23,7 @@ pub fn isReadOnlyCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
         .read_file,
         .read_tool_result,
         .grep_files,
+        .fuzzy_search,
         .skill,
         .web_fetch,
         .web_search,
@@ -51,6 +52,10 @@ fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const To
 
 pub const GroupKind = enum { none, read_only, subagent };
 
+// A model can emit arbitrarily large read groups. Bound the number of native
+// threads, search processes and live result arenas in each scheduler batch.
+const max_parallel_group_calls: usize = 8;
+
 pub const LeadingGroup = struct {
     kind: GroupKind = .none,
     len: usize = 0,
@@ -61,9 +66,9 @@ pub fn leadingParallelGroup(
     calls: []const ToolCall,
 ) LeadingGroup {
     const read_only_len = parallelReadOnlyPrefixLen(registry, calls);
-    if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
+    if (read_only_len > 0) return .{ .kind = .read_only, .len = @min(read_only_len, max_parallel_group_calls) };
     const subagent_len = parallelSubagentPrefixLen(registry, calls);
-    if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
+    if (subagent_len > 0) return .{ .kind = .subagent, .len = @min(subagent_len, max_parallel_group_calls) };
     return .{};
 }
 
@@ -634,6 +639,24 @@ test "parallel classifier keeps only a leading safe read-only group" {
     try std.testing.expect(isReadOnlyCall(registry, calls[0]));
     try std.testing.expect(isReadOnlyCall(registry, calls[1]));
     try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
+}
+
+test "parallel classifier bounds large groups without crossing a mutation" {
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const tools = [_]tool_dispatch.Tool{ builtin_tools.read_file, builtin_tools.write_file };
+    const registry = tool_dispatch.Registry{ .tools = &tools };
+    const reads = [_]ToolCall{toolCall("read", "read_file", "{\"path\":\"README.md\"}")} ** 12;
+    const calls = reads ++ [_]ToolCall{
+        toolCall("write", "write_file", "{\"path\":\"out.txt\",\"content\":\"x\"}"),
+        toolCall("later", "read_file", "{\"path\":\"out.txt\"}"),
+    };
+    const first = leadingParallelGroup(registry, &calls);
+    try std.testing.expectEqual(GroupKind.read_only, first.kind);
+    try std.testing.expectEqual(@as(usize, 8), first.len);
+    const second = leadingParallelGroup(registry, calls[first.len..]);
+    try std.testing.expectEqual(@as(usize, 4), second.len);
+    try std.testing.expectEqual(GroupKind.none, leadingParallelGroup(registry, calls[first.len + second.len ..]).kind);
+    try std.testing.expectEqual(@as(usize, 1), leadingParallelGroup(registry, calls[13..]).len);
 }
 
 test "parallel classifier keeps one leading registered subagent group" {

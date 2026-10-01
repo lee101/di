@@ -678,6 +678,10 @@ async function runUserCardResizeReplayScrollback(
   writeReproScript(manifest);
 
   const fixture = createFixture(runId);
+  // Count user cards independently of the optional session title in the footer.
+  writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({
+    statusLine: { session: false },
+  }));
   const gateway = startLocalGatewayFixture(promptTail);
   let session: RenderLabTmux | null = null;
   try {

@@ -62,6 +62,7 @@ async function startFx(
   withGateway = false,
   recordRender = false,
   gatewayResponseCount = 1,
+  settings: Record<string, unknown> = {},
 ): Promise<TmuxSession> {
   testHome = mkdtempSync(join(tmpdir(), "fx-tui-input-"));
   stderrPath = join(testHome, "stderr.log");
@@ -69,7 +70,7 @@ async function startFx(
   mkdirSync(join(testHome, ".fx"), { recursive: true });
   writeFileSync(
     join(testHome, ".fx", "settings.json"),
-    JSON.stringify({ sandbox: "none" }),
+    JSON.stringify({ sandbox: "none", ...settings }),
   );
   if (withGateway) {
     gateway = startFakeGateway(
@@ -193,7 +194,7 @@ function rowHasBackgroundSgr(row: string): boolean {
 }
 
 test("selected slash row ignores the welcome header help hint", () => {
-  const header = `${SELECTED_COMPLETION_SGR}𝒇x\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
+  const header = `${SELECTED_COMPLETION_SGR}di\x1b[0m\x1b[38;5;245m v0.3.27 · Run /help for commands`;
   const composer = `${SELECTED_COMPLETION_SGR}┃ /\x1b[39m`;
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m Clear the conversation`;
 
@@ -900,7 +901,11 @@ tmuxTest(
 tmuxTest(
   "Ctrl+L redraws without clearing the draft or session",
   async () => {
-    const active = await startFx(80, 24, true, true, 2);
+    // The history marker must only identify transcript content in this test,
+    // not the persistent session title shown by di's default status line.
+    const active = await startFx(80, 24, true, true, 2, {
+      statusLine: { session: false },
+    });
     await setupPromptHistory(active);
     const draft = "CTRL_L_UNSENT_DRAFT";
     await typeLiteral(active, draft);

@@ -167,7 +167,9 @@ pub fn beginExistingMutation() !?Mutation {
     return try lockMutation(fx_dir);
 }
 
-fn beginMutation() !Mutation {
+/// Opens the profile store for writing, creating it when absent. Adoption of an
+/// existing Codex CLI login needs this because di may have no profile yet.
+pub fn beginMutation() !Mutation {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| return session_presence.storageError(auth_file_name, err),

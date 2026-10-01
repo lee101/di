@@ -30,10 +30,10 @@ const sort_utils = @import("../core/shared/sort_utils.zig");
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
 
 const terminal_identity = "You are di, a local coding CLI assistant with tool access.";
-const terminal_rendering = "Write responses in GitHub-flavored Markdown, which fx renders in the terminal.";
-const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since fx already bolds table headers.";
+const terminal_rendering = "Write responses in GitHub-flavored Markdown, which di renders in the terminal.";
+const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since di already bolds table headers.";
 
-/// The base prompt for hosts that present fx inside another application
+/// The base prompt for hosts that present di inside another application
 /// rather than a terminal. Only the terminal identity and rendering claims
 /// differ; a wording change in the base prompt fails the build here.
 pub const embedded_system_prompt = embedded: {
@@ -3371,6 +3371,13 @@ fn permissionModeContext(permission_mode: types.PermissionMode) []const u8 {
     };
 }
 
+fn questionModeContext(permission_mode: types.PermissionMode) []const u8 {
+    return switch (permission_mode) {
+        .ask => "Runtime context: question mode is ask. The question tool opens the real question screen. Use it only when a user-owned decision blocks progress after local files, git state, and tool output cannot answer it.",
+        .auto, .yolo => "Runtime context: question mode is auto answer. The question tool is not advertised and no question screen opens. When a user-owned decision remains after inspection, answer it yourself: choose the most conservative option that still completes the task, state the assumption and its basis in one line, and continue. Never stop the turn to ask, and never block on a decision the repository can settle.",
+    };
+}
+
 const stale_shell_handles_context =
     "Runtime context: fx restarted since this session was last active, so earlier shell session_id handles no longer exist; stopping or interacting with them fails with ExecutionNotFound. Their processes are normally terminated when fx exits but can survive an unclean exit, so check for a survivor before starting a duplicate. Otherwise start fresh shell sessions instead of reusing earlier handles.";
 
@@ -3391,6 +3398,7 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
     try messages.append(arena, .{ .role = .system, .content = content });
     try appendWorkspaceAccessContext(input.access_scope, arena, messages);
     try messages.append(arena, .{ .role = .system, .content = permissionModeContext(input.permission_mode) });
+    try messages.append(arena, .{ .role = .system, .content = questionModeContext(input.permission_mode) });
     if (input.stale_shell_handles) try messages.append(arena, .{
         .role = .system,
         .content = stale_shell_handles_context,
@@ -3501,12 +3509,16 @@ test "runtime context composes exact auto mode with noninteractive blockers" {
     try expectContains(messages.items[0].content.?, "surface a concrete blocker in freeform text");
     try expectContains(messages.items[0].content.?, "Do not recommend or label one option as preferred");
     try expectNotContains(messages.items[0].content.?, "ask_user_question");
-    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqual(@as(usize, 3), messages.items.len);
     try std.testing.expectEqual(types.ChatRole.system, messages.items[1].role);
     try std.testing.expectEqualStrings(
         "Runtime context: permission mode is auto. After configured rules, session grants, and deterministic safe-tool authority, fx sends each unresolved action to a narrow safety reviewer. A clear result authorizes only that exact action. A caution or unavailable result holds only that action and returns advice without opening a permission screen, disabling tools, or ending the turn. Exact cautions are reused for this turn; choose a materially different safe action or explain why no safe path remains. Tool admission and exact live revalidation remain authoritative.",
         messages.items[1].content.?,
     );
+    try std.testing.expectEqual(types.ChatRole.system, messages.items[2].role);
+    try expectContains(messages.items[2].content.?, "question mode is auto answer");
+    try expectContains(messages.items[2].content.?, "The question tool is not advertised");
+    try expectContains(messages.items[2].content.?, "Never stop the turn to ask");
 }
 
 test "runtime context lists active added roots without treating them as instructions" {
@@ -3607,7 +3619,7 @@ test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
     try expectDefaultPromptDoesNotContain("use markdown unless requested");
-    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which fx renders in the terminal.");
+    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which di renders in the terminal.");
     try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
     try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
     try expectDefaultPromptContains("answer simple questions in plain sentences");
@@ -3644,6 +3656,10 @@ test "gateway_system_prompt: focused tools and live verification" {
 
 test "gateway_system_prompt: static guidance is capability-neutral" {
     inline for (&.{
+        "fuzzy_search",
+        "gemini_search",
+        "grep_files",
+        "glob_files",
         "run_command",
         "web_fetch",
         "web_search",

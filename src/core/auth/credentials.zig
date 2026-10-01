@@ -649,7 +649,7 @@ pub fn sourcePresence(
             .missing
         else
             secret_store.presence(),
-        .chatgpt_subscription => chatgpt_session.presence(),
+        .chatgpt_subscription => chatgpt_oauth.presence(),
         .grok_subscription => grok_session.presence(),
         .host_managed, .configured => .missing,
     };

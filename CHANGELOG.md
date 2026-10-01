@@ -54,11 +54,16 @@
 
 ### New Features
 
-- **Default model:** fx now uses Grok 4.7 as its default model. Fast mode remains opt-in.
+- **Semantic code discovery:** `fuzzy_search` queries an existing local zbed index with bounded results. Exact search through `grep_files` or `rg` and grounded web research through `gemini_search` remain available.
+- **Full access by default:** fx now starts in full access. Tool lookup, argument validation, cancellation, limits, operating-system permissions, and remote authentication stay authoritative, and no approval screen or automatic safety review gates an action. Press `BTab` or set `permission_mode` to `auto` or `ask` when you want the bounded safety review or approval-before-change behavior back.
+- **Auto answer:** Questions no longer interrupt. Outside `ask` mode the question tool is not advertised and no question screen opens, so the agent answers its own question with the most conservative option that still completes the task, states the assumption, and continues. `ask` mode still opens the real screen.
+- **Default model:** fx now starts on Space Bunny Alpha on either route, so an OpenPaths key no longer switches the default away from it. Both stealth routes still fail over to MiMo 2.6 Pro.
+- **Task planning:** The agent now has a `todo` tool that keeps a phased task list for the session and reports the active phase and open work after every change.
 - **Custom connections:** fx now supports named OpenAI Chat Completions connections for local servers and other gateways. Configure them in `~/.fx/settings.json`, then select one with `fx provider <name>` or `FX_PROVIDER`.
 - **Provider routing:** Gateway users can set `provider_order` and `provider_strict`, or pass `--provider-order` and `--provider-strict`, to prefer or restrict which providers serve a model.
 - **Interactive flags:** Interactive sessions accept `--provider`, `--model`, `--effort`, and `--fast`; `fx ask` accepts `--model`, `--effort`, and `--fast` for one run without changing saved preferences. Grok models now support Fast mode.
 - **Slack bot:** fx can now install and manage your Slack workspace bot from the CLI.
+- **Codex CLI sign-in:** A ChatGPT plan already signed in with the OpenAI Codex CLI (`~/.codex/auth.json`, or `$CODEX_HOME/auth.json`) now works without a second login: di adopts that session into its own profile on first use and leaves the CLI's file untouched.
 - **Custom themes:** fx now loads custom TUI themes from `~/.fx/themes/<name>.json`, including VS Code themes. Set `theme` in `~/.fx/settings.json` or use `FX_THEME`.
 - **Image reading:** `read_file` now attaches PNG, JPEG, GIF, and WebP files to supported vision models.
 - **libfx steering:** libfx turns support `turn.steer()` for mid-turn guidance. Applied steering arrives as a `user_message` event and remains in checkpoints.
@@ -68,6 +73,8 @@
 
 ### Improvements
 
+- **Search efficiency:** Eligible recursive text searches in clean full-access shells use ripgrep with an automatic fallback when it is unavailable. Other grep commands and exact approvals retain their original behavior.
+- **Bounded parallel work:** Large groups of independent tool calls run in batches of at most eight to reduce thread and memory spikes while preserving result order.
 - **Recovery:** Transient model failures now retry until the connection recovers. Silent streams use liveness checks, and retries slow to once a minute after 15 minutes.
 - **Session resume:** `/resume` opens up to 60× faster with better session caching.
 - **File suggestions:** `@` file suggestions are 6–40× faster with a saved index and background scanning.
@@ -82,8 +89,11 @@
 - **Subagents:** Subagent rows show the child's model, effort, token use, and task status. Exact and unambiguous partial model names now work in subagent overrides.
 - **Faster exits:** Double `Ctrl+C` exits up to 40× faster when MCP servers are stuck, and no longer waits on upgrade downloads.
 - **Command rendering:** Command rows now resize with the terminal, giving long shell commands cleaner rendering.
+- **Codex models:** The permission reviewer and session titles follow the subscription's own catalog, preferring the newest `gpt-6-luna` / `gpt-5.6-luna` a plan serves. A catalog that stops carrying a pinned model no longer disables the Codex model list.
 
 ### Bug Fixes
+
+- **Resumed model settings:** Reopening a session preserves reasoning and Fast options by keeping an unchanged model-catalog fetch alive.
 
 - **Multiple images:** Reading multiple images in one turn no longer crashes fx, and images returned by tools now reach vision models through Gateway.
 - **Image accounting:** Tool images no longer count as text during request estimation. Automatic compaction now uses the real image cost.
@@ -103,7 +113,7 @@
 ### Security
 
 - **Custom connection credentials:** Custom connections read credentials only from their named environment variable, and committed project configuration cannot define model endpoints. Saved sessions refuse to resume against a changed endpoint or authentication identity.
-- **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
+- **Review model:** Set `review_model` or `FX_REVIEW_MODEL` to choose the model used for auto-mode safety reviews, for the Codex subscription as well as the Gateway. Review transport failures and malformed replies retry once; cautions never retry for approval, and an unresolved action stays blocked.
 - **Safe tool errors:** Tool failure details now redact secrets and escape terminal control sequences before rendering.
 
 ## 0.0.10

@@ -2637,7 +2637,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           await session.waitForText(finalText, TIMEOUT);
         } else {
           await session.sendInterruptEscapePair(TIMEOUT);
-          await session.waitForText("What can fx do differently?", TIMEOUT);
+          await session.waitForText("What can di do differently?", TIMEOUT);
         }
         await session.waitForPane((pane) => !pane.includes("Thinking") && hasEmptyComposer(pane), TIMEOUT);
         const scrollback = await session.captureFullScrollback();
@@ -2850,12 +2850,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await session!.sendInterruptEscapePair(TIMEOUT);
-      await session!.waitForText("What can fx do differently?", TIMEOUT);
+      await session!.waitForText("What can di do differently?", TIMEOUT);
       await session!.waitForComposer(TIMEOUT);
       const scrollback = await session!.captureFullScrollback();
 
       expect(queuedGateway.requests).toHaveLength(3);
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("What can di do differently?");
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
       expect(scrollback).not.toContain("request failed: ModelError");
@@ -3323,7 +3323,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(hold.cancelled).toBe(false);
       await session.sendKeys("C-c");
       const cancelledPane = await session.waitForText(
-        "What can fx do differently?",
+        "What can di do differently?",
         TIMEOUT,
       );
 
@@ -3413,7 +3413,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForText("Thinking", TIMEOUT);
       await Bun.sleep(250);
       await session.sendKeys("C-c");
-      await session.waitForText("What can fx do differently?", TIMEOUT);
+      await session.waitForText("What can di do differently?", TIMEOUT);
 
       execFileSync(FX_BIN, ["replay", tapePath, "--frames-dir", framesRoot], {
         encoding: "utf8",
@@ -4661,7 +4661,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("C-c");
       const afterFirst = await session.waitForText(
-        "What can fx do differently?",
+        "What can di do differently?",
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
@@ -4672,7 +4672,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollbackAfterFirst = await session.captureFullScrollbackEscapes();
       expect(
-        countOccurrences(scrollbackAfterFirst, "What can fx do differently?"),
+        countOccurrences(scrollbackAfterFirst, "What can di do differently?"),
       ).toBe(1);
 
       await session.sendKeys("C-c");
@@ -4684,9 +4684,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       const scrollback = await session.captureFullScrollback();
       const trace = readFileSync(tracePath, "utf8");
-      expect(scrollback).toContain("What can fx do differently?");
+      expect(scrollback).toContain("What can di do differently?");
       expect(
-        countOccurrences(scrollback, "What can fx do differently?"),
+        countOccurrences(scrollback, "What can di do differently?"),
       ).toBe(1);
       expect(scrollback).not.toContain("system: cancelled");
       expect(scrollback).not.toContain("Cancelling");
@@ -4858,7 +4858,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(observed.stderr).toBe(
           stage === "baseline-silent"
             ? ""
-            : "fx: LifecycleReconciliationCollision\n",
+            : "di: LifecycleReconciliationCollision\n",
         );
         return;
       }
@@ -5912,7 +5912,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(compact).not.toContain("Managed subagent");
         await session.resizeWindow(45, 30);
         await session.waitForText(finalText, TIMEOUT);
-        const narrow = await session.capturePane();
+        const narrow = await session.captureFullScrollback();
         expect(narrow).toContain("reviewer replied · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");

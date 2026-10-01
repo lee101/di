@@ -1117,6 +1117,10 @@ fn parseCatalog(
         if (value != .object) continue;
         const raw_id = stringField(value.object, "id") orelse continue;
         if (raw_id.len == 0 or raw_id.len > max_model_id_bytes) continue;
+        // Only a chat model can answer a turn. Embedding, speech, image, video
+        // and 3D entries answer a different endpoint entirely, so listing them
+        // offers a selection that cannot work once it is made.
+        if (!isChatModel(value.object, raw_id)) continue;
         const id = try alloc.dupe(u8, raw_id);
         errdefer alloc.free(id);
         const model_type = try alloc.dupe(u8, "language");
@@ -1130,6 +1134,78 @@ fn parseCatalog(
     }
     return catalog;
 }
+
+/// A catalog entry is selectable when the provider says so, or -- for
+/// providers that publish no type -- when its id does not name a non-chat
+/// service. Provider types are authoritative because they survive vendor
+/// prefixes, aliases, and re-spellings; the id fallback keeps catalogs that
+/// omit the field from filling the picker with unusable models.
+fn isChatModel(object: std.json.ObjectMap, id: []const u8) bool {
+    if (object.get("type")) |type_value| {
+        if (type_value == .string) return std.ascii.eqlIgnoreCase(type_value.string, "language");
+        return true;
+    }
+    if (billedForNonChatWork(object)) return false;
+    return !namesNonChatService(id);
+}
+
+/// A catalog that publishes pricing lets the same signals the provider
+/// classifies on decide the answer, so a media model is caught even when its
+/// id names no service -- "fal-ai/flux-2-pro/outpaint" is billed per image and
+/// is not a language model. Every field is optional: a catalog that omits
+/// pricing leaves this false and the id check stands alone.
+fn billedForNonChatWork(object: std.json.ObjectMap) bool {
+    if (unsignedField(object, "max_output_tokens") == 0) return true;
+    const pricing = objectMapField(object, "pricing") orelse return false;
+    if (costField(pricing, "output_per_1m_tokens") == 0) return true;
+    for ([_][]const u8{
+        "per_image",
+        "per_megapixel",
+        "first_megapixel",
+        "extra_megapixel",
+        "per_input_image",
+        "per_video",
+        "per_second",
+        "per_minute",
+        "per_hour",
+        "per_1m_characters",
+    }) |key| {
+        if ((costField(pricing, key) orelse 0) > 0) return true;
+    }
+    return false;
+}
+
+fn namesNonChatService(id: []const u8) bool {
+    var buffer: [max_model_id_bytes]u8 = undefined;
+    if (id.len > buffer.len) return false;
+    const lowered = std.ascii.lowerString(buffer[0..id.len], id);
+    for (non_chat_service_markers) |marker| {
+        if (std.mem.indexOf(u8, lowered, marker) != null) return true;
+    }
+    return false;
+}
+
+/// Matched anywhere in the id, so a vendor prefix cannot hide a service behind
+/// one: "cdom/openpaths/qwen-embed-8b" is an embedding model like any other.
+const non_chat_service_markers = [_][]const u8{
+    "embed",
+    "whisper",
+    "-stt",
+    "transcri",
+    "-tts",
+    "moderation",
+    "rerank",
+    "clip",
+    "voice",
+    "realtime",
+    "music",
+    "sfx",
+    "3d",
+    "video",
+    "image",
+    "chronos",
+    "forecast",
+};
 
 /// Tri-state: true when input_modalities contains "image", false when the array
 /// exists without it, null when architecture/modalities data is absent.
@@ -1342,7 +1418,7 @@ fn normalizeCreatedAtMs(raw: ?i64) error{InvalidGenerationRecord}!i64 {
     return value;
 }
 
-test "parse catalog keeps every id the models endpoint returns" {
+test "parse catalog keeps every chat id the models endpoint returns" {
     const body =
         \\{"data":[{"id":"xiaomi/mimo-v2.6-pro"},{"id":"xiaomi/mimo-v2.6-flash"},{"id":"brand-new/vendor-model"},{"id":"zai/glm-5.2"}]}
     ;
@@ -1353,6 +1429,65 @@ test "parse catalog keeps every id the models endpoint returns" {
     try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-flash", catalog.items[1].id);
     try std.testing.expectEqualStrings("brand-new/vendor-model", catalog.items[2].id);
     try std.testing.expectEqualStrings("zai/glm-5.2", catalog.items[3].id);
+}
+
+test "parse catalog drops models that only serve embeddings, speech, or media" {
+    const body =
+        \\{"data":[
+        \\  {"id":"openpaths-embed"},
+        \\  {"id":"cdom/openpaths/qwen-embed-8b"},
+        \\  {"id":"hailuo-video"},
+        \\  {"id":"pocket-tts"},
+        \\  {"id":"whisper-large-v3-turbo"},
+        \\  {"id":"grok-voice-fast"},
+        \\  {"id":"pixal3d-image-to-3d"},
+        \\  {"id":"chronos2"},
+        \\  {"id":"gpt-5"},
+        \\  {"id":"openpaths/qwen3.8-27b-uncensored"}
+        \\]}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings("gpt-5", catalog.items[0].id);
+    try std.testing.expectEqualStrings("openpaths/qwen3.8-27b-uncensored", catalog.items[1].id);
+}
+
+test "parse catalog drops media models priced per unit the id never names" {
+    const body =
+        \\{"data":[
+        \\  {"id":"fal-ai/flux-2-pro/outpaint","max_output_tokens":null,"pricing":{"first_megapixel":0.033,"extra_megapixel":0.0165}},
+        \\  {"id":"gpt-realtime-2.1","max_output_tokens":4096,"pricing":{"input_per_1m_tokens":1,"output_per_1m_tokens":4,"per_hour":3}},
+        \\  {"id":"vendor/billed-per-image","max_output_tokens":4096,"pricing":{"input_per_1m_tokens":1,"output_per_1m_tokens":4,"per_image":0.02}},
+        \\  {"id":"vendor/no-output-tokens","pricing":{"input_per_1m_tokens":1,"per_request":0.1}},
+        \\  {"id":"vendor/chat-with-pricing","max_output_tokens":8192,"pricing":{"input_per_1m_tokens":1,"output_per_1m_tokens":8}},
+        \\  {"id":"vendor/chat-without-pricing","max_output_tokens":8192}
+        \\]}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings("vendor/chat-with-pricing", catalog.items[0].id);
+    try std.testing.expectEqualStrings("vendor/chat-without-pricing", catalog.items[1].id);
+}
+
+test "parse catalog trusts a provider type over the id" {
+    const body =
+        \\{"data":[
+        \\  {"id":"gpt-5","type":"language"},
+        \\  {"id":"Acme/Chat-Model","type":"LANGUAGE"},
+        \\  {"id":"vendor/looks-chat","type":"embedding"},
+        \\  {"id":"vendor/looks-embed","type":"language"},
+        \\  {"id":"vendor/no-type-here"}
+        \\]}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    try std.testing.expectEqualStrings("gpt-5", catalog.items[0].id);
+    try std.testing.expectEqualStrings("Acme/Chat-Model", catalog.items[1].id);
+    try std.testing.expectEqualStrings("vendor/looks-embed", catalog.items[2].id);
+    try std.testing.expectEqualStrings("vendor/no-type-here", catalog.items[3].id);
 }
 
 test "parse catalog maps image input modalities to true claims" {

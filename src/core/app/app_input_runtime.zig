@@ -2781,7 +2781,16 @@ pub fn Runtime(comptime App: type) type {
             };
             defer if (selected.id.len > 0) app.alloc.free(selected.id);
 
+            // Ctrl+P and `/model` both continue into the inline effort and
+            // fast stages. A Ctrl+P draft stays stashed while those stages
+            // borrow the composer; settleModelPickerDraft hands it back once
+            // the flow ends, and a failure here hands it back immediately.
             errdefer restoreModelPickerDraft(app);
+            // A catalog row served by another credential or provider is
+            // applied by switching to that origin. The inline effort and fast
+            // stages only describe the provider already active, so a cross
+            // provider switch settles the flow instead of continuing it, and
+            // closeModelMenu hands the composer back to a stashed draft.
             if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
                 if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
                     recordModelSelectionHistory(app, max_prompt_history, selected.id);

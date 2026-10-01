@@ -390,9 +390,9 @@ pub fn malformedToolArgumentsJson(
     return toolExecutionFailureJson(alloc, .{
         .tool_name = tool_name,
         .message = switch (found.failure) {
-            .truncated => "Tool arguments ended before the JSON was complete, so fx did not run the call. The conversation shows its arguments as {}.",
-            .syntax_error => "Tool arguments were not valid JSON, so fx did not run the call. The conversation shows its arguments as {}.",
-            .rejected_value => "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.",
+            .truncated => "Tool arguments ended before the JSON was complete, so di did not run the call. The conversation shows its arguments as {}.",
+            .syntax_error => "Tool arguments were not valid JSON, so di did not run the call. The conversation shows its arguments as {}.",
+            .rejected_value => "Tool arguments repeated an object key or held a value di cannot accept, so di did not run the call. The conversation shows its arguments as {}.",
         },
         .details = details[0..count],
         .suggestion = switch (found.failure) {

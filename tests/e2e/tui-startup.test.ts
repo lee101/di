@@ -71,7 +71,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
   test(
-    "statusline hides the workspace identity by default",
+    "statusline shows the workspace identity by default",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-statusline-default-")));
       const home = join(root, "home");
@@ -99,8 +99,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
 
         const pane = await session.waitForComposer(10_000);
-        expect(pane).not.toContain("workspace-default-hidden");
-        expect(pane).not.toContain("default-hidden-branch");
+        expect(pane).toContain("workspace-default-hidden");
+        expect(pane).toContain("default-hidden-branch");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -255,7 +255,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
 
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `di v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -680,7 +680,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       session = await TmuxSession.create({ env });
 
-      const initial = await session.waitForText("Welcome to fx", TIMEOUT);
+      const initial = await session.waitForText("Welcome to di", TIMEOUT);
       expect(initial).toContain("Sign in with Vercel");
       expect(initial).toContain("Add an API key");
       expect(initial).toContain("esc to set up later");
@@ -690,14 +690,14 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
 
       await session.sendKeys("Escape");
       const skipped = await session.waitForPane(
-        (pane) => !pane.includes("Welcome to fx") && !pane.includes("Sign in with Vercel"),
+        (pane) => !pane.includes("Welcome to di") && !pane.includes("Sign in with Vercel"),
         TIMEOUT,
       );
       expect(skipped).not.toContain("Add an API key");
 
       await session.kill();
       session = await TmuxSession.create({ env });
-      const restarted = await session.waitForText("Welcome to fx", TIMEOUT);
+      const restarted = await session.waitForText("Welcome to di", TIMEOUT);
       expect(restarted).toContain("Sign in with Vercel");
       expect(restarted).toContain("Add an API key");
     },

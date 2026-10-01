@@ -1317,7 +1317,7 @@ fn slack_bridge_config(alloc: Allocator, endpoint: []const u8, client_config: Cl
 
 pub fn authentication_error_message(err: anyerror) []const u8 {
     return switch (err) {
-        error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than fx requires. Authorization was not started. Custom scope subsets are not supported for the fx app. Remove the local scopes override only if you want to authorize the full shared scope set",
+        error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than di requires. Authorization was not started. Custom scope subsets are not supported for the di app. Remove the local scopes override only if you want to authorize the full shared scope set",
         else => @errorName(err),
     };
 }

@@ -15,6 +15,7 @@ const terminal_managed_observer = @import("../../core/terminal/managed_observer.
 const terminal_operation = @import("../../core/terminal/operation.zig");
 const terminal_store = @import("../../core/terminal/store.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const search_rewrite = @import("../../core/shell_command/search_rewrite.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -556,12 +557,18 @@ fn callRun(
             .{@errorName(err)},
         ) };
     };
+    const optimized_command = try acceleratedSearchCommand(request_arena, authority, .{
+        .command = command,
+        .resolved_cwd = cwd,
+        .target_os = builtin.os.tag,
+        .environment = environment,
+    });
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
-        .command = command,
+        .command = optimized_command orelse command,
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
@@ -588,6 +595,59 @@ fn callRun(
     };
     defer prepared.deinit(ctx.allocator);
     return finishPrepared(ctx, runtime, &prepared, .command);
+}
+
+fn acceleratedSearchCommand(
+    alloc: Allocator,
+    authority: command_admission.CommandExecutionAuthority,
+    command_ctx: command_admission.CommandContext,
+) Allocator.Error!?[]u8 {
+    // Exact approvals, user shell functions/aliases and interactive sessions
+    // must retain the original command. Full access is the only authority
+    // that permits this execution optimization without a second approval.
+    if (command_ctx.execution_mode != .captured) return null;
+    if (command_ctx.target_os != .linux and command_ctx.target_os != .macos) return null;
+    const shell = switch (command_ctx.environment) {
+        .clean => |path| std.fs.path.basename(path),
+        else => return null,
+    };
+    if (!std.mem.eql(u8, shell, "bash") and !std.mem.eql(u8, shell, "zsh")) return null;
+    switch (authority) {
+        .shell_allowed => |allowed| {
+            if (allowed.source != .yolo or !allowed.fingerprint.matches(command_ctx)) return null;
+        },
+        else => return null,
+    }
+    return search_rewrite.rewrite(alloc, command_ctx.command);
+}
+
+test "search rewrite retains exact approvals and user shell semantics" {
+    const alloc = std.testing.allocator;
+    const ctx = command_admission.CommandContext{
+        .command = "grep -ranFH needle src",
+        .resolved_cwd = "/tmp",
+        .target_os = .linux,
+        .environment = .{ .clean = "/bin/bash" },
+    };
+    inline for (std.meta.tags(command_admission.ShellAuthorizationSource)) |source| {
+        const result = try acceleratedSearchCommand(alloc, .{ .shell_allowed = .{
+            .fingerprint = .init(ctx),
+            .source = source,
+        } }, ctx);
+        defer if (result) |command| alloc.free(command);
+        try std.testing.expectEqual(source == .yolo, result != null);
+    }
+    const authority = command_admission.CommandExecutionAuthority{ .shell_allowed = .{
+        .fingerprint = .init(ctx),
+        .source = .yolo,
+    } };
+    var changed = ctx;
+    changed.command = "grep -ranFH other src";
+    try std.testing.expectEqual(@as(?[]u8, null), try acceleratedSearchCommand(alloc, authority, changed));
+    changed = ctx;
+    changed.environment = .{ .user = "/bin/bash" };
+    try std.testing.expectEqual(@as(?[]u8, null), try acceleratedSearchCommand(alloc, authority, changed));
+    try std.testing.expectEqual(@as(?[]u8, null), try acceleratedSearchCommand(alloc, .{ .direct_only = .init(ctx) }, ctx));
 }
 
 fn callInteract(

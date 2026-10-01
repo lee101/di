@@ -13,6 +13,7 @@ const permission_gate = @import("../permissions/permission_gate.zig");
 const change_tracker = @import("../workspace/change_tracker.zig");
 const read_tracker_mod = @import("../workspace/read_tracker.zig");
 const session_child_store = @import("../session/session_child_store.zig");
+const todo_state = @import("../session/todo_state.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_runner = @import("../execution/command_runner.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
@@ -272,6 +273,10 @@ pub const DispatchContext = struct {
     managed_executions: ?*managed_execution.Runtime = null,
     tool_result_dir: ?[]const u8 = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
+    /// Session-scoped todo list the `todo` tool reads and writes. Null when the
+    /// caller has no live session, which the tool reports as a failure rather
+    /// than silently keeping the list somewhere the model cannot reach.
+    session_todo: ?*todo_state.Session = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     terminal_client: ?*terminal_client_runtime.Runtime = null,
     terminal_owner_session_id: ?[]const u8 = null,
@@ -393,6 +398,7 @@ pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
 pub const ExecutorKind = enum {
     glob_files,
     grep_files,
+    fuzzy_search,
     read_file,
     read_tool_result,
     write_file,
@@ -401,6 +407,7 @@ pub const ExecutorKind = enum {
     web_search,
     gemini_search,
     think,
+    todo,
     run_command,
     terminal,
     skill,

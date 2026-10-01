@@ -2458,7 +2458,7 @@ pub fn Runtime(comptime App: type) type {
                             try app.writeDomainNotice(.{
                                 .topic = "recovery",
                                 .tone = .warning,
-                                .body = "fx quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
+                                .body = "di quit unexpectedly while this response was recovering, so it was not restarted. Send \"continue\" to retry it, or a new message to move on.",
                             }, true);
                         },
                         .auto_continue => {

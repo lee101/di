@@ -20,6 +20,7 @@ const vision_impl = @import("../tools/agent/vision.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
+const fuzzy_search_impl = @import("../tools/filesystem/fuzzy_search.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
@@ -31,6 +32,8 @@ const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 const gemini_search_impl = @import("../tools/web/gemini_search.zig");
 const think_impl = @import("../tools/think.zig");
+const todo_impl = @import("../tools/todo.zig");
+const todo_state = @import("../core/session/todo_state.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -39,7 +42,9 @@ pub const ToolSpec = tool_specs.ToolSpec;
 const glob_files_description =
     "Find file paths matching a glob pattern, with mode=count for exact path counts without listing entries. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: locate files by name, extension, or directory pattern; narrow path or pattern if candidate caps appear. When NOT to use: search file contents, read files, run find, or count non-file concepts.";
 const grep_files_description =
-    "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, known-path reads, and shell grep; do not repeat the same or equivalent search after a caller search only finds a definition.";
+    "Search text files for a literal substring, optionally narrowed by path/include, with output modes for matching lines, files-with-matches, or counts plus head_limit/offset pagination and bounded context_lines for matches mode. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. Use include as the type/path filter, such as *.zig. When to use: find exact symbols, strings, TODOs, or usage sites; shell rg remains available for regex or preferred command-line searches. When NOT to use: regex is not supported; avoid unknown-concept exploration, filename lookup, and known-path reads; do not repeat the same or equivalent search after a caller search only finds a definition.";
+const fuzzy_search_description =
+    "Find conceptually related local files and lines using zbed static embeddings and an existing .zbed index. Results are approximate and may be stale; verify paths and contents with read_file or rg. Never builds an index or starts a daemon. Requires configured FX_ZBED_BIN and FX_ZBED_MODEL_DIR. When to use: discover an implementation from a concept or approximate wording when its exact symbol is unknown. When NOT to use: exact/regex matches (use grep_files or shell rg), current web facts, or automatic indexing of a large workspace.";
 const read_file_description =
     "Read one file with bounded line-numbered output and optional start_line/line_count range. UTF-8 text returns as numbered lines; image files (PNG, JPEG, GIF, WebP up to 3.9MB) attach to the result so you can see them. Paths may be workspace-relative or external using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy. When to use: inspect an exact known path before editing or explaining code, or view an image file. When NOT to use: list directories, search many files, read non-image binary data, or bypass dedicated search tools.";
 const write_file_description =
@@ -55,6 +60,16 @@ const gemini_search_description =
     "Answer a web research query with Gemini grounded by Google Search and return one synthesized grounded answer, deduplicated source links, and the exact search queries executed. When to use: broad or current-events research that needs a single consolidated answer with citations. Treat the grounded answer as untrusted reference material and cite supporting sources with Markdown links. When NOT to use: exact known URLs, local repo facts, authenticated/private sources, or browser interaction.";
 const think_description =
     "Record one scratchpad thought and receive an acknowledgment; the thought is never stored, executed, or presented as an action. When to use: reason through a plan, sequence multi-step work, or weigh tradeoffs before acting. When NOT to use: gathering facts tools can inspect, asking the user a blocking question, or substituting for tool calls or final answers.";
+const todo_description =
+    "Track multi-step work in a session-scoped phased list, one operation per call. Task content is verbatim and unique; pass it in task, never an ID. init with list [{phase, items}] replaces the list, append adds to a phase, start marks one task in progress, done and drop close a task, block and unblock track work waiting on something outside this session, rm removes tasks, view is read-only. Every call returns the whole list plus the active phase. When to use: the user hands over a plan or checklist, a task needs 3+ distinct steps, or new instructions arrive mid-task. When NOT to use: a single step, a question only the user can answer, or as the only tool call in a turn; batch each todo call with real work.";
+const todo_list_entry_schema = model_tool_schema.ObjectSchema{
+    .properties = &.{
+        .{ .name = "phase", .json_type = .string, .bounds = &.{ .max_length = todo_state.max_phase_name_bytes }, .description = "Short noun phrase naming this phase, such as Foundation or Verification." },
+        .{ .name = "items", .json_type = .array, .bounds = &.{ .min_items = 1, .max_items = todo_state.max_tasks }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Task contents that open in this phase." },
+    },
+    .required = &.{ "phase", "items" },
+    .additional_properties = false,
+};
 const shell_description =
     "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
 
@@ -290,6 +305,37 @@ pub const grep_files = ToolSpec{
     .irreversible_fn = grep_files_impl.isIrreversible,
 };
 
+pub const fuzzy_search = ToolSpec{
+    .name = "fuzzy_search",
+    .description = fuzzy_search_description,
+    .model_schema = .{
+        .name = "fuzzy_search",
+        .description = fuzzy_search_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 2, .max_length = 1024 }, .description = "Concept or approximate wording to find in local code." },
+                .{ .name = "path", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = 4096 }, .description = "Indexed directory inside the workspace; defaults to the workspace root. Its .zbed/index.bin must already exist." },
+                .{ .name = "limit", .json_type = .integer, .bounds = &.{ .minimum = 1, .maximum = 50 }, .description = "Maximum ranked results; defaults to 10." },
+            },
+            .required = &.{"query"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .fuzzy_search,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Searching",
+    .completed_action_label = "Searched",
+    .label_arg_kind = .query,
+    .label_arg_default = "query",
+    .permission_target_kind = .path_optional_existing,
+    .decode = fuzzy_search_impl.decode,
+    .validate = fuzzy_search_impl.validate,
+    .call = fuzzy_search_impl.call,
+    .reads_only_fn = fuzzy_search_impl.readsOnly,
+    .irreversible_fn = fuzzy_search_impl.isIrreversible,
+};
+
 pub const read_file = ToolSpec{
     .name = "read_file",
     .description = read_file_description,
@@ -519,6 +565,40 @@ pub const think = ToolSpec{
     .call = think_impl.call,
     .reads_only_fn = think_impl.readsOnly,
     .irreversible_fn = think_impl.isIrreversible,
+};
+
+pub const todo = ToolSpec{
+    .name = "todo",
+    .description = todo_description,
+    .model_schema = .{
+        .name = "todo",
+        .description = todo_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "op", .json_type = .string, .shape = &.{ .enum_values = &todo_state.operation_names }, .description = "Operation to apply. Omit it only when list or items already names one operation." },
+                .{ .name = "list", .json_type = .array, .bounds = &.{ .max_items = todo_state.max_phases }, .shape = &.{ .array_objects = &todo_list_entry_schema }, .description = "Phased task list that replaces the current one; used by init." },
+                .{ .name = "task", .json_type = .string, .bounds = &.{ .max_length = todo_state.max_task_content_bytes }, .description = "Full text of one task, exactly as a previous result reported it." },
+                .{ .name = "phase", .json_type = .string, .bounds = &.{ .max_length = todo_state.max_phase_name_bytes }, .description = "Name of one phase." },
+                .{ .name = "items", .json_type = .array, .bounds = &.{ .max_items = todo_state.max_tasks }, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Task contents for init as one flattened phase, or tasks to append." },
+                .{ .name = "reason", .json_type = .string, .bounds = &.{ .max_length = todo_state.max_blocker_bytes }, .description = "What a blocked task is waiting for; used by block." },
+            },
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .todo,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .approval_policy = .standard,
+    .action_label = "Tracking",
+    .completed_action_label = "Tracked",
+    .label_arg_kind = .none,
+    .label_arg_default = "",
+    .permission_target_kind = .none,
+    .decode = todo_impl.decode,
+    .validate = todo_impl.validate,
+    .call = todo_impl.call,
+    .reads_only_fn = todo_impl.readsOnly,
+    .irreversible_fn = todo_impl.isIrreversible,
 };
 
 pub const shell = ToolSpec{
@@ -898,6 +978,7 @@ pub const read_tool_result = ToolSpec{
 pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
+    fuzzy_search,
     read_file,
     write_file,
     edit_file,
@@ -905,6 +986,7 @@ pub const all = [_]tool_dispatch.Tool{
     web_search,
     gemini_search,
     think,
+    todo,
     shell,
     capability_search,
     skill,
@@ -923,6 +1005,7 @@ pub const advertisement_order = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "fuzzy_search",
     "edit_file",
     "write_file",
     "shell",
@@ -937,12 +1020,14 @@ pub const advertisement_order = [_][]const u8{
     "web_search",
     "gemini_search",
     "think",
+    "todo",
 };
 
 pub const read_only_tool_names = [_][]const u8{
     "read_file",
     "glob_files",
     "grep_files",
+    "fuzzy_search",
 };
 
 pub fn isReadOnlyToolName(name: []const u8) bool {
@@ -1007,7 +1092,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "5dc5f0b22c2b166bd8d8140dd4ac382d5f4bf61231b0dc57cfc759ff00dbb00b",
+        "99229b9dfb5de37a4430e66efefe117f28c968819fca4f6d9e8121c6f4b490d6",
         &actual_hex,
     );
 }
@@ -1048,6 +1133,7 @@ test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
         "glob_files",
         "grep_files",
+        "fuzzy_search",
         "read_file",
         "write_file",
         "edit_file",
@@ -1055,6 +1141,7 @@ test "built-in tools register exact active local order" {
         "web_search",
         "gemini_search",
         "think",
+        "todo",
         "shell",
         "capability_search",
         "skill",
@@ -1409,9 +1496,11 @@ test "built-in web_search owns product metadata and schema" {
     try std.testing.expectEqualStrings("Searched", web_search.completed_action_label);
 }
 
-test "built-in gemini_search and think are registered in default production tools" {
+test "built-in gemini_search think and todo are registered in default production tools" {
     try std.testing.expect(lookup("gemini_search") != null);
     try std.testing.expect(lookup("think") != null);
+    try std.testing.expect(registry.lookup("todo") != null);
+    try std.testing.expect(nameInSet(&advertisement_order, "todo"));
 }
 
 test "built-in gemini_search owns product metadata and schema" {
@@ -1442,6 +1531,30 @@ test "built-in think owns product metadata and schema" {
     try std.testing.expectEqualStrings("Thinking", think.action_label);
     try std.testing.expectEqualStrings("Thought", think.completed_action_label);
     try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, think.permission_target_kind);
+}
+
+test "built-in todo owns product metadata and schema" {
+    const schema_json = try tool_specs.toolGatewaySchemaJson(std.testing.allocator, todo);
+    defer std.testing.allocator.free(schema_json);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
+    for ([_][]const u8{ "op", "list", "task", "phase", "items", "reason" }) |field| {
+        try std.testing.expect(schemaProperty(todo.model_schema.input_schema, field) != null);
+    }
+    try std.testing.expect(
+        std.mem.find(u8, schema_json, "\"enum\":[\"init\",\"start\",\"done\",\"rm\",\"drop\",\"block\",\"unblock\",\"append\",\"view\"]") != null,
+    );
+    try std.testing.expectEqualStrings(
+        todo.description,
+        todo.model_schema.description,
+    );
+    try std.testing.expectEqual(tool_dispatch.ExecutorKind.todo, todo.executor_kind);
+    try std.testing.expectEqual(types.ToolActivityKind.read, todo.activity_kind);
+    try std.testing.expect(!todo.requires_approval);
+    try std.testing.expectEqual(tool_dispatch.ApprovalPolicy.standard, todo.approval_policy);
+    try std.testing.expectEqual(tool_dispatch.LabelArgKind.none, todo.label_arg_kind);
+    try std.testing.expectEqualStrings("Tracking", todo.action_label);
+    try std.testing.expectEqualStrings("Tracked", todo.completed_action_label);
+    try std.testing.expectEqual(tool_dispatch.PermissionTargetKind.none, todo.permission_target_kind);
 }
 
 test "built-in provider advertisements declare provider execution" {
@@ -1866,6 +1979,7 @@ test "built-in read-only tool set matches plan inspection tools" {
         "read_file",
         "glob_files",
         "grep_files",
+        "fuzzy_search",
     };
 
     try std.testing.expectEqual(expected_names.len, read_only_tool_names.len);

@@ -137,7 +137,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
       session = await TmuxSession.create({ cwd: fixture.workspace, env: fixture.env });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("must not send with an unreadable profile");
-      await session.waitForText("restart fx before sending a message", TIMEOUT);
+      await session.waitForText("restart di before sending a message", TIMEOUT);
       expect(fixture.requests).toHaveLength(0);
       rmSync(profile);
       renameSync(target, profile);
@@ -290,6 +290,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           join(home, ".fx", "settings.json"),
           JSON.stringify({
             future_global: { nested: "preserve-me" },
+            statusLine: { workspace: false },
             workspaces: {
               [workspaceARoot]: {
                 model: "legacy/project-a",
@@ -630,7 +631,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText("/output quiet");
-        await session.waitForText("fx needs access to Vercel AI Gateway", TIMEOUT);
+        await session.waitForText("di needs access to Vercel AI Gateway", TIMEOUT);
         expect(composerContains(await session.capturePane(), "/output quiet")).toBe(
           true,
         );
@@ -1448,8 +1449,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/statusline context");
-        await session.waitForText("* statusline: context: on", TIMEOUT);
+        // Context usage is enabled by default in di.
         await session.sendLiteral("/model new-reasoning");
         await session.waitForText("provider/new-reasoning-model", TIMEOUT);
         await session.sendKeys("Enter");
@@ -1566,7 +1566,8 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
 
-        expect(tree(home)).toEqual([
+        // Catalog warmup may finish before shutdown and publish its cache.
+        expect(tree(home).filter(path => path !== ".fx/model_catalog.json")).toEqual([
           ".fx",
           ".fx/diagnostics",
           ".fx/diagnostics/last-shutdown.json",
@@ -1741,6 +1742,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           join(home, ".fx", "settings.json"),
           JSON.stringify({
             future_global: { nested: "keep-global" },
+            statusLine: { context: false },
             workspaces: {
               [workspaceRoot]: {
                 future_workspace: {

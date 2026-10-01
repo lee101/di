@@ -1457,6 +1457,37 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     );
 }
 
+fn configuredProviderSelection(
+    default_model: []const u8,
+    settings: *const config_runtime.Settings,
+    provider_override: ?model_provider.ProviderId,
+) !model_provider.ProviderSelection {
+    const provider = provider_override orelse model_provider.effectiveProvider(settings.provider);
+    const model = settings.models.get(provider) orelse switch (provider) {
+        .gateway => default_model,
+        .openpaths => model_provider.openpathsDefaultModel(),
+        .codex => return error.CodexModelNotSelected,
+        .grok => return error.GrokModelNotSelected,
+        .configured => io_mod.getenv("FX_MODEL") orelse return error.ConfiguredModelNotSelected,
+    };
+    // Route on the model that will actually run (FX_MODEL wins), but keep the
+    // persisted per-provider model as the configured value.
+    const effective = initialModelId(model, model);
+    const rerouted = model_provider.rerouteUnservableSelection(.{ .provider = provider, .model = effective });
+    return .{ .provider = rerouted.provider, .model = model };
+}
+
+test "startup reroutes a third-party model persisted under codex to openpaths" {
+    var settings = config_runtime.Settings{ .provider = .codex };
+    defer settings.deinit(std.testing.allocator);
+    try settings.models.putCopy(std.testing.allocator, .codex, "deepseek-v4-flash-vision-exp");
+    const selection = try configuredProviderSelection("default/model", &settings, null);
+    try std.testing.expectEqualStrings("deepseek-v4-flash-vision-exp", selection.model);
+    const has_key = io_mod.getenv("OPENPATHS_API_KEY") != null or io_mod.getenv("OPENROUTER_API_KEY") != null;
+    const expected: model_provider.ProviderId = if (has_key) .openpaths else .codex;
+    try std.testing.expectEqual(expected, selection.provider);
+}
+
 fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8 {
     return config_runtime.modelEnvOverride() orelse configured orelse default_model;
 }
@@ -1677,11 +1708,11 @@ test "permission mode parser accepts known modes" {
     try std.testing.expect(config_runtime.parsePermissionMode("weird") == null);
 }
 
-test "permission mode loader defaults to auto" {
+test "permission mode loader defaults to full access" {
     var env = try TestEnv.install(std.testing.allocator, &.{});
     defer env.deinit();
 
-    try std.testing.expectEqual(PermissionMode.auto, loadPermissionMode(null));
+    try std.testing.expectEqual(PermissionMode.yolo, loadPermissionMode(null));
     try std.testing.expectEqual(PermissionMode.ask, loadPermissionMode(.ask));
 }
 

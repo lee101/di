@@ -43,12 +43,13 @@ export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
 di
 ```
 
-The default OpenPaths model is `xiaomi/mimo-v2.6-pro`. Model lists are fetched
+The default model is `xiaomi/mimo-v2.6-pro` for an OpenPaths key and
+`stealth/space-bunny-alpha` for an OpenRouter key. Model lists are fetched
 live from OpenPaths or OpenRouter and cached on disk, so new models such as
 `xiaomi/mimo-v2.6-flash` show up in `/model` without an update; when a listing
-is unavailable, any model id can be typed directly. A selection persisted under
-the retired default `openpaths/stealth/ox-alpha` circuit-breaks to
-`xiaomi/mimo-v2.6-pro` for the rest of the turn and shows a recovered banner.
+is unavailable, any model id can be typed directly. OpenRouter may retire a
+stealth model without notice, so both stealth routes circuit-break to
+`xiaomi/mimo-v2.6-pro` for the rest of the turn and show a recovered banner.
 
 OpenRouter `:free` variants and the `openrouter/free` router still require an
 `OPENROUTER_API_KEY`; “free” describes inference price, not anonymous API
@@ -67,12 +68,25 @@ catalog is cached under `~/.fx` so the menu opens instantly and refreshes in the
 background, and a typed id that is not listed still selects through the
 `Use <query>` row.
 
+Only language models are listed. OpenPaths serves embeddings, speech
+transcription and synthesis, music, image, video, and 3D models from the same
+catalog, and those answer a different endpoint, so a row for one is a
+selection that cannot work once it is made. Providers that publish a model
+type are taken at their word; for the rest the same pricing and id signals
+OpenPaths itself classifies on decide. A model you know is served but is not
+listed can still be typed directly through the `Use <query>` row.
+
 Sign in with one of:
 
 - `fx login`: Vercel AI Gateway
 - `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
 - `fx login grok`: Grok subscription (xAI OAuth)
 - `fx setup`: AI Gateway API key
+
+An existing Codex CLI login at `$CODEX_HOME/auth.json` (default
+`~/.codex/auth.json`) is adopted on first use, so a ChatGPT plan already signed
+in there needs no `fx login codex`. di copies the session into its own `~/.fx`
+profile and refreshes it there; the CLI's file is never modified.
 
 Then start the interactive shell from a project:
 
@@ -101,6 +115,57 @@ and `FX_*` environment variables. That preserves prior sessions, skills, and
 ChatGPT/Codex login state for people moving from fx. New provider keys use
 their standard names: `OPENPATHS_API_KEY`, `OPENROUTER_API_KEY`, and
 `AI_GATEWAY_API_KEY`.
+
+## Efficient local searches
+
+The agent can choose among these search tools:
+
+| Tool | Use |
+| --- | --- |
+| `fuzzy_search` | Semantic discovery of local code using an existing zbed index. |
+| `grep_files` | Exact literal matches with bounded output and context. |
+| `shell` with `rg` | Regex search, filename search, or command-line search when preferred. |
+| `gemini_search` | Public web research with a grounded answer and citations; requires `GEMINI_API_KEY`. |
+| `web_search` | Public web search results through the configured search provider. |
+
+To enable `fuzzy_search`, build the zbed checkout with Zig 0.16.0,
+then configure trusted absolute paths before launching di:
+
+```bash
+export FX_ZBED_BIN=/path/to/zbed/zig-out/bin/zbed
+export FX_ZBED_MODEL_DIR=/path/to/zbed/model
+"$FX_ZBED_BIN" index /path/to/project --model-dir "$FX_ZBED_MODEL_DIR"
+```
+
+Index a suitably narrow directory explicitly. `fuzzy_search` takes `query`,
+optional workspace-relative `path`, and `limit` (1–50, default 10). It requires
+the updated backend advertising `zbed-search-readonly-v1`, reads an existing
+index up to 64 MiB, and never creates or refreshes an index. Searches are local,
+use no GPU or daemon, have a 15-second execution deadline and a 64 KiB output
+cap. Results may be stale; verify them against current files. A missing backend
+or index leaves `rg` and `grep_files` available. Existing `grep` permission rules
+also govern `fuzzy_search`, which is restricted to the workspace.
+
+Use `grep_files` for literal search, `glob_files` for discovery, and `rg` for
+shell searches. The agent is guided to narrow search roots, batch independent
+reads, and wait on existing shell sessions instead of repeatedly polling.
+Parallel tool groups run in batches of at most eight, preserving result order
+and keeping mutations behind preceding reads.
+
+In full-access mode, captured `shell` calls with `profile: "clean"` automatically
+translate a conservative subset of recursive text searches to ripgrep. For
+example, `grep -ranFH needle src` uses `rg` when available, with the original
+command as the fallback when it is absent. Hidden and ignored files remain in
+scope; ripgrep config is disabled and the search uses one worker. The executed
+command is recorded in the shell result.
+
+Translation requires explicit text mode (`-a`), recursion (`-r` or `-R`) and
+filename formatting (`-H` or `-h`). It accepts fixed strings (`-F`) or simple
+literal patterns, plus line numbers (`-n`). Other flags, binary detection,
+regexes, expansions, pipelines, interactive shells, user startup profiles, and
+exact-command approval modes retain their original command. No extra model
+round trip is required. See [the op comparison](docs/op-parity.md) for coverage
+and remaining gaps.
 
 ## di infinity
 
@@ -159,7 +224,9 @@ The script builds a Debug binary with symbols, reports the memcheck error
 summary per command, and exits nonzero on definite leaks or invalid accesses.
 `zig build test -Dtest-filter=NAME` runs a subset of tests without valgrind.
 
-di starts in `auto` permission mode. Routine understood development actions run directly; unresolved sensitive actions receive one bounded automatic review. A blocked action may return an exact approval request that the agent can send to di's real permission screen. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for other modes and persistent rules.
+di starts in full-access permission mode. Tool lookup, argument validation, cancellation, limits, operating-system permissions, and remote authentication stay authoritative, and no approval screen or automatic safety review gates an action. Switch to `auto` for the bounded safety review of unresolved sensitive actions, or to `ask` to require approval before changes. Ordinary question text never grants permission. See [Permissions](https://fx.sh/docs/configure-fx/permissions) for the other modes and persistent rules.
+
+Questions follow the same dial. The question tool is advertised only in `ask` mode, where it opens the real question screen. In `auto` and full access no question screen opens and the tool is not advertised: the agent answers its own question with the most conservative option that still completes the task, states the assumption and its basis, and keeps going instead of stopping the turn.
 
 Inside the shell, run `/help` to browse interactive commands.
 

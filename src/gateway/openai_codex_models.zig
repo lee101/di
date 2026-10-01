@@ -1,6 +1,7 @@
 const std = @import("std");
 const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const credentials = @import("../core/auth/credentials.zig");
+const debug_trace = @import("../core/shared/debug_trace.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -17,10 +18,36 @@ const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://chatgpt.com/backend-api/codex/models";
 const e2e_models_endpoint_env = "FX_E2E_OPENAI_CODEX_MODELS_URL";
 
-pub const reviewer_model = "gpt-5.6-luna";
-/// Title generation tracks the smallest catalog-backed fast model
-/// independently of the permission reviewer so either can move alone.
-pub const title_model = "gpt-5.6-luna";
+/// Newest first. The live Codex catalog decides which id is actually used, so a
+/// model rollout only has to add a preference here: `selectPreferred` ignores
+/// entries the subscription does not advertise.
+pub const reviewer_model_preferences = [_][]const u8{ "gpt-6-luna", "gpt-5.6-luna" };
+/// Session titles take their model from the compiled provider bundle, so they
+/// name the newest catalog-served fast id directly.
+pub const title_model = "gpt-6-luna";
+
+/// Index into the preferences of the newest id the last Codex fetch served.
+var selected_reviewer_index = std.atomic.Value(usize).init(0);
+
+/// Reviewer model for a review request: the catalog-backed id the last
+/// successful fetch reported, else the newest compiled preference.
+pub fn reviewerModelId() []const u8 {
+    return reviewer_model_preferences[selected_reviewer_index.load(.monotonic)];
+}
+
+/// Index of the newest preference the catalog advertises, or null when the
+/// subscription serves none of them.
+fn selectPreferred(
+    items: []const model_catalog.ModelCatalogEntry,
+    preferences: []const []const u8,
+) ?usize {
+    for (preferences, 0..) |preference, index| {
+        for (items) |entry| {
+            if (std.mem.eql(u8, entry.id, preference)) return index;
+        }
+    }
+    return null;
+}
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
@@ -125,16 +152,18 @@ fn fetchCatalogForProvider(
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
-    var reviewer_available = false;
-    for (catalog.items) |entry| {
-        if (std.mem.eql(u8, entry.id, reviewer_model)) {
-            reviewer_available = true;
-            break;
-        }
-    }
-    if (!reviewer_available) {
+    if (catalog.items.len == 0) {
         model_catalog.freeModelCatalog(alloc, &catalog);
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
+    }
+    if (selectPreferred(catalog.items, &reviewer_model_preferences)) |index| {
+        selected_reviewer_index.store(index, .monotonic);
+    } else {
+        debug_trace.logf(
+            "gateway",
+            "Codex catalog serves no reviewer preference; keeping {s}",
+            .{reviewerModelId()},
+        );
     }
     return .{ .catalog = catalog };
 }
@@ -378,4 +407,32 @@ test "host-managed Codex catalog auth carries no local headers" {
     const auth = catalogRequestAuth(.host_managed) orelse return error.TestExpectedHostManagedCatalogAuth;
     try std.testing.expect(auth.credential == null);
     try std.testing.expect(auth.account_id == null);
+}
+
+test "Codex preferences select the newest served model and skip absent ones" {
+    try std.testing.expectEqualStrings("gpt-6-luna", title_model);
+    const current = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("gpt-5.6-luna"), .model_type = @constCast("language") },
+        .{ .id = @constCast("gpt-5.4"), .model_type = @constCast("language") },
+    };
+    try std.testing.expectEqual(
+        @as(?usize, 1),
+        selectPreferred(&current, &reviewer_model_preferences),
+    );
+
+    const rotated = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("gpt-6-sol"), .model_type = @constCast("language") },
+        .{ .id = @constCast("gpt-6-luna"), .model_type = @constCast("language") },
+    };
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        selectPreferred(&rotated, &reviewer_model_preferences),
+    );
+
+    // A catalog that serves neither preference leaves selection untouched
+    // instead of failing the whole subscription catalog.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        selectPreferred(rotated[0..1], &reviewer_model_preferences),
+    );
 }

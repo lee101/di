@@ -8,10 +8,10 @@ const tool_projection = @import("../core/tooling/tool_projection.zig");
 
 pub const ModeSpec = mode_contract.ModeSpec;
 pub const ToolPolicy = mode_contract.ToolPolicy;
-pub const default_mode_id = "ask";
+pub const default_mode_id = "code";
 
 pub const all = [_]ModeSpec{
-    .{ .id = "code", .name = "Code", .description = "Write and modify code with full tool access", .permission_mode = .auto },
+    .{ .id = "code", .name = "Code", .description = "Write and modify code with full tool access and no permission review", .permission_mode = .yolo },
     .{ .id = "ask", .name = "Ask", .description = "Request permission before making any changes", .permission_mode = .ask },
 };
 
@@ -31,9 +31,9 @@ test "built-in modes register exact ACP order and permission policy" {
         try std.testing.expectEqualStrings(expected, mode.id);
     }
 
-    try std.testing.expectEqualStrings("ask", default_mode_id);
+    try std.testing.expectEqualStrings("code", default_mode_id);
     try std.testing.expectEqualStrings(default_mode_id, registry.default_mode_id);
-    try std.testing.expectEqual(@as(@TypeOf(all[0].permission_mode), .auto), lookup("code").?.permission_mode);
+    try std.testing.expectEqual(@as(@TypeOf(all[0].permission_mode), .yolo), lookup("code").?.permission_mode);
     try std.testing.expectEqual(@as(@TypeOf(all[1].permission_mode), .ask), lookup("ask").?.permission_mode);
     try std.testing.expectEqual(ToolPolicy.full, lookup("code").?.tool_policy);
     try std.testing.expectEqual(ToolPolicy.full, lookup("ask").?.tool_policy);

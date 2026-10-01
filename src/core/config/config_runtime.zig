@@ -16,7 +16,7 @@ pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
-pub const default_permission_mode: types.PermissionMode = .auto;
+pub const default_permission_mode: types.PermissionMode = .yolo;
 
 pub const Paths = struct {
     home_dir: ?[]u8 = null,
@@ -635,7 +635,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     try resolve_provider_selection(&settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (modelEnvOverride() != null) {
-        const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+        const override_provider = model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider));
         sources.models.set(override_provider, .process_override) catch |err| switch (err) {
             error.TooManyModelPreferences => debug_trace.logf(
                 "config",
@@ -681,7 +681,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
-        .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
+        .model_source = sources.models.get(model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider))),
         .sources = sources,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,

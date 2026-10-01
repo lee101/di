@@ -4865,6 +4865,7 @@ fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
     state.selected_model = try alloc.dupe(u8, default_model);
     state.context_enabled = false;
+    state.yolo_acknowledged = true;
     return state;
 }
 
@@ -4878,18 +4879,23 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     };
     state.selected_model = try alloc.dupe(u8, default_model);
     state.context_enabled = true;
+    state.yolo_acknowledged = true;
     return state;
 }
 
-fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+/// Default permission mode is full access, so a profile that never recorded an
+/// acknowledgment prints the warning on every headless run. Warning tests opt
+/// into this fixture; every other test uses the acknowledged base.
+fn testMissingKeyUnacknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
-    state.yolo_acknowledged = true;
+    state.yolo_acknowledged = false;
     return state;
 }
 
 fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     errdefer state.deinit(alloc);
+    state.yolo_acknowledged = false;
     state.config_diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 1);
     state.config_diagnostics[0] = .{
         .layer = .user,
@@ -6008,7 +6014,7 @@ test "headless yolo warning reaches stderr before acknowledgment persistence" {
     defer TestYoloPersistence.reset();
     TestYoloPersistence.warning_capture = &stderr_capture;
 
-    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyStartup);
+    var deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testMissingKeyUnacknowledgedStartup);
     deps.persist_yolo_acknowledgment = TestYoloPersistence.persist;
     const exit_code = try runWithDeps(
         alloc,
@@ -6068,7 +6074,7 @@ test "headless yolo persistence is skipped when warning emission fails" {
     var deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
-        testMissingKeyStartup,
+        testMissingKeyUnacknowledgedStartup,
     );
     deps.stderr_ctx = null;
     deps.write_stderr = TestFailingStderr.write;
@@ -6096,7 +6102,7 @@ test "headless yolo warning respects acknowledgment and no-color" {
     var acknowledged_deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
-        testMissingKeyAcknowledgedStartup,
+        testMissingKeyStartup,
     );
     acknowledged_deps.persist_yolo_acknowledgment = TestYoloPersistence.persist;
     _ = try runWithDeps(
@@ -6112,7 +6118,7 @@ test "headless yolo warning respects acknowledgment and no-color" {
     var color_deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
-        testMissingKeyStartup,
+        testMissingKeyUnacknowledgedStartup,
     );
     color_deps.stderr_is_tty = TestTty.yes;
     color_deps.persist_yolo_acknowledgment = TestYoloPersistence.persist;
@@ -6132,7 +6138,7 @@ test "headless yolo warning respects acknowledgment and no-color" {
     var no_color_deps = testPromptRunDeps(
         &stdout_capture,
         &stderr_capture,
-        testMissingKeyStartup,
+        testMissingKeyUnacknowledgedStartup,
     );
     no_color_deps.stderr_is_tty = TestTty.yes;
     no_color_deps.persist_yolo_acknowledgment = TestYoloPersistence.persist;

@@ -11,6 +11,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const image_attachments = @import("../images/image_attachments.zig");
 const generation_usage_provider = @import("generation_usage_provider.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
+const todo_state = @import("todo_state.zig");
 const command_replay_store = @import("command_replay_store.zig");
 pub const session_usage = @import("session_usage.zig");
 pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
@@ -1672,6 +1673,11 @@ pub const SessionRuntime = struct {
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
+    /// Session-scoped todo list behind the `todo` tool. It lives in memory for
+    /// the life of the process and is never persisted: a restart starts from an
+    /// empty list, and `reset` and `restore` clear it with the rest of the
+    /// session.
+    todo: todo_state.Session = .{},
     language_lock: std.Io.Mutex = .init,
     conversation_language: ConversationLanguage = ConversationLanguage.default(),
     usage: session_usage.Usage = session_usage.Usage.initFresh(),
@@ -1730,6 +1736,7 @@ pub const SessionRuntime = struct {
         self.usage.deinit(alloc);
         self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
+        self.todo.deinit(alloc, io_mod.getIo());
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
@@ -1773,6 +1780,7 @@ pub const SessionRuntime = struct {
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(ConversationLanguage.default());
+        self.todo.clear(alloc, io_mod.getIo());
         self.has_stale_shell_handles = false;
     }
 
@@ -1783,6 +1791,7 @@ pub const SessionRuntime = struct {
         self.clearHistory(alloc);
         self.clearContextNotices();
         self.setConversationLanguage(language);
+        self.todo.clear(alloc, io_mod.getIo());
         self.has_stale_shell_handles = false;
 
         for (history) |turn| {
