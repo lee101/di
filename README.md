@@ -78,10 +78,10 @@ listed can still be typed directly through the `Use <query>` row.
 
 Sign in with one of:
 
-- `fx login`: Vercel AI Gateway
-- `fx login codex`: ChatGPT subscription (OpenAI Codex OAuth)
-- `fx login grok`: Grok subscription (xAI OAuth)
-- `fx setup`: AI Gateway API key
+- `di login`: Vercel AI Gateway
+- `di login codex`: ChatGPT subscription (OpenAI Codex OAuth)
+- `di login grok`: Grok subscription (xAI OAuth)
+- `di setup`: AI Gateway API key
 
 An existing Codex CLI login at `$CODEX_HOME/auth.json` (default
 `~/.codex/auth.json`) is adopted on first use, so a ChatGPT plan already signed
