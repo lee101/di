@@ -1147,6 +1147,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return null;
         }
 
+        fn applyModelSelection(app: *App, model: []const u8, effort: types.ReasoningEffort, fast_mode: bool) !void {
+            if (comptime @hasDecl(App, "switchModelAcrossProviders") and @hasDecl(App, "cachedModelOrigin")) {
+                if (try app.switchModelAcrossProviders(model, app.cachedModelOrigin(model))) return;
+            }
+            try session_commands.Commands(App).selectModelFromPicker(app, model, effort, fast_mode);
+        }
+
         pub fn submitModelPicker(app: *App) !bool {
             switch (app.input_runtime.picker.model_picker_stage) {
                 .model => {
@@ -1173,7 +1180,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
                         try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, .fast);
                     } else {
-                        try session_commands.Commands(App).selectModelFromPicker(app, model, effort, app.fast_mode);
+                        try applyModelSelection(app, model, effort, app.fast_mode);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     }
                     app.shell.render_requests.request(.footer);
@@ -1188,7 +1195,7 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_commands.Commands(App).selectModelFromPicker(app, model, effort, fast_mode);
+                    try applyModelSelection(app, model, effort, fast_mode);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                     app.shell.render_requests.request(.footer);
                     return true;
@@ -1199,11 +1206,13 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn selectedModelCompletion(app: *App) ?[]const u8 {
             const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return null;
             if (query.stage != .model) return null;
-            if (exactModelCompletion(app, query.query)) |model| return model;
             var buf: [32][]const u8 = undefined;
             const count = modelPickerCompletions(app, query.query, &buf);
             if (count == 0) return null;
             const idx = modelPickerIndex(app, buf[0..count]);
+            if (idx == 0) {
+                if (exactModelCompletion(app, query.query)) |model| return model;
+            }
             return buf[idx];
         }
 
@@ -1219,7 +1228,7 @@ pub fn CompletionRuntime(comptime App: type) type {
             const supports_fast = capabilities.supports_fast_mode;
 
             if (!supports_effort and !supports_fast) {
-                try session_commands.Commands(App).selectModelFromPicker(app, model, app.effort, app.fast_mode);
+                try applyModelSelection(app, model, app.effort, app.fast_mode);
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 app.shell.render_requests.request(.footer);
                 return;

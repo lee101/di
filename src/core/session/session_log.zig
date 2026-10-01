@@ -25,6 +25,9 @@ const Identifier = session_event.Identifier;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const lock_deadline_ms: u64 = 2000;
+/// Real first events stay under 2 KiB; this leaves room for two maximum-length
+/// workspace paths while keeping listing reads independent of log size.
+const listed_first_event_max_bytes: usize = 16 * 1024;
 const events_file = "events.jsonl";
 const authority_file = "authority.json";
 const authority_intent_file = "authority.pending.json";
@@ -32,6 +35,12 @@ const publication_intent_file = "commit.pending.json";
 const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
+/// Written when resume suppresses a checkpoint's auto-continue after an
+/// unclean exit. Cleared with the checkpoint so suppression stays sticky
+/// until the user resolves the turn instead of re-arming after a clean quit.
+const recovery_asked_file = "recovery.asked";
+/// Liveness marker naming the live writable owner.
+const owner_live_file = "owner.live";
 const conversation_migration_temp_file = "events.v4.tmp";
 const conversation_migration_backup_file = "events.v3.backup";
 const checkpoint_file = "checkpoint.json";
@@ -756,13 +765,47 @@ fn writeConversationRecoveryState(
             recovery_checkpoint_file,
             bound_bytes,
         );
+        // A fresh checkpoint is a new recovery state; any prior suppression
+        // belonged to the turn it replaces.
+        clearRecoveryAsked(dir);
     } else {
         dir.dir.deleteFile(io_mod.getIo(), recovery_checkpoint_file) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
+        clearRecoveryAsked(dir);
         try io_mod.syncVerifiedDir(dir.dir);
     }
+}
+
+fn clearRecoveryAsked(dir: *io_mod.VerifiedDir) void {
+    dir.dir.deleteFile(io_mod.getIo(), recovery_asked_file) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => debug_trace.logf("session", "recovery ask marker clear failed err={s}", .{@errorName(err)}),
+    };
+}
+
+/// Records that resume suppressed this checkpoint's auto-continue once.
+/// Advisory like owner.live: write failures degrade to a single suppression
+/// instead of blocking the resume.
+pub fn markRecoveryAsked(alloc: Allocator, dir: *io_mod.VerifiedDir) void {
+    const body = std.fmt.allocPrint(alloc, "{{\"asked_at_ms\":{d}}}\n", .{io_mod.milliTimestamp()}) catch |err| {
+        debug_trace.logf("session", "recovery ask marker allocation failed err={s}", .{@errorName(err)});
+        return;
+    };
+    defer alloc.free(body);
+    io_mod.durableReplaceVerified(alloc, dir, recovery_asked_file, body) catch |err| {
+        debug_trace.logf("session", "recovery ask marker write failed err={s}", .{@errorName(err)});
+    };
+}
+
+/// True when a prior resume already suppressed this checkpoint. Read at
+/// decision time; the marker is written mid-session, after the open.
+pub fn recoveryWasAsked(dir: *io_mod.VerifiedDir) bool {
+    return entryExists(dir, recovery_asked_file) catch |err| blk: {
+        debug_trace.logf("session", "recovery ask marker probe failed err={s}", .{@errorName(err)});
+        break :blk false;
+    };
 }
 
 /// Inline tool-result output budget for the durable recovery checkpoint.
@@ -2312,7 +2355,7 @@ fn findConversationReplayWindow(
     return scan.finish(alloc, source);
 }
 
-const ConversationTurnBuilder = struct {
+pub const ConversationTurnBuilder = struct {
     alloc: Allocator,
     user: ?types.UserTurn = null,
     pending_assistant: ?[]u8 = null,
@@ -2322,11 +2365,11 @@ const ConversationTurnBuilder = struct {
     steps: std.ArrayList(types.ToolExecutionStep) = .empty,
     steering: std.ArrayList(types.PersistedSteering) = .empty,
 
-    fn init(alloc: Allocator) ConversationTurnBuilder {
+    pub fn init(alloc: Allocator) ConversationTurnBuilder {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *ConversationTurnBuilder) void {
+    pub fn deinit(self: *ConversationTurnBuilder) void {
         if (self.user) |user| types.freeUserTurn(self.alloc, user);
         if (self.pending_assistant) |text| self.alloc.free(text);
         if (self.pending_replay) |replay| types.freeProviderReplay(self.alloc, replay);
@@ -2349,7 +2392,7 @@ const ConversationTurnBuilder = struct {
         self.* = undefined;
     }
 
-    fn isIdle(self: *const ConversationTurnBuilder) bool {
+    pub fn isIdle(self: *const ConversationTurnBuilder) bool {
         return self.user == null and
             self.pending_assistant == null and
             self.calls.items.len == 0 and
@@ -2358,7 +2401,7 @@ const ConversationTurnBuilder = struct {
             self.steering.items.len == 0;
     }
 
-    fn begin(
+    pub fn begin(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationUser,
     ) !void {
@@ -2370,7 +2413,7 @@ const ConversationTurnBuilder = struct {
         });
     }
 
-    fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
+    pub fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
         if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
             return error.InvalidConversationFrame;
@@ -2384,7 +2427,7 @@ const ConversationTurnBuilder = struct {
         if (value.standalone_response) try self.finishStep();
     }
 
-    fn appendToolCall(
+    pub fn appendToolCall(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationToolCall,
     ) !void {
@@ -2408,7 +2451,7 @@ const ConversationTurnBuilder = struct {
         try self.calls.append(self.alloc, call);
     }
 
-    fn appendToolResult(
+    pub fn appendToolResult(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationToolResult,
     ) !void {
@@ -2437,7 +2480,7 @@ const ConversationTurnBuilder = struct {
         if (self.results.items.len == self.calls.items.len) try self.finishStep();
     }
 
-    fn finishStandalone(self: *ConversationTurnBuilder) !void {
+    pub fn finishStandalone(self: *ConversationTurnBuilder) !void {
         if (self.calls.items.len != 0 or self.results.items.len != 0) return error.InvalidConversationFrame;
         const text = self.pending_assistant orelse return;
         if (text.len == 0 and self.pending_replay == null) {
@@ -2448,7 +2491,7 @@ const ConversationTurnBuilder = struct {
         try self.finishStep();
     }
 
-    fn finishStep(self: *ConversationTurnBuilder) !void {
+    pub fn finishStep(self: *ConversationTurnBuilder) !void {
         try self.steps.ensureUnusedCapacity(self.alloc, 1);
         const calls = try self.calls.toOwnedSlice(self.alloc);
         errdefer types.freeToolCallSlice(self.alloc, calls);
@@ -2464,7 +2507,7 @@ const ConversationTurnBuilder = struct {
         self.pending_replay = null;
     }
 
-    fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
+    pub fn appendSteering(self: *ConversationTurnBuilder, text: []const u8) !void {
         if (self.user == null or self.calls.items.len != 0 or self.results.items.len != 0) {
             return error.InvalidConversationFrame;
         }
@@ -2479,7 +2522,7 @@ const ConversationTurnBuilder = struct {
         self.pending_assistant = null;
     }
 
-    fn finishAssistant(
+    pub fn finishAssistant(
         self: *ConversationTurnBuilder,
         completed: session_event.ConversationTurnCompleted,
     ) !session.HistoryTurn {
@@ -2507,7 +2550,7 @@ const ConversationTurnBuilder = struct {
         } };
     }
 
-    fn finishInterrupted(
+    pub fn finishInterrupted(
         self: *ConversationTurnBuilder,
         value: session_event.ConversationInterruption,
     ) !session.HistoryTurn {
@@ -2577,7 +2620,7 @@ const ConversationTurnBuilder = struct {
         } };
     }
 
-    fn takeExecution(
+    pub fn takeExecution(
         self: *ConversationTurnBuilder,
         files_source: []const types.FileEvidence,
         turn_summary: ?types.TurnSummary,
@@ -2884,7 +2927,7 @@ fn externalizeConversationResults(
     };
 }
 
-fn externalizeConversationTurnResults(
+pub fn externalizeConversationTurnResults(
     alloc: Allocator,
     turn: *session.HistoryTurn,
     capability: ?*session_child_store.SessionChildCapability,
@@ -3088,12 +3131,54 @@ pub const WritableSessionDir = struct {
     dir: io_mod.VerifiedDir,
     writer_lock: ?io_mod.TimedAdvisoryLock,
     session_id: []u8,
+    /// True when a leftover owner marker was present at open time: the
+    /// previous owning process exited without deinit (crash or kill). A
+    /// still-live parked owner produces the same signal, so callers must
+    /// treat it as a reason to be careful, never as proof of corruption.
+    previous_owner_died: bool = false,
 
     pub fn deinit(self: *WritableSessionDir, alloc: Allocator) void {
+        self.clearOwnerLiveness();
         if (self.writer_lock) |*lock| lock.release();
         self.dir.close();
         alloc.free(self.session_id);
         self.* = undefined;
+    }
+
+    /// Records this process as the live owner of the session directory. The
+    /// marker is written on every writable open and removed by deinit while
+    /// the writer lock is still held, so a leftover marker means the previous
+    /// owner died. Advisory only: probe and write failures degrade to no
+    /// signal rather than blocking the open.
+    pub fn trackOwnerLiveness(self: *WritableSessionDir, alloc: Allocator) void {
+        self.previous_owner_died = entryExists(&self.dir, owner_live_file) catch |err| blk: {
+            debug_trace.logf("session", "owner liveness probe failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+            break :blk false;
+        };
+        const body = std.fmt.allocPrint(alloc, "{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
+            std.c.getpid(),
+            io_mod.milliTimestamp(),
+        }) catch |err| {
+            debug_trace.logf("session", "owner liveness mark allocation failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+            return;
+        };
+        defer alloc.free(body);
+        io_mod.durableReplaceVerified(alloc, &self.dir, owner_live_file, body) catch |err| {
+            debug_trace.logf("session", "owner liveness mark failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+        };
+    }
+
+    fn clearOwnerLiveness(self: *WritableSessionDir) void {
+        self.dir.dir.deleteFile(io_mod.getIo(), owner_live_file) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                debug_trace.logf("session", "owner liveness clear failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+                return;
+            },
+        };
+        io_mod.syncVerifiedDir(self.dir.dir) catch |err| {
+            debug_trace.logf("session", "owner liveness clear sync failed id={s} err={s}", .{ self.session_id, @errorName(err) });
+        };
     }
 
     fn isParked(self: *const WritableSessionDir) bool {
@@ -3130,6 +3215,10 @@ pub const LoadedWritableSession = struct {
     conversation_writer: ConversationWriter,
     log: WritableSessionDir,
     freshly_started: bool = false,
+    /// Runtime-only latch set when an open turn without a recovery checkpoint
+    /// outlived the fresh-prompt boundary wait: some stop paths never commit
+    /// the close in-process, so later sends fail fast instead of re-waiting.
+    boundary_wedged: bool = false,
     child_capability: ?*session_child_store.SessionChildCapability = null,
     position: CommitPosition,
     migration_source_schema_version: ?u8 = null,
@@ -4021,6 +4110,7 @@ pub const Root = struct {
             .writer_lock = writer_lock,
             .session_id = session_id,
         };
+        writable.trackOwnerLiveness(alloc);
         var writable_owned = true;
         errdefer if (writable_owned) writable.deinit(alloc);
         var loaded = try createNativeSession(
@@ -4102,9 +4192,12 @@ pub const Root = struct {
         )) orelse error.SessionMigrationRequired;
     }
 
-    /// Reads the immutable child-privacy bit from current session metadata.
-    /// Legacy sessions retain their read-only first-event compatibility path.
-    pub fn loadSubagentChildIdentity(
+    /// Reads the child identity a legacy session records in its first event,
+    /// for a session discovery classified as legacy, whose metadata carries no
+    /// child bit. The event is read only within `listed_first_event_max_bytes`,
+    /// so listing never scans a log; a longer first line fails with
+    /// `error.TruncatedEventFrame`.
+    pub fn loadListedLegacyChildIdentity(
         self: *const Root,
         alloc: Allocator,
         session_id: []const u8,
@@ -4120,27 +4213,9 @@ pub const Root = struct {
             else => return err,
         };
         defer session_dir.close();
-        if (try hasConversationMetadata(alloc, &session_dir)) {
-            const metadata_bytes = try readManagedFileAlloc(
-                alloc,
-                &session_dir,
-                manifest_file,
-                session_codec.max_session_metadata_bytes,
-            );
-            defer alloc.free(metadata_bytes);
-            var metadata = try session_codec.decodeSessionMetadata(
-                alloc,
-                metadata_bytes,
-            );
-            defer metadata.deinit();
-            if (!std.mem.eql(u8, metadata.value.id, session_id)) {
-                return error.InvalidSessionMetadata;
-            }
-            return metadata.value.subagent_child;
-        }
         var log_file = try openManagedFile(&session_dir, events_file, .read_only);
         defer log_file.close(io_mod.getIo());
-        return session_replay.readSubagentChildIdentity(alloc, log_file);
+        return session_replay.readSubagentChildIdentityWithin(alloc, log_file, listed_first_event_max_bytes);
     }
 
     fn openWritableSessionDir(
@@ -4169,11 +4244,13 @@ pub const Root = struct {
             dir.close();
             return err;
         };
-        return .{
+        var writable = WritableSessionDir{
             .dir = dir,
             .writer_lock = writer_lock,
             .session_id = owned_id,
         };
+        writable.trackOwnerLiveness(alloc);
+        return writable;
     }
 
     fn entryExistsForTest(
@@ -4268,19 +4345,16 @@ fn openSessionDir(
     return .{ .dir = dir };
 }
 
+/// Opens an existing session file without waiting on a special file such as
+/// a FIFO; non-regular, hard-linked, or linked targets are unsafe.
 fn openManagedFile(
     dir: *io_mod.VerifiedDir,
     name: []const u8,
     mode: std.Io.Dir.OpenFileOptions.Mode,
 ) !std.Io.File {
     try validateLeaf(name);
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{
-        .mode = mode,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+    var file = io_mod.openExistingRegularFile(dir.dir, name, mode) catch |err| switch (err) {
+        error.DurablePathUnsafe, error.IsDir, error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
         else => return err,
     };
     errdefer file.close(io_mod.getIo());
@@ -4716,6 +4790,43 @@ test "conversation writer rolls back failed sync and refuses uncertain continuat
             }
         }
     }
+}
+
+test "owner liveness marker reports unclean exit and clears on clean close" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "owner-liveness", 10);
+    defer initial.deinit(alloc);
+
+    // A fresh start sees no leftover marker and writes its own while open.
+    {
+        var started = try temp.root.startConversationSession(alloc, initial, .{});
+        try std.testing.expect(!started.log.previous_owner_died);
+        try std.testing.expect(try entryExists(&started.log.dir, owner_live_file));
+        started.deinit(alloc);
+    }
+    // The clean close removed the marker, so the next open sees no death.
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+        try std.testing.expect(!resumed.log.previous_owner_died);
+        resumed.deinit(alloc);
+    }
+    // A leftover marker simulates an owner that never reached deinit.
+    {
+        var dir = try openSessionDir(&temp.root.sessions.?, initial.id, .writable);
+        defer dir.close();
+        try io_mod.durableReplaceVerified(alloc, &dir, owner_live_file, "{\"pid\":0,\"opened_at_ms\":1}\n");
+    }
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+        try std.testing.expect(resumed.log.previous_owner_died);
+        resumed.deinit(alloc);
+    }
+    // A clean close after the detection clears the signal again.
+    var reopened = try temp.root.resumeForWrite(alloc, initial.id, .{ .session_lock_deadline_ms = 0 });
+    try std.testing.expect(!reopened.log.previous_owner_died);
+    reopened.deinit(alloc);
 }
 
 test "parked session refuses history and control mutations" {
@@ -5633,6 +5744,7 @@ test "root starts a cache-free conversation session" {
     var saw_writer_lock = false;
     var saw_permissions = false;
     var saw_usage = false;
+    var saw_owner_live = false;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |entry| {
         count += 1;
@@ -5641,13 +5753,15 @@ test "root starts a cache-free conversation session" {
         if (std.mem.eql(u8, entry.name, "session.lock")) saw_writer_lock = true;
         if (std.mem.eql(u8, entry.name, "permissions.json")) saw_permissions = true;
         if (std.mem.eql(u8, entry.name, "usage-v2.json")) saw_usage = true;
+        if (std.mem.eql(u8, entry.name, owner_live_file)) saw_owner_live = true;
     }
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 6), count);
     try std.testing.expect(saw_events);
     try std.testing.expect(saw_metadata);
     try std.testing.expect(saw_writer_lock);
     try std.testing.expect(saw_permissions);
     try std.testing.expect(saw_usage);
+    try std.testing.expect(saw_owner_live);
 }
 
 test "root session creation stays outside discovery while preparing" {
@@ -5778,7 +5892,7 @@ test "conversation writer appends without duplicating live history" {
     var count: usize = 0;
     var iterator = loaded.log.dir.dir.iterate();
     while (try iterator.next(std.testing.io)) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 5), count);
+    try std.testing.expectEqual(@as(usize, 6), count);
 }
 
 test "cache-free conversation session resumes from metadata and JSONL" {
@@ -6257,6 +6371,53 @@ test "cache-free recovery checkpoint resumes and clears independently" {
     var cleared = try temp.root.loadReadOnly(alloc, initial.id, .{});
     defer cleared.deinit(alloc);
     try std.testing.expectEqual(@as(?session_codec.RecoveryCheckpoint, null), cleared.recovery_checkpoint);
+}
+
+test "recovery ask marker stays sticky across resumes and follows the checkpoint lifecycle" {
+    const alloc = std.testing.allocator;
+    var temp = try TempRoot.init(alloc);
+    defer temp.deinit(alloc);
+    var initial = try testState(alloc, "recovery-ask-marker", 10);
+    defer initial.deinit(alloc);
+    const checkpoint = session_codec.RecoveryCheckpoint{
+        .turn_id = 7,
+        .user = .{ .text = @constCast("continue the request") },
+        .assistant_source = @constCast("partial"),
+        .cause = .network_interrupted,
+        .action = .retrying_request,
+        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 3,
+        .consumed_provider_attempts = 1,
+    };
+    {
+        var loaded = try temp.root.startConversationSession(alloc, initial, .{});
+        defer loaded.deinit(alloc);
+        _ = try loaded.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 20);
+        try std.testing.expect(!recoveryWasAsked(&loaded.log.dir));
+        markRecoveryAsked(alloc, &loaded.log.dir);
+        try std.testing.expect(recoveryWasAsked(&loaded.log.dir));
+    }
+    // The marker survives a clean close: a later resume still sees it.
+    {
+        var resumed = try temp.root.resumeForWrite(alloc, initial.id, .{});
+        defer resumed.deinit(alloc);
+        try std.testing.expect(recoveryWasAsked(&resumed.log.dir));
+        // A fresh checkpoint resets the suppression.
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_set = .{ .checkpoint = checkpoint },
+        }, 30);
+        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
+        // Clearing the checkpoint clears the marker.
+        markRecoveryAsked(alloc, &resumed.log.dir);
+        _ = try resumed.appendEvent(alloc, .{
+            .recovery_checkpoint_cleared = .{},
+        }, 31);
+        try std.testing.expect(!recoveryWasAsked(&resumed.log.dir));
+    }
 }
 
 test "recovery checkpoint spills oversized tool outputs and reload restores them" {

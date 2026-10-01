@@ -131,7 +131,7 @@ async function waitFor(expression, sessionId, timeoutMs = 10000) {
   let diagnostic;
   try {
     diagnostic = await command("Runtime.evaluate", {
-      expression: "window.__fxBrowserTerminalTest || null",
+      expression: "window.__fxCoreTest || window.__fxBrowserTerminalTest || null",
       returnByValue: true,
     }, sessionId);
   } catch {}
@@ -182,6 +182,16 @@ try {
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
     expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+  });
+  await runCase("Blob prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1", (result) => {
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.blobSent === true, "browser Blob image was not sent as a validated file part");
+    expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
+  });
+  await runCase("iframe File prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1&blob-iframe=1", (result) => {
+    expect(result.crossRealm === true, "test File was not created in another realm");
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.blobSent === true, "iframe File was not sent as a validated file part");
   });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);

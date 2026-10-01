@@ -73,6 +73,8 @@ Every PR must carry exactly one label that describes its primary intent:
 
 If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
 
+If an AI coding agent writes any of your contribution's prose, including the PR title and description, commit messages, documentation, and issues, it must use the `technical-writer` skill in `.fx/skills/technical-writer/`.
+
 ## Repo Shape
 
 * `src/main.zig`: composition root only
@@ -125,7 +127,9 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+
+`skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
 Runtime state lives under `~/.fx/`:
 
@@ -203,8 +207,8 @@ array. Workspace entries are always optional and never load stored credentials.
 Approved workspace `command`, `args`, `env`, and HTTP header values expand
 `${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
 rejected entries do not read environment values. Missing required variables
-leave an approved server unloaded and appear in `/mcp list` without exposing
-values.
+leave an approved server unloaded and appear in the `/mcp` and `/mcp list`
+menu without exposing values.
 
 Interactive sessions keep pending workspace servers disconnected and request
 project trust before any project-defined process or network effect. Pending
@@ -230,7 +234,9 @@ assertions. Servers validate their tool arguments and results.
 
 The interactive surface supports:
 
-* `/mcp list`
+* `/mcp`
+
+* `/mcp list` (opens the same server menu)
 
 * `/mcp resource list <server>`
 
@@ -305,6 +311,20 @@ server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
 without `--cidfile` receive a private cidfile so fx can remove the container
 after shutdown or startup failure. An explicit cidfile remains user-owned.
 
+When a stdio server closes its connection before answering `initialize`, for
+example because its process exited, the reported failure names the exit code
+or signal and includes a bounded, terminal-safe excerpt of the server's stderr
+with secrets masked. A startup timeout names the limit that ran out, plus an
+earlier launch's exit when there was one, and names the `startup_timeout_ms`
+key when that setting set the limit. When a server writes a stdout line that
+is not an MCP message, such as a banner, the failure quotes the start of that
+line. A startup restart runs only when it could change the outcome: a server
+that closed its connection at every offered protocol version is not
+restarted, and neither is one whose startup deadline has already passed. A
+server that fx stopped because of invalid output still gets its restart. The
+model sees the same reason when it searches a named server that is down, or
+when a tool call finds its server stopped and the relaunch fails.
+
 MongoDB Atlas Managed MCP configuration service accounts use the OAuth
 client-credentials grant. fx does not implement that grant directly. Use
 MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
@@ -330,8 +350,9 @@ MCP capability to a child. Server-filtered searches, selected tools, and feature
 operations activate only their target; a broad search activates the broader
 catalog. Each server owns its startup and recovery progress. Connection deadlines
 cover discovery, fallback, and restarts together. Interactive authentication and
-logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
-snapshot. The interactive menu refreshes that view while it is open.
+logout change only the affected connection. `/mcp` and `/mcp list` open the same
+bounded, secret-free menu, which refreshes its live health snapshot while open.
+Noninteractive `fx mcp list` renders the health snapshot to stdout.
 
 Search and explicit selection share bounded schema publication. Definitions are
 checked against their runtime, connection, catalog, and credential generations
@@ -347,6 +368,64 @@ ACP-provided servers are isolated to their owning ACP session. One-off and
 persistent subagents receive an immutable, permission-filtered view of the
 parent or ACP session's admitted MCP tools, resources, prompts, and completion
 capability. Missing, revoked, stale, or closed authority fails before transport.
+
+ACP clients can also serve an MCP server over the ACP connection itself, as
+described in the MCP-over-ACP RFD, by declaring
+`{"type":"acp","name":"...","serverId":"..."}` in `mcpServers`. fx advertises
+`mcpCapabilities.acp` and sends each modern MCP request as an `mcp/message`
+request with a fresh logical `requestId`; the client answers with a `result` or
+`error` carrier, and timeouts or cancellation send `$/cancel_request`. These
+servers connect from the prompt worker at the start of the first turn, because
+discovery waits for replies that only the connection reader delivers, so a
+server that fails to connect appears in the model's server catalog instead of
+failing session setup. Request-scoped `mcp/message` notifications such as
+progress are not delivered to operations yet.
+
+## ACP Embedding
+
+`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
+written under `_meta.fx`.
+
+* **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
+  are advertised on every turn within the `mcp_selected_schema_bytes` budget.
+  Set `_meta.fx.alwaysLoaded` to `false` on a server entry to load it on demand
+  instead. A model call naming a live MCP tool that is not loaded is loaded and
+  admitted through the normal MCP permission path instead of failing.
+* **Steering:** a `session/prompt` with `_meta.fx.steer` set to `true` while a
+  turn runs joins that turn at its next safe boundary and is replayed as a
+  `user_message_chunk` whose `_meta.fx.steering.requestId` names the request.
+  Its response arrives when that turn ends, with the turn's `stopReason` and
+  `_meta.fx.steering` set to `absorbed`. Steering queued when a turn is
+  cancelled answers `cancelled` with `dropped`; steering that a turn ended
+  without reading returns an error so the client can send it again. Without the
+  opt-in, a second prompt keeps the `Prompt already in progress` error.
+  `session/load` replays absorbed steering in place with a null `requestId`.
+  `initialize` reports support in `agentCapabilities._meta.fx.steering`.
+* **Client system prompt:** `session/new` accepts `systemPrompt` text blocks in
+  `append` mode, as proposed in the client system prompt RFD, and `initialize`
+  advertises `sessionCapabilities.systemPrompt`. `_meta.fx.systemPrompt`
+  accepts the same blocks for SDKs that drop unknown fields. The prompt follows
+  fx's own instructions in the system slot, is stored with the session, and is
+  restored on `session/load` and `session/resume`. Set `_meta.fx.terminal` to
+  `false` on `initialize` when fx is not presented in a terminal; fx then drops
+  its terminal identity and rendering guidance.
+* **Tool call metadata:** each `tool_call` update carries
+  `_meta.fx.toolCall.internal`, which is true for fx's own discovery and
+  bookkeeping steps such as `capability_search`, `mcp_select_tool`, and
+  `read_tool_result`. MCP tool calls add `mcp.server` and `mcp.tool` and use
+  the server's tool title, falling back to the tool's own name. `session/load`
+  replays the same metadata, including for servers that reconnect only on the
+  next turn.
+* **Session workspace:** an absolute `cwd` on `session/new`, `session/load`,
+  or `session/resume` becomes that session's workspace for file access, shell
+  commands, project instructions, project skills, project MCP servers, and the
+  session record. Model, provider, credentials, and permission policy stay as
+  resolved at `initialize` from the launch directory. A client without a
+  project can pass an empty directory it owns.
+* **Profile MCP servers:** ACP sessions use only client-supplied and approved
+  project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
+  request to add the user's `~/.fx/mcp.json` servers. Request entries win name
+  collisions, and profile entries win over project entries.
 
 ## Permissions and Auto Mode
 

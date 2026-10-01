@@ -391,6 +391,15 @@ pub const State = struct {
             entry.deinit(alloc);
             return;
         }
+        if (entry.images.items.len == 0) {
+            var index = self.entries.items.len;
+            while (index > 0) {
+                index -= 1;
+                if (!self.entries.items[index].eql(&entry)) continue;
+                var duplicate = self.entries.orderedRemove(index);
+                duplicate.deinit(alloc);
+            }
+        }
 
         try self.entries.append(alloc, entry);
         entry = .{};
@@ -659,6 +668,22 @@ test "record deduplicates adjacent entries and prunes the oldest" {
     try std.testing.expectEqual(@as(usize, 2), state.count());
     try std.testing.expectEqualStrings("two", state.entryText(0).?);
     try std.testing.expectEqualStrings("three", state.entryText(1).?);
+}
+
+test "record moves a repeated entry to the end" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.record(alloc, 10, "one", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 10, "two", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 10, "three", &.{}, &.{}, &.{}, &.{});
+    try state.record(alloc, 10, "one", &.{}, &.{}, &.{}, &.{});
+
+    try std.testing.expectEqual(@as(usize, 3), state.count());
+    try std.testing.expectEqualStrings("two", state.entryText(0).?);
+    try std.testing.expectEqualStrings("three", state.entryText(1).?);
+    try std.testing.expectEqualStrings("one", state.entryText(2).?);
 }
 
 test "navigation recalls entries and restores the unsent draft" {

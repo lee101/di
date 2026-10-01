@@ -573,6 +573,7 @@ pub fn shellProcessOnlySpec() ToolSpec {
 
 pub const capability_search = ToolSpec{
     .name = "capability_search",
+    .internal = true,
     .description = capability_search_description,
     .model_schema = .{
         .name = "capability_search",
@@ -697,6 +698,7 @@ pub const subagent = ToolSpec{
 
 pub const mcp_select_tool = ToolSpec{
     .name = "mcp_select_tool",
+    .internal = true,
     .description = mcp_select_tool_description,
     .model_schema = .{
         .name = "mcp_select_tool",
@@ -862,6 +864,7 @@ const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
 
 pub const read_tool_result = ToolSpec{
     .name = "read_tool_result",
+    .internal = true,
     .description = read_tool_result_description,
     .model_schema = .{
         .name = "read_tool_result",
@@ -1743,8 +1746,6 @@ test "built-in vision dispatch uses supplied runtime provider" {
 
     var fixture = Fixture{};
     const vision_registry = tool_dispatch.Registry{ .tools = &.{vision} };
-    var status_detail: ?[]u8 = null;
-    defer if (status_detail) |detail| std.testing.allocator.free(detail);
     var result = try tool_dispatch.dispatchAuthorizedToolCall(.{
         .allocator = std.testing.allocator,
         .vision_provider = .{
@@ -1755,7 +1756,7 @@ test "built-in vision dispatch uses supplied runtime provider" {
         .id = "vision_1",
         .name = "vision",
         .arguments_json = "{\"image_ids\":[7,9],\"focus\":\"read status\"}",
-    }, &status_detail);
+    });
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.success, result.status);

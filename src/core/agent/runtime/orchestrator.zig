@@ -51,9 +51,11 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
+const execution_memory_helpers = @import("../execution_memory.zig");
 const runtime_agent = @import("agent.zig");
 const runtime_tool_admission = @import("tool_admission.zig");
 const runtime_interruption = @import("interruption.zig");
@@ -78,6 +80,8 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 const http_error_detail_max_bytes: usize = 4096;
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
+pub const assistant_tail_continuation_prompt =
+    "Continue from the conversation above.";
 const repeated_terminal_validation_notice =
     "Repeated shell validation failures stopped the tool loop. The invalid shell calls were not executed and produced no shell effect.";
 const repeated_shell_execution_failure_notice =
@@ -979,16 +983,6 @@ fn project_subagent_request_messages(
         if (message.role != .assistant) continue;
         for (message.tool_calls) |call| {
             if (!std.mem.eql(u8, call.name, "subagent")) continue;
-            if (call.argument_integrity == .malformed_json) {
-                try calls.append(alloc, .{
-                    .assistant_index = message_index,
-                    .id = call.id,
-                    .action = "malformed",
-                    .disposition = .inert,
-                });
-                needs_projection = true;
-                continue;
-            }
             if (legacy_subagent_action(call.arguments_json)) |action| {
                 try calls.append(alloc, .{
                     .assistant_index = message_index,
@@ -1120,7 +1114,7 @@ fn project_subagent_request_messages(
     return projected;
 }
 
-test "non-object subagent rejection keeps its call and result during projection" {
+test "rejected subagent arguments keep their call and result during projection" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
@@ -1143,7 +1137,10 @@ test "non-object subagent rejection keeps its call and result during projection"
         .{ .role = .tool, .tool_call_id = "rejected", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
         .{ .role = .tool, .tool_call_id = "valid", .tool_name = "read_file", .content = "contents", .tool_result_status = .success },
     };
-    for (0..2) |_| {
+    // Rewriting a malformed call into an assistant-role summary would leave
+    // the next request ending in assistant prefill.
+    for ([_]types.ToolArgumentIntegrity{ .non_object_json, .malformed_json, .valid }) |integrity| {
+        calls[0].argument_integrity = integrity;
         const projected = try project_subagent_request_messages(
             alloc,
             .{ .tools = &.{tool} },
@@ -1159,7 +1156,6 @@ test "non-object subagent rejection keeps its call and result during projection"
         try std.testing.expectEqualStrings("rejected", projected[1].tool_call_id.?);
         try std.testing.expectEqualStrings("not executed", projected[1].content.?);
         try std.testing.expectEqual(types.PersistedToolStatus.failure, projected[1].tool_result_status.?);
-        calls[0].argument_integrity = .valid;
     }
 }
 
@@ -2672,6 +2668,55 @@ fn prepareAvailabilityTerminal(
     };
 }
 
+/// Advertises live MCP tools the model called without loading them first, so
+/// those calls reach normal validation and MCP permission instead of failing
+/// as unselected. Names that do not resolve, including lookups that fail or
+/// are cancelled, keep the unsupported-tool path, where the turn's normal
+/// cancellation handling still applies.
+fn advertiseUnselectedMcpCalls(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    calls: []const ToolCall,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !void {
+    const resolve = deps.resolve_unselected_mcp_tool orelse return;
+    for (calls) |call| {
+        if (deps.tool_registry.lookup(call.name) != null) continue;
+        if (containsToolName(advertised_names.*, call.name)) continue;
+        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            },
+        };
+        const definition = resolved orelse continue;
+        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
+        const tool = for (selected.items) |item| {
+            if (std.mem.eql(u8, item.name, call.name)) break item;
+        } else unreachable;
+        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+        tools[advertised_tools.len] = tool;
+        const names = try arena.alloc([]const u8, advertised_names.len + 1);
+        @memcpy(names[0..advertised_names.len], advertised_names.*);
+        names[advertised_names.len] = tool.name;
+        advertised_tools.* = tools;
+        advertised_names.* = names;
+        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
+    }
+}
+
+fn containsToolName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
 fn prepareDeferredDynamicCandidate(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -3287,7 +3332,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -3897,6 +3942,31 @@ noinline fn pausedRequiredAction(
         .continue_later;
 }
 
+/// Hands the model's tool calls to `append_turn_piece` before any of them
+/// runs (D28). Execution memory holds only finished exchanges, so the calls
+/// travel apart, in the form a finished step saves them.
+fn appendRunningToolCalls(
+    deps: *const AgentRuntimeDeps,
+    finalization: *const TurnFinalizationGuard,
+    job: QueuedPrompt,
+    current_turn_messages: []const ChatMessage,
+    calls: []const types.ToolCall,
+) !void {
+    const append = deps.append_turn_piece orelse return;
+    if (calls.len == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer mem_utils.deinit_arena(scratch);
+    const arena = scratch.allocator();
+    const execution = try runtime_execution_memory.buildExecutionMemory(arena, current_turn_messages);
+    const running = try arena.alloc(types.ToolCall, calls.len);
+    for (calls, running) |call, *saved| saved.* = try execution_memory_helpers.dupePersistedToolCall(arena, call);
+    try append(deps.ctx, .{
+        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .execution = try finalization.compacted_execution.project(arena, execution),
+        .running_calls = running,
+    });
+}
+
 fn persistRecoveryCheckpoint(
     deps: *const AgentRuntimeDeps,
     finalization: *const TurnFinalizationGuard,
@@ -3914,7 +3984,7 @@ fn persistRecoveryCheckpoint(
     tool_evidence: model_response_recovery.ToolEvidence,
     trace_ctx: TraceContext,
 ) !void {
-    const effect = deps.recovery_checkpoint orelse return;
+    if (deps.recovery_checkpoint == null and deps.append_turn_piece == null) return;
     // Every sink copies or serializes the borrowed checkpoint synchronously.
     // Retaining these full-history reconstructions in the turn arena is quadratic.
     var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -3924,14 +3994,16 @@ fn persistRecoveryCheckpoint(
         arena,
         current_turn_messages,
     );
+    const projected = try finalization.compacted_execution.project(arena, execution);
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    // Every completed piece reaches the session before the next request.
+    if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected });
+    const effect = deps.recovery_checkpoint orelse return;
     try effect.set(deps.ctx, .{
         .turn_id = job.turn_id,
-        .user = .{
-            .text = @constCast(job.prompt),
-            .images = job.images,
-        },
+        .user = user,
         .assistant_source = @constCast(assistant_source),
-        .execution = try finalization.compacted_execution.project(arena, execution),
+        .execution = projected,
         .cause = checkpointCause(cause),
         .action = checkpointAction(strategy),
         .tool_state = checkpointToolState(tool_evidence),
@@ -4064,6 +4136,67 @@ test "recovery checkpoints do not accumulate temporary history copies in the tur
     try std.testing.expectError(error.CheckpointWriteFailed, persistRecoveryCheckpoint(&deps, &finalization, fixture.job(), messages.items, "cancelled", "model", false, false, 10, 1, false, .transport_interrupted, .pause, .confirmed, .{}));
     try std.testing.expectEqual(retained_bytes, turn.queryCapacity());
     try std.testing.expectEqual(@as(usize, 1000), sink.checkpoint.?.execution.tool_steps.len);
+}
+
+test "running tool calls reach append_turn_piece before they run" {
+    const support = @import("tests/support.zig");
+    const Sink = struct {
+        appends: usize = 0,
+        finished_steps: usize = 0,
+        running: std.ArrayList([]u8) = .empty,
+
+        fn append(raw: *anyopaque, progress: runtime_deps.TurnProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.appends += 1;
+            self.finished_steps = progress.execution.tool_steps.len;
+            for (progress.running_calls) |call| {
+                try self.running.append(std.testing.allocator, try std.testing.allocator.dupe(u8, call.id));
+            }
+        }
+    };
+    var sink: Sink = .{};
+    defer {
+        for (sink.running.items) |id| std.testing.allocator.free(id);
+        sink.running.deinit(std.testing.allocator);
+    }
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    var fixture: support.PromptFixture = .{};
+    var finalization = TurnFinalizationGuard.init(&deps, 1, support.testLifecycleContext(
+        hooks.RuntimeView.empty(),
+        std.testing.allocator,
+        fixture.workspace_root,
+    ));
+    defer finalization.deinit();
+    var finished = [_]ToolCall{.{ .id = "read_0", .name = "read_file", .arguments_json = "{\"path\":\"b\"}" }};
+    var running = [_]ToolCall{
+        .{ .id = "run_1", .name = "shell", .arguments_json = "{\"command\":\"sleep 9\"}" },
+        .{ .id = "run_2", .name = "read_file", .arguments_json = "{\"path\":\"a\"}" },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &finished },
+        .{ .role = .tool, .tool_call_id = "read_0", .tool_name = "read_file", .tool_result_status = .success, .content = "done" },
+        .{ .role = .assistant, .tool_calls = &running },
+    };
+
+    // Without the hook, as on v1, nothing is built or sent.
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
+    try std.testing.expectEqual(@as(usize, 0), sink.appends);
+
+    deps.ctx = &sink;
+    deps.append_turn_piece = Sink.append;
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &running);
+    try std.testing.expectEqual(@as(usize, 1), sink.appends);
+    // The finished step travels as execution memory, the running calls beside it.
+    try std.testing.expectEqual(@as(usize, 1), sink.finished_steps);
+    try std.testing.expectEqual(@as(usize, 2), sink.running.items.len);
+    try std.testing.expectEqualStrings("run_1", sink.running.items[0]);
+    try std.testing.expectEqualStrings("run_2", sink.running.items[1]);
+
+    // A step with no calls sends nothing.
+    try appendRunningToolCalls(&deps, &finalization, fixture.job(), &messages, &.{});
+    try std.testing.expectEqual(@as(usize, 1), sink.appends);
 }
 
 /// Pure formatter for the full-only network record: provider, model, latency,
@@ -4313,6 +4446,7 @@ fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
         "maximum context length",
         "maximum prompt length",
         "input is too long",
+        "prompt is too long",
         "too many input tokens",
     }) |needle| {
         if (text_utils.containsIgnoreCase(detail, needle)) return true;
@@ -4353,6 +4487,10 @@ test "context overflow recovery is typed safe and bounded" {
         .kind = .invalid_request,
         .detail = @constCast("This model's maximum prompt length is 1000000 but the request contains 1003383 tokens."),
     };
+    const anthropic_prompt_overflow = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: prompt is too long: 1077372 tokens > 1000000 maximum"),
+    };
     const request_too_large = agent_stream_provider.Failure{
         .kind = .request_too_large,
     };
@@ -4366,6 +4504,7 @@ test "context overflow recovery is typed safe and bounded" {
     }{
         .{ .failure = context_failure, .expected = true },
         .{ .failure = grok_prompt_overflow, .expected = true },
+        .{ .failure = anthropic_prompt_overflow, .expected = true },
         .{ .failure = request_too_large, .expected = true },
         .{ .failure = unrelated_failure, .expected = false },
         .{ .failure = context_failure, .has_compactable_context = false, .expected = false },
@@ -4382,20 +4521,111 @@ test "context overflow recovery is typed safe and bounded" {
     ));
 }
 
-fn isPostVisionAssistantPrefillRejection(
+/// fx never asks a model to extend an assistant message, and models without
+/// prefill support reject that shape. Returns `source` unchanged, or an
+/// `arena` copy ending with a host continuation when history projection left
+/// the conversation on an assistant message.
+fn with_replyable_conversation_tail(
+    arena: Allocator,
+    source: []const ChatMessage,
+) Allocator.Error![]const ChatMessage {
+    if (source.len == 0 or source[source.len - 1].role != .assistant) return source;
+    const projected = try arena.alloc(ChatMessage, source.len + 1);
+    @memcpy(projected[0..source.len], source);
+    projected[source.len] = .{ .role = .user, .content = assistant_tail_continuation_prompt };
+    return projected;
+}
+
+test "request tail ends with a user continuation instead of assistant prefill" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const replyable = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "read_file", .content = "result" },
+    };
+    try std.testing.expectEqual(@as([*]const ChatMessage, &replyable), (try with_replyable_conversation_tail(arena, &replyable)).ptr);
+    try std.testing.expectEqual(@as(usize, 0), (try with_replyable_conversation_tail(arena, &.{})).len);
+
+    const prefill = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .assistant, .content = "[Prior subagent create action completed.]" },
+    };
+    const repaired = try with_replyable_conversation_tail(arena, &prefill);
+    try std.testing.expectEqual(@as(usize, 3), repaired.len);
+    try std.testing.expectEqualStrings(prefill[1].content.?, repaired[1].content.?);
+    try std.testing.expectEqual(types.ChatRole.user, repaired[2].role);
+    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, repaired[2].content.?);
+    try std.testing.expectEqual(types.ChatRole.assistant, prefill[1].role);
+}
+
+test "legacy subagent history at the tail stays replyable after projection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tool = tool_dispatch.Tool{
+        .name = "subagent",
+        .description = "subagent",
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
+        .executor_kind = .subagent,
+        .decode = undefined,
+        .call = undefined,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    const calls = [_]ToolCall{.{
+        .id = "legacy",
+        .name = "subagent",
+        .arguments_json = "{\"command\":{\"create\":{\"name\":\"worker\",\"mode\":\"persistent\",\"prompt\":\"do it\"}}}",
+    }};
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "delegate" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .tool_call_id = "legacy", .tool_name = "subagent", .content = "not executed", .tool_result_status = .failure },
+    };
+    const projected = try project_subagent_request_messages(
+        arena,
+        .{ .tools = &.{tool} },
+        true,
+        &messages,
+        agent_stream_provider.unavailable_provider,
+        .{ .provider = .gateway, .model = "test" },
+    );
+    try std.testing.expectEqual(types.ChatRole.assistant, projected[projected.len - 1].role);
+    const request = try with_replyable_conversation_tail(arena, projected);
+    try std.testing.expectEqual(types.ChatRole.user, request[request.len - 1].role);
+    try std.testing.expectEqualStrings(assistant_tail_continuation_prompt, request[request.len - 1].content.?);
+}
+
+/// Some provider routes reject a request that ends with tool results as an
+/// assistant prefill. Returns the tail tool name when that happened.
+fn postToolAssistantPrefillRejection(
     status: std.http.Status,
     detail: []const u8,
     messages: []const ChatMessage,
-) bool {
-    if (status != .bad_request or messages.len == 0) return false;
+) ?[]const u8 {
+    if (status != .bad_request or messages.len == 0) return null;
     const tail = messages[messages.len - 1];
-    if (tail.role != .tool or
-        !std.mem.eql(u8, tail.tool_name orelse return false, "vision"))
+    if (tail.role != .tool) return null;
+    if (std.mem.find(u8, detail, "does not support assistant message prefill") == null or
+        std.mem.find(u8, detail, "must end with a user message") == null)
     {
-        return false;
+        return null;
     }
-    return std.mem.find(u8, detail, "does not support assistant message prefill") != null and
-        std.mem.find(u8, detail, "must end with a user message") != null;
+    return tail.tool_name orelse "unknown";
+}
+
+test "assistant prefill rejection recovers after any tool result tail" {
+    const detail = "AI_APICallError: This model does not support assistant message prefill. The conversation must end with a user message.";
+    const after_tool = [_]ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .tool, .tool_call_id = "call", .tool_name = "subagent", .content = "failed" },
+    };
+    try std.testing.expectEqualStrings("subagent", postToolAssistantPrefillRejection(.bad_request, detail, &after_tool).?);
+    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, "other failure", &after_tool) == null);
+    try std.testing.expect(postToolAssistantPrefillRejection(.too_many_requests, detail, &after_tool) == null);
+    const after_user = [_]ChatMessage{.{ .role = .user, .content = "go" }};
+    try std.testing.expect(postToolAssistantPrefillRejection(.bad_request, detail, &after_user) == null);
 }
 
 fn recovery_deadline(delay_ns: u64) std.Io.Clock.Timestamp {
@@ -5278,30 +5508,6 @@ test "request capabilities resolve before capacity planning and Vision routing" 
         false,
         .{ .context_window = 128_000 },
     ));
-}
-
-fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32 {
-    const max_output_tokens = capabilities.max_output_tokens orelse return null;
-    const context_window = capabilities.context_window orelse return max_output_tokens;
-    if (max_output_tokens >= context_window) return null;
-    return max_output_tokens;
-}
-
-test "request output limit follows capability bounds" {
-    const cases = [_]struct {
-        capabilities: model_capabilities.Capabilities,
-        expected: ?u32,
-    }{
-        .{ .capabilities = .{}, .expected = null },
-        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
-        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576 }, .expected = null },
-        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = null },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, request_max_output_tokens(case.capabilities));
-    }
 }
 
 const PreparedSkills = struct {
@@ -6239,7 +6445,7 @@ pub fn prepareManualCompactionContinuation(
             },
             .tool_choice = config.first_call_tool_choice,
             .provider_options = provider_options,
-            .max_output_tokens = request_max_output_tokens(capabilities),
+            .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
             .budget = .{ .cancel_flag = config.cancel_flag },
         },
         .handoff_message_index = projection.current_user_index,
@@ -7004,6 +7210,10 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var tool_image_strip_notified = false;
+    var attachment_withheld_notified = false;
+    // Attachment pixel sizes probed during this turn, so each step does not
+    // reread every attachment snapshot. Entries live in the turn arena.
+    var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -7151,8 +7361,8 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
-        const advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
+        var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        var advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
@@ -7374,9 +7584,37 @@ fn processQueuedPromptLoop(
                     break;
                 }
             }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
+            const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const projection = try image_attachments.withholdOversizedAttachments(
+                    overlay_arena,
+                    arena,
+                    &attachment_dimensions,
+                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                );
+                // The model gets a note for each withheld attachment. The user
+                // hears about ones attached this turn, once per turn.
+                var withheld_now: usize = 0;
+                for (projection.withheld_ids) |id| {
+                    for (job.images) |image| {
+                        if (image.id == id) withheld_now += 1;
+                    }
+                }
+                if (withheld_now > 0 and !attachment_withheld_notified) {
+                    attachment_withheld_notified = true;
+                    const limit = image_data.max_image_dimension;
+                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
+                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
+                    else
+                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                }
+                break :native projection.messages;
+            } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = image_projection.messages;
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            if (request_messages.ptr != image_projection.messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
             // once per turn, and only when the catalog itself is known to be
@@ -7426,7 +7664,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = request_max_output_tokens(request_capabilities),
+                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             var prepared_request_body: ?[]const u8 = null;
@@ -8388,26 +8626,28 @@ fn processQueuedPromptLoop(
             const gateway_wait_finished_ms = io_mod.milliTimestamp();
             summary_accumulator.addThinkingWait(gateway_wait_started_ms, stream_ctx.first_model_output_at_ms orelse gateway_wait_finished_ms);
 
-            if (!assistant_prefill_recovery_used and
+            const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
                 semantic_attempt + 1 < semantic_limit and
-                streamReplaySafe(&stream_ctx) and
-                isPostVisionAssistantPrefillRejection(
+                streamReplaySafe(&stream_ctx))
+                postToolAssistantPrefillRejection(
                     if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
-                ))
-            {
-                try within_turn_suffix.append(arena, .{
-                    .role = .user,
-                    .content = assistant_prefill_recovery_prompt,
-                });
+                )
+            else
+                null;
+            if (prefill_tool_name) |tool_name| {
                 debug_trace.eventf(
                     "gateway",
                     "assistant_prefill_recovery",
                     step_ctx,
-                    "tool_name=vision provider_attempt={d}/{d}",
-                    .{ semantic_attempt + 1, semantic_limit },
+                    "tool_name={s} provider_attempt={d}/{d}",
+                    .{ tool_name, semantic_attempt + 1, semantic_limit },
                 );
+                try within_turn_suffix.append(arena, .{
+                    .role = .user,
+                    .content = assistant_prefill_recovery_prompt,
+                });
                 stream_result.deinit(arena);
                 stream_result_set = false;
                 assistant_prefill_recovery_used = true;
@@ -9676,6 +9916,14 @@ fn processQueuedPromptLoop(
             }
         }
 
+        try advertiseUnselectedMcpCalls(
+            deps,
+            arena,
+            completion.tool_calls,
+            &selected_dynamic_tools,
+            &advertised_dynamic_tools,
+            &advertised_dynamic_tool_names,
+        );
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
@@ -10023,6 +10271,7 @@ fn processQueuedPromptLoop(
             else
                 provider_replay,
         );
+        try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
         if (step_has_content) {
@@ -12008,7 +12257,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

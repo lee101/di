@@ -38,8 +38,8 @@ pub var green_style: []const u8 = shared_theme.fx_dark.green_style;
 pub var red_style: []const u8 = shared_theme.fx_dark.red_style;
 pub var diff_added_style: []const u8 = shared_theme.fx_dark.diff_added_style;
 pub var diff_removed_style: []const u8 = shared_theme.fx_dark.diff_removed_style;
-pub var diff_added_marker_style: []const u8 = shared_theme.fx_dark.diff_added_marker_fallback;
-pub var diff_removed_marker_style: []const u8 = shared_theme.fx_dark.diff_removed_marker_fallback;
+pub var diff_added_marker_style: []const u8 = "";
+pub var diff_removed_marker_style: []const u8 = "";
 pub var approval_button_active_style: []const u8 = shared_theme.fx_dark.approval_button_active_style;
 pub var approval_button_inactive_style: []const u8 = shared_theme.fx_dark.approval_button_inactive_style;
 pub var selected_completion_style: []const u8 = shared_theme.fx_dark.selected_completion_style;
@@ -91,9 +91,13 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     selected_completion_style = theme.selected_completion_style;
     permission_auto_style = theme.permission_auto_style;
 
-    // The diff marker green/red reads the same on light and dark, so both
-    // capability variants ship in every theme; the terminal picks which applies.
-    if (truecolor_enabled) {
+    // Terminal-following defaults keep diff markers monochrome. An explicit
+    // light/dark pin or named theme enables its green/red marker colors.
+    const theme_selected = shared_theme.variantPinned() or shared_theme.sourceName() != null;
+    if (!theme_selected) {
+        diff_added_marker_style = "";
+        diff_removed_marker_style = "";
+    } else if (truecolor_enabled) {
         diff_added_marker_style = theme.diff_added_marker_truecolor;
         diff_removed_marker_style = theme.diff_removed_marker_truecolor;
     } else {
@@ -859,9 +863,11 @@ pub fn formatResumeHandoff(
     buffer: []u8,
     session_id: []const u8,
     terminal_cols: u16,
+    sessions_v2: bool,
 ) ![]const u8 {
     const label = "Continue session with:";
-    const command = "di --resume ";
+    // A v2 session resumes only with the flag that saved it.
+    const command = if (sessions_v2) "di --sessions-v2 --resume " else "di --resume ";
     const single_row_width = label.len + 1 + command.len + session_id.len;
     const separator = if (single_row_width <= terminal_cols) " " else "\n  ";
     return std.fmt.bufPrint(
@@ -869,6 +875,49 @@ pub fn formatResumeHandoff(
         "{s}{s}{s}{s}{s}{s}\n",
         .{ dim_style, label, separator, command, session_id, reset_style },
     );
+}
+
+test "diff markers are monochrome by default and colored for selected themes" {
+    const saved_truecolor = truecolorIsEnabled();
+    defer {
+        shared_theme.setSource(null, false);
+        setTruecolorSupport(saved_truecolor);
+        initTheme(false, null);
+    }
+
+    shared_theme.setSource(null, false);
+    setTruecolorSupport(true);
+    initTheme(false, null);
+    try std.testing.expectEqualStrings("", diff_added_marker_style);
+    try std.testing.expectEqualStrings("", diff_removed_marker_style);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings("", diff_added_marker_style);
+    try std.testing.expectEqualStrings("", diff_removed_marker_style);
+
+    // Explicit builtin pins are configured themes even though they use the
+    // same palette as the terminal-following default.
+    shared_theme.setSource(null, true);
+    initTheme(false, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.diff_added_marker_truecolor, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_dark.diff_removed_marker_truecolor, diff_removed_marker_style);
+    setTruecolorSupport(false);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_removed_marker_fallback, diff_removed_marker_style);
+
+    // A named theme remains explicitly selected when its file is missing and
+    // startup falls back to the builtin variant.
+    shared_theme.setSource("missing-light", false);
+    initTheme(true, null);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_added_marker_fallback, diff_added_marker_style);
+    try std.testing.expectEqualStrings(shared_theme.fx_light.diff_removed_marker_fallback, diff_removed_marker_style);
+
+    var custom = shared_theme.fx_dark;
+    custom.diff_added_marker_fallback = "[custom-add]";
+    custom.diff_removed_marker_fallback = "[custom-remove]";
+    applyTheme(custom, null);
+    try std.testing.expectEqualStrings("[custom-add]", diff_added_marker_style);
+    try std.testing.expectEqualStrings("[custom-remove]", diff_removed_marker_style);
 }
 
 test "initTheme sets light mode styles" {
@@ -887,17 +936,24 @@ test "resume handoff uses one row only when the full instruction fits" {
 
     const single_row = "Continue session with: di --resume session-123";
     var exact_buffer: [128]u8 = undefined;
-    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len);
+    const exact = try formatResumeHandoff(&exact_buffer, "session-123", single_row.len, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with: di --resume session-123\x1b[0m\n",
         exact,
     );
 
     var narrow_buffer: [128]u8 = undefined;
-    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1);
+    const narrow = try formatResumeHandoff(&narrow_buffer, "session-123", single_row.len - 1, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;245mContinue session with:\n  di --resume session-123\x1b[0m\n",
         narrow,
+    );
+
+    var v2_buffer: [128]u8 = undefined;
+    const v2 = try formatResumeHandoff(&v2_buffer, "session-123", 80, true);
+    try std.testing.expectEqualStrings(
+        "\x1b[38;5;245mContinue session with: fx --sessions-v2 --resume session-123\x1b[0m\n",
+        v2,
     );
 }
 
@@ -906,7 +962,7 @@ test "resume handoff follows the active muted theme shade" {
     defer initTheme(false, null);
 
     var buffer: [128]u8 = undefined;
-    const message = try formatResumeHandoff(&buffer, "session-123", 80);
+    const message = try formatResumeHandoff(&buffer, "session-123", 80, false);
     try std.testing.expectEqualStrings(
         "\x1b[38;5;247mContinue session with: di --resume session-123\x1b[0m\n",
         message,

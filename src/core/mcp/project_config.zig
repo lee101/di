@@ -1147,7 +1147,10 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     auth.client_id = try parseOptionalOwnedString(alloc, auth_object, "client_id");
     auth.client_secret_env = try parseOptionalOwnedString(alloc, auth_object, "client_secret_env");
     auth.client_metadata_url = try parseOptionalOwnedString(alloc, auth_object, "client_metadata_url");
-    if (auth_object.get("scopes")) |field| auth.scopes = try parseStringArray(alloc, field);
+    if (auth_object.get("scopes")) |field| {
+        auth.scopes = try parseStringArray(alloc, field);
+        auth.scopes_configured = true;
+    }
     auth.callback_port = try parseOptionalPort(auth_object, "callback_port");
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;

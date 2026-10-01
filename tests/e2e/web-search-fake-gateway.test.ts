@@ -1260,6 +1260,7 @@ describe("web_search Gateway fixture", () => {
           kind: "search",
           status: "pending",
           rawInput: {},
+          _meta: { fx: { toolCall: { internal: false } } },
         });
         expect(toolUpdates[1]?.sessionUpdate).toBe("tool_call_update");
         expect(toolUpdates[1]?.status).toBe("completed");

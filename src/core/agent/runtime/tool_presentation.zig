@@ -1274,7 +1274,7 @@ fn failureStatusDetail(
                     std.mem.findScalar(u8, actionable, '\r') == null)
                 {
                     const masked = try text_utils.maskSecrets(arena, actionable);
-                    const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+                    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
                     return if (encoded.bytes.len == 0) detail else encoded.bytes;
                 }
             }
@@ -1282,7 +1282,7 @@ fn failureStatusDetail(
 
         if (safe_result.len == 0) return detail;
         const masked = try text_utils.maskSecrets(arena, safe_result);
-        const encoded = try text_utils.encodeTerminalSafe(arena, masked, 256);
+        const encoded = try text_utils.encodeTerminalSafeInline(arena, masked, 256);
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
@@ -1293,7 +1293,7 @@ fn failureStatusDetail(
     }
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
-    const encoded = try text_utils.encodeTerminalSafe(arena, masked_detail, 256);
+    const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
     return if (encoded.bytes.len == 0) null else encoded.bytes;
 }
 
@@ -2582,7 +2582,7 @@ test "permission target preflight failure reports the actionable reason" {
     );
 }
 
-test "dynamic MCP failure derives a bounded terminal-safe detail from the safe result" {
+test "dynamic MCP failure flattens a multi-line detail into a terminal-safe summary" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2591,7 +2591,7 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     defer capture.deinit();
     const hooks = capture.hooks();
     const failure =
-        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input: labels require at least one item\nretry rejected"}]}}
+        \\{"server":"plain","tool":"mcp_plain_getThreads","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"Invalid input:\u001b[31m labels require at least one item\nretry rejected\n"}]}}
     ;
     const advertised = [_][]const u8{"mcp_plain_getThreads"};
 
@@ -2616,7 +2616,48 @@ test "dynamic MCP failure derives a bounded terminal-safe detail from the safe r
     const terminal = capture.events.items[0].terminal;
     try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
     try std.testing.expectEqualStrings(
-        "Failed mcp_plain_getThreads: Invalid input: labels require at least one item\\x0aretry rejected",
+        "Failed mcp_plain_getThreads: Invalid input:\\x1b[31m labels require at least one item retry rejected",
+        terminal.outcome.summary,
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, terminal.outcome.summary, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, terminal.outcome.summary, '\n') == null);
+}
+
+test "dynamic MCP failure flattens a pretty-printed JSON error body" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const hooks = capture.hooks();
+    const failure =
+        \\{"server":"vercel","tool":"mcp_vercel_web_fetch_vercel_url","result":{"resultType":"complete","isError":true,"content":[{"type":"text","text":"{\n  \"success\": false,\n  \"info\": \"Unable to create share\"\n}"}]}}
+    ;
+    const advertised = [_][]const u8{"mcp_vercel_web_fetch_vercel_url"};
+
+    try finishExecutedToolStatus(
+        &hooks,
+        arena,
+        7,
+        .{
+            .id = "vercel_failure",
+            .name = "mcp_vercel_web_fetch_vercel_url",
+            .arguments_json = "{}",
+        },
+        true,
+        null,
+        .{ .status = .failure, .model_output = failure },
+        failure,
+        .{ .output_bytes = failure.len, .stored_output_bytes = failure.len },
+        null,
+        &advertised,
+    );
+
+    const terminal = capture.events.items[0].terminal;
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, terminal.outcome.kind);
+    try std.testing.expectEqualStrings(
+        "Failed mcp_vercel_web_fetch_vercel_url: { \"success\": false, \"info\": \"Unable to create share\" }",
         terminal.outcome.summary,
     );
 }

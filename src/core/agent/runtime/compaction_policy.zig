@@ -268,6 +268,45 @@ test "compaction policy framing preserves exact user text and validates state ma
     try std.testing.expect((try state_artifact("ordinary source text")) == null);
 }
 
+test "compaction policy keeps restored steering as exact user text" {
+    const alloc = std.testing.allocator;
+    const io_mod = @import("../../shared/io.zig");
+    const session = @import("../../session/session.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Longer than the 2 KiB excerpt used for generated notices.
+    const correction = "Prefix every progress line with S1>. " ++ ("Keep this whole correction. " ** 100) ++ "CORRECTION_END";
+    comptime std.debug.assert(correction.len > 2048);
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast(correction), .after_tool_step_count = 0 },
+        .{ .text = @constCast(""), .after_tool_step_count = 0 },
+    };
+    var source: std.ArrayList(types.ChatMessage) = .empty;
+    try source.append(arena, .{ .role = .user, .content = "Original task.", .context_origin = .user_turn });
+    try session.appendExecutionMemoryChatMessages(arena, &source, .{ .steering = &steering });
+
+    const prepared = try prepare(arena, source.items, .{ .legacy_dir = dir }, 100_000, null);
+    try std.testing.expectEqual(@as(usize, 2), prepared.users.len);
+    try std.testing.expectEqualStrings("Original task.", prepared.users[0]);
+    try std.testing.expectEqualStrings(correction, prepared.users[1]);
+    var labeled: usize = 0;
+    for (prepared.messages) |message| {
+        const content = message.content orelse continue;
+        if (std.mem.find(u8, content, "CORRECTION_END") == null) continue;
+        try std.testing.expect(message.role == .user);
+        try std.testing.expect(std.mem.startsWith(u8, content, "USER_RETAINED:"));
+        try std.testing.expect(std.mem.endsWith(u8, content, correction));
+        labeled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), labeled);
+}
+
 test "compaction policy source selection never edits source messages" {
     const user = "original user";
     const message = types.ChatMessage{ .role = .user, .content = user, .context_origin = .user_turn };

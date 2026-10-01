@@ -1823,10 +1823,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "full-window output limit is omitted from the agent request",
+    "full-window output limit is bounded in the agent request",
     async () => {
       const model = "meta/muse-spark-1.2-contributor";
-      const finalText = "Full-window output limit omitted.";
+      const finalText = "Full-window output limit bounded.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-full-window-output-limit-",
         [fakeGatewayFinalText(finalText)],
@@ -1853,9 +1853,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.modelRequests).toHaveLength(1);
       expect(queuedGateway.requests).toHaveLength(1);
-      expect(JSON.parse(queuedGateway.requests[0]!.body)).not.toHaveProperty(
-        "maxOutputTokens",
-      );
+      expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
@@ -2622,9 +2620,13 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           },
         });
         await session.waitForComposer(TIMEOUT);
-        // A pending recovery checkpoint continues automatically on resume; no
-        // slash command exists for it anymore.
-        await session.waitForText(/continues\s+automatically/, TIMEOUT);
+        // The kill left the owner marker behind, so resume reports the
+        // unclean exit and waits instead of restarting the turn on its own.
+        await session.waitForText(/quit unexpectedly/, TIMEOUT);
+        await Bun.sleep(1_000);
+        expect(resumed.started).toBe(false);
+        expect(queuedGateway.requests).toHaveLength(2);
+        await session.sendText("continue");
         await waitForCondition(() => resumed.started, "admitted resumed response");
         await session.waitForText("Thinking", TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
@@ -2796,8 +2798,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         },
       });
       await session.waitForComposer(TIMEOUT);
-      // The pending recovery checkpoint continues automatically on resume.
-      await session.waitForText(/continues\s+automatically/, TIMEOUT);
+      // The unclean-exit gate asks before the recovering turn retries.
+      await session.waitForText(/quit unexpectedly/, TIMEOUT);
+      expect(queuedGateway.requests).toHaveLength(1);
+      await session.sendText("continue");
       await session.waitForText(finalText, TIMEOUT);
 
       expect(queuedGateway.requests).toHaveLength(2);

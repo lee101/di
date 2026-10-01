@@ -1,6 +1,7 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const shared_theme = @import("../../core/shared/theme.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const full_transcript_screen = @import("../full_transcript_screen.zig");
@@ -11402,7 +11403,7 @@ test "theme retint preserves a capped canonical anchor and visual geometry" {
     );
     const committed_diagnostic = runtime.transcriptCommitDiagnostic();
 
-    try runtime.retintEntriesForTheme(alloc, false, true);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
 
     try std.testing.expectEqualDeep(
         committed_diagnostic,
@@ -11460,7 +11461,7 @@ test "theme retint preserves a capped canonical anchor and visual geometry" {
     const retinted_diagnostic = runtime.transcriptCommitDiagnostic();
     const retinted_bytes = try alloc.dupe(u8, retinted_source.bytes);
     defer alloc.free(retinted_bytes);
-    try runtime.retintEntriesForTheme(alloc, true, true);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_light, shared_theme.fx_light);
     var unchanged_source = try runtime.prepareTranscriptSource(alloc, null);
     defer unchanged_source.deinit(alloc);
     try std.testing.expectEqualStrings(retinted_bytes, unchanged_source.bytes);
@@ -11503,7 +11504,7 @@ test "light to dark theme retint preserves retention with equal-width tokens" {
         1,
     );
 
-    try runtime.retintEntriesForTheme(alloc, true, false);
+    try runtime.retintEntriesForTheme(alloc, shared_theme.fx_light, shared_theme.fx_dark);
 
     try std.testing.expectEqual(
         transcript_runtime.TranscriptCommitDiagnosticState.stable,
@@ -11565,7 +11566,7 @@ fn checkThemeRetintAllocationFailures(alloc: Allocator) !void {
     const pending_repaints_before = runtime.render_requests.pendingReasonCount();
     const cache_origin_before = runtime.transcript_cache_origin_untrimmed;
 
-    runtime.retintEntriesForTheme(alloc, false, true) catch |err| {
+    runtime.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light) catch |err| {
         var source_after = try runtime.prepareTranscriptSource(std.testing.allocator, null);
         defer source_after.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings(source_before.bytes, source_after.bytes);
@@ -16827,4 +16828,47 @@ test "multi-word command labels stay intact when a syntax token follows" {
     // The command word colors; the bare number argument stays plain.
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;252msleep\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, source.bytes, "\x1b[38;5;250m5\x1b[39m") == null);
+}
+
+test "retint rewrites custom theme colors on a variant flip" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = transcriptTestLayout(80, 14, 10),
+        .owned_top_row = 1,
+    };
+    defer runtime.deinit(alloc);
+    try runtime.enableShadowVt(alloc);
+
+    var custom_dark = shared_theme.fx_dark;
+    custom_dark.name = "probe-dark";
+    custom_dark.statusline_style = "\x1b[38;5;201m";
+    custom_dark.syntax.keyword_style = "\x1b[38;5;202m";
+    var custom_light = shared_theme.fx_light;
+    custom_light.name = "probe-light";
+    custom_light.statusline_style = "\x1b[38;5;89m";
+    custom_light.syntax.keyword_style = "\x1b[38;5;90m";
+
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;201mMuted row\x1b[39m\n",
+        .subagent_status,
+    );
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;202mKeyword row\x1b[39m\n",
+        .subagent_status,
+    );
+    // Terminal output is user content: never retinted.
+    _ = try runtime.appendRawTranscriptEntryClassified(
+        alloc,
+        "\x1b[38;5;201muser output\x1b[39m\n",
+        .command_output,
+    );
+
+    try runtime.retintEntriesForTheme(alloc, custom_dark, custom_light);
+
+    const muted = runtime.transcript.items;
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;89mMuted row") != null);
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;90mKeyword row") != null);
+    try std.testing.expect(std.mem.find(u8, muted, "\x1b[38;5;201muser output") != null);
 }

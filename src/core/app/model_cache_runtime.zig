@@ -98,6 +98,7 @@ pub const ModelMenuCatalogState = struct {
     source: ?credentials.Source = null,
     public_only_reason: ?credentials.CatalogPublicOnlyReason = null,
     private_models_hidden: bool = false,
+    from_profile_settings: bool = false,
     failure: ?Failure = null,
 
     pub const Failure = struct {
@@ -370,14 +371,19 @@ pub const ModelMenu = struct {
         return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
     }
 
-    /// Enter resolution for the model menu. A non-empty query names the model
-    /// directly: an exact listed id selects that row, otherwise the typed id
-    /// becomes the selection (the trailing "Use <query>" row) and invalid typed
-    /// ids are rejected. Empty queries keep the ordinary highlighted selection.
+    /// Enter resolution for the model menu. A highlighted listed row always
+    /// wins, so a filtered query never overrides what the user picked. With
+    /// the trailing "Use <query>" row highlighted (or nothing listed), the
+    /// typed id becomes the selection and invalid typed ids are rejected.
     pub fn enterSelectionAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
         if (!self.active) return null;
         const typed = std.mem.trim(u8, self.query(), " \t\r\n");
         if (typed.len == 0) return self.selectedItemAlloc(alloc);
+        if (self.load_state == .ready) {
+            if (self.itemAt(self.selected_index)) |item| {
+                if (!item.custom) return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
+            }
+        }
         for (self.items.items) |item| {
             if (item.custom) continue;
             if (std.mem.eql(u8, item.id, typed)) {
@@ -508,6 +514,7 @@ pub const Runtime = struct {
     cancel_requested: std.atomic.Value(bool) = .init(false),
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
+    from_profile_settings: bool = false,
     menu: ModelMenu = .{},
     cache_path: ?[]u8 = null,
     cache_path_resolved: bool = false,
@@ -566,6 +573,7 @@ pub const Runtime = struct {
     ) void {
         self.ensureCachePath();
         self.rememberRefreshSource(provider, access);
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -598,6 +606,7 @@ pub const Runtime = struct {
     ) void {
         self.ensureCachePath();
         self.rememberRefreshSource(provider, access);
+        self.from_profile_settings = provider.provider_id == .configured;
         if (!self.beginLoad(access, provider.refresh_interval_ms)) return;
 
         const result = model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
@@ -674,7 +683,7 @@ pub const Runtime = struct {
                     loaded.* = .{ .access = requested_access };
                     self.outcome.last_failure = null;
                     if (self.menu.active) {
-                        self.menu.catalog_state = modelMenuCatalogState(self.outcome);
+                        self.menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
                     }
                     reused_public_catalog = true;
                 }
@@ -745,6 +754,7 @@ pub const Runtime = struct {
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
         self.catalog = .empty;
         self.outcome = .{};
+        self.from_profile_settings = false;
     }
 
     /// Installs a catalog that was completely fetched and validated before the
@@ -778,6 +788,7 @@ pub const Runtime = struct {
         self.catalog = moved;
         replaceOriginsLocked(self, &origins);
         self.outcome = .{ .loaded = .{ .access = metadata } };
+        self.from_profile_settings = false;
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = io_mod.milliTimestamp();
@@ -1274,7 +1285,7 @@ pub const Runtime = struct {
                 self.primaryOriginLocked(),
             ),
         }
-        menu.catalog_state = modelMenuCatalogState(self.outcome);
+        menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
         // A disk-seeded catalog keeps painting through refresh failures with no
         // failure flash; live status returns once a fetch lands.
         if (self.cache_seeded) menu.catalog_state.failure = null;
@@ -1339,7 +1350,7 @@ fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
-fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
+fn modelMenuCatalogState(outcome: CatalogOutcome, from_profile_settings: bool) ModelMenuCatalogState {
     const access = if (outcome.last_failure) |failed|
         if (outcome.loaded == null or failed.anonymous_fallback_used)
             failed.access
@@ -1360,6 +1371,7 @@ fn modelMenuCatalogState(outcome: CatalogOutcome) ModelMenuCatalogState {
         .source = access.source,
         .public_only_reason = access.public_only_reason,
         .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = from_profile_settings,
         .failure = if (failure) |failed| .{
             .category = failed.category,
             .retryable = failed.retryable,
@@ -2433,6 +2445,21 @@ test "model menu Enter accepts typed ids and rejects invalid input" {
         defer alloc.free(selected.id);
         try std.testing.expectEqualStrings("typed/while-failed", selected.id);
     }
+}
+
+test "model menu Enter prefers the highlighted row over the typed query" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    var entries = try testCatalog(alloc, "stealth/space-bunny-alpha");
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    runtime.menu.active = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, entries.items, &.{}, null);
+
+    runtime.menu.setQuery(alloc, "bunn");
+    const selected = (try runtime.menu.enterSelectionAlloc(alloc)).?;
+    defer alloc.free(selected.id);
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", selected.id);
 }
 
 test "model menu offers a Use query row for non-exact typed ids" {

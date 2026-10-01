@@ -193,6 +193,28 @@ pub fn frame_too_large_result(
     return try out.toOwnedSlice();
 }
 
+/// A tool call that could not run because its stopped server failed to
+/// start again. `failure` is the server's recorded startup failure.
+pub fn restart_failed_result(
+    alloc: Allocator,
+    server_name: []const u8,
+    tool_name: []const u8,
+    failure: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeAll("{\"server\":");
+    try std.json.Stringify.value(server_name, .{}, &out.writer);
+    try out.writer.writeAll(",\"tool\":");
+    try std.json.Stringify.value(tool_name, .{}, &out.writer);
+    try out.writer.writeAll(",\"error\":{\"kind\":\"server_restart_failed\",\"message\":");
+    const message = try std.fmt.allocPrint(alloc, "MCP server stopped and could not be restarted: {s}", .{failure});
+    defer alloc.free(message);
+    try std.json.Stringify.value(message, .{}, &out.writer);
+    try out.writer.writeAll("}}");
+    return try out.toOwnedSlice();
+}
+
 fn legacy_url_required(
     alloc: Allocator,
     tool_name: []const u8,
@@ -535,6 +557,22 @@ test "tool result extracts all content" {
     try std.testing.expectEqualStrings("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", result.images[0].data);
     try std.testing.expectEqualStrings("image/png", result.images[0].mime_type);
     try std.testing.expectEqualStrings("world", content[2].object.get("text").?.string);
+}
+
+test "a tool call whose server could not restart carries the startup failure" {
+    const alloc = std.testing.allocator;
+    const output = try restart_failed_result(
+        alloc,
+        "fixture",
+        "mcp_fixture_echo",
+        "MCP server exited with code 5 before completing startup: \"relaunch\" blocked",
+    );
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings(
+        "{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"error\":{\"kind\":\"server_restart_failed\"," ++
+            "\"message\":\"MCP server stopped and could not be restarted: MCP server exited with code 5 before completing startup: \\\"relaunch\\\" blocked\"}}",
+        output,
+    );
 }
 
 test "tool result retains protocol error diagnostics" {

@@ -131,6 +131,37 @@ pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilit
     return capabilities;
 }
 
+// A catalog output limit that fills the whole context window cannot bound a real request, and
+// omitting the limit lets some providers stop replies at a few thousand tokens.
+const full_window_output_tokens: u32 = 32_768;
+const full_window_output_divisor: u32 = 8;
+
+/// Output tokens to request and reserve for one model call, or null to leave the limit unset.
+pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
+    const advertised = capabilities.max_output_tokens orelse return null;
+    const window = capabilities.context_window orelse return advertised;
+    if (advertised < window) return advertised;
+    return @min(full_window_output_tokens, window / full_window_output_divisor);
+}
+
+test "request output limit bounds full-window catalog limits" {
+    const cases = [_]struct {
+        capabilities: Capabilities,
+        expected: ?u32,
+    }{
+        .{ .capabilities = .{}, .expected = null },
+        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
+        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
+        .{ .capabilities = .{ .context_window = 1_000_000, .max_output_tokens = 1_000_000 }, .expected = 32_768 },
+        .{ .capabilities = .{ .context_window = 131_072, .max_output_tokens = 131_072 }, .expected = 16_384 },
+        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = 16_000 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, requestOutputTokens(case.capabilities));
+    }
+}
+
 pub fn reasoningEffortSupported(capabilities: Capabilities, effort: types.ReasoningEffort) bool {
     if (effort.isDefault()) return true;
     for (capabilities.reasoning_efforts.slice()) |option| {

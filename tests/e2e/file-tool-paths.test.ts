@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -527,6 +528,65 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "read_file downscales a frame over the model pixel limit and keeps smaller images unchanged",
+    async () => {
+      const root = createIsolatedRoot();
+      const smallBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+      const gateway = startFakeGateway(
+        [
+          sse([
+            { type: "tool-call", toolCallId: "read_small", toolName: "read_file", input: { path: "small.png" } },
+            { type: "tool-call", toolCallId: "read_frame", toolName: "read_file", input: { path: "frame.png" } },
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          finalText("frames inspected"),
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"] },
+      );
+      try {
+        writeFileSync(join(root.workspace, "small.png"), Buffer.from(smallBase64, "base64"));
+        writeFileSync(join(root.workspace, "frame.png"), solidPng(3420, 2224));
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read small.png and frame.png once, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+        ]);
+        expect(gateway.requests).toHaveLength(2);
+        const body = gateway.requests[1].body;
+        expect(toolResultOutput(body, "read_frame")).toContain(
+          "[Image downscaled from 3420x2224 to 2000x1301 pixels to fit the 2000-pixel limit per side. Multiply coordinates in this image by 1.71 to get original pixels.]",
+        );
+        expect(toolResultOutput(body, "read_small")).toContain("image attached");
+        const request = JSON.parse(body) as {
+          prompt: Array<{ role?: string; content?: unknown }>;
+        };
+        const files = request.prompt
+          .filter((message) => message.role === "user" && Array.isArray(message.content))
+          .flatMap((message) => message.content as Array<Record<string, unknown>>)
+          .filter((entry) => entry.type === "file");
+        const sent = files.map((entry) => (entry.data as Record<string, unknown>).data as string);
+        expect(sent).toHaveLength(2);
+        expect(sent).toContain(smallBase64);
+        const shrunk = sent.find((data) => data !== smallBase64)!;
+        expect(pngPixelSize(Buffer.from(shrunk, "base64"))).toEqual({ width: 2000, height: 1301 });
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "corrupted stored tool image degrades to an explicit notice on resume",
     async () => {
       const root = createIsolatedRoot();
@@ -584,6 +644,73 @@ describe("filesystem path handling", () => {
         const body = secondGateway.requests[0].body;
         expect(body).toContain("Stored tool image unavailable");
         expect(body).not.toContain(pngBase64);
+      } finally {
+        secondGateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "resumed follow-up request extends the live request byte for byte",
+    async () => {
+      const root = createIsolatedRoot();
+      const lines = Array.from(
+        { length: 400 },
+        (_, index) => `PARITY_LINE_${String(index + 1).padStart(3, "0")}_${"x".repeat(24)}`,
+      );
+      writeFileSync(join(root.workspace, "parity.md"), `${lines.join("\n")}\n`);
+      const firstGateway = startFakeGateway([
+        toolCall("edit_parity_1", "edit_file", {
+          path: "parity.md",
+          old_string: "PARITY_LINE_200_",
+          new_string: "PARITY_EDITED_200_",
+        }),
+        finalText("parity edit done"),
+      ]);
+      let sessionId = "";
+      let liveBody = "";
+      try {
+        const first = await runFx(
+          ["ask", "--auto", "--json", "Edit parity.md once, then stop."],
+          { cwd: root.workspace, env: gatewayEnv(root, firstGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        sessionId = parseFxJson(first).session_id;
+        expect(firstGateway.requests.length).toBe(2);
+        liveBody = firstGateway.requests[1].body;
+        expect(toolResultOutput(liveBody, "edit_parity_1")).not.toContain("Not executed");
+      } finally {
+        firstGateway.stop();
+      }
+      // The edit snapshots are large, so they live behind a handle and stay
+      // out of the log that resume reads.
+      const events = readFileSync(
+        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
+        "utf8",
+      );
+      expect(events).toMatch(/"content_handle":"diff-[0-9a-f]{16}-[0-9a-f]{16}\.json"/);
+      expect(events).not.toContain("PARITY_LINE_001_");
+
+      const secondGateway = startFakeGateway([finalText("parity follow-up done")]);
+      try {
+        const resumed = await runFx(
+          ["ask", "--auto", "--json", "--resume", sessionId, "What changed in parity.md?"],
+          { cwd: root.workspace, env: gatewayEnv(root, secondGateway, root.home), timeoutMs: TIMEOUT },
+        );
+        expect(resumed.code, resumed.stderr).toBe(0);
+        expect(secondGateway.requests.length).toBe(1);
+        const live = JSON.parse(liveBody) as { prompt: unknown[]; tools?: unknown };
+        const next = JSON.parse(secondGateway.requests[0].body) as { prompt: unknown[]; tools?: unknown };
+        // Provider prompt caching depends on the resumed request starting
+        // with exactly the bytes the live session last sent.
+        const livePrompt = live.prompt.map((message) => JSON.stringify(message));
+        const nextPrompt = next.prompt.map((message) => JSON.stringify(message));
+        expect(livePrompt.length).toBeGreaterThanOrEqual(3);
+        expect(livePrompt.join("")).toContain("edit_parity_1");
+        expect(nextPrompt.length).toBeGreaterThan(livePrompt.length);
+        expect(nextPrompt.slice(0, livePrompt.length)).toEqual(livePrompt);
+        expect(JSON.stringify(next.tools)).toBe(JSON.stringify(live.tools));
       } finally {
         secondGateway.stop();
         rmSync(root.root, { recursive: true, force: true });

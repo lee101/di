@@ -65,7 +65,7 @@ async function runPrompt(agent) {
 // A model with an advertised fast path accepts fast and sends it on the wire.
 {
   const gateway = mockGateway();
-  const agent = await createAgent(gateway, { model: "sdk/fast-model", fast: true });
+  const agent = await createAgent(gateway, { model: { id: "sdk/fast-model", fast: true } });
   assert.equal(gateway.state.catalogFetches, 1);
   const result = await runPrompt(agent);
   assert.equal(result.stopReason, "end_turn");
@@ -90,11 +90,24 @@ async function runPrompt(agent) {
   await assert.rejects(
     createAgent(gateway, { model: "sdk/plain-model", fast: true }),
     (error) => {
-      assert.equal(error.code, "LIBFX_UNSUPPORTED_FAST");
+      assert.equal(error.code, "LIBFX_MODEL_UNSUPPORTED_FAST");
+      assert.equal(error.model, "sdk/plain-model");
+      assert.equal(error.capability, "fast");
       assert.match(error.message, /Fast mode is not available/);
       assert.match(error.message, /sdk\/plain-model/);
       return true;
     },
+  );
+  assert.equal(gateway.state.catalogFetches, 1);
+}
+
+// An unsupported model option in auto mode is a product error, not a reason
+// to retry creation on another backend.
+if (backend === "native") {
+  const gateway = mockGateway();
+  await assert.rejects(
+    createAgent(gateway, { backend: "auto", model: { id: "sdk/plain-model", fast: true } }),
+    (error) => error.code === "LIBFX_MODEL_UNSUPPORTED_FAST" && error.model === "sdk/plain-model",
   );
   assert.equal(gateway.state.catalogFetches, 1);
 }

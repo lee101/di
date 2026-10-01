@@ -29,6 +29,36 @@ const sort_utils = @import("../core/shared/sort_utils.zig");
 
 pub const gateway_system_prompt = @embedFile("system_prompt.md");
 
+const terminal_identity = "You are di, a local coding CLI assistant with tool access.";
+const terminal_rendering = "Write responses in GitHub-flavored Markdown, which fx renders in the terminal.";
+const terminal_table_emphasis = "Use bold sparingly, and never inside tables, since fx already bolds table headers.";
+
+/// The base prompt for hosts that present fx inside another application
+/// rather than a terminal. Only the terminal identity and rendering claims
+/// differ; a wording change in the base prompt fails the build here.
+pub const embedded_system_prompt = embedded: {
+    @setEvalBranchQuota(4_000_000);
+    var text: []const u8 = gateway_system_prompt;
+    text = replaceOnce(
+        text,
+        terminal_identity,
+        "You are di, a coding agent with tool access. A client application hosts this conversation and displays your replies; do not describe yourself as running in a terminal.",
+    );
+    text = replaceOnce(text, terminal_rendering, "Write responses in GitHub-flavored Markdown, which the client application renders.");
+    text = replaceOnce(text, terminal_table_emphasis, "Use bold sparingly.");
+    const final = text[0..text.len].*;
+    break :embedded &final;
+};
+
+fn replaceOnce(comptime haystack: []const u8, comptime needle: []const u8, comptime replacement: []const u8) []const u8 {
+    const index = std.mem.find(u8, haystack, needle) orelse
+        @compileError("system prompt no longer contains: " ++ needle);
+    if (std.mem.find(u8, haystack[index + needle.len ..], needle) != null) {
+        @compileError("system prompt repeats: " ++ needle);
+    }
+    return haystack[0..index] ++ replacement ++ haystack[index + needle.len ..];
+}
+
 pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
     _ = model;
     return null;
@@ -36,6 +66,7 @@ pub fn modelPromptOverlay(model: []const u8) ?[]const u8 {
 
 pub const prompt_policy = prompt_policy_contract.Policy{
     .system_prompt = gateway_system_prompt,
+    .embedded_system_prompt = embedded_system_prompt,
     .model_prompt_overlay_fn = modelPromptOverlay,
 };
 
@@ -3575,6 +3606,12 @@ test "gateway_system_prompt: source routing" {
 test "gateway_system_prompt: concise interaction and concrete blockers" {
     try expectDefaultPromptContains("Reply in the same natural language as the user's latest message unless asked to switch.");
     try expectDefaultPromptContains("Keep responses short and practical.");
+    try expectDefaultPromptDoesNotContain("use markdown unless requested");
+    try expectDefaultPromptContains("Write responses in GitHub-flavored Markdown, which fx renders in the terminal.");
+    try expectDefaultPromptContains("Use a table for comparisons or data with several attributes per item");
+    try expectDefaultPromptContains("fenced code blocks only for code, commands to run, or verbatim output");
+    try expectDefaultPromptContains("answer simple questions in plain sentences");
+    try expectDefaultPromptContains("Use bold sparingly, and never inside tables");
     try expectDefaultPromptContains("Before the first tool call in a tool-driven task, always send one brief user-visible update");
     try expectDefaultPromptContains("Never start the first tool silently.");
     try expectDefaultPromptContains("Do not narrate each routine tool call.");
@@ -3620,6 +3657,25 @@ test "gateway_system_prompt: static guidance is capability-neutral" {
     try expectDefaultPromptDoesNotContain("Use task only for focused delegated work");
     try expectDefaultPromptContains("Persist until the task is handled");
     try expectDefaultPromptContains("memory or general knowledge");
+}
+
+test "embedded system prompt drops only terminal identity and rendering claims" {
+    // The only remaining mention is the instruction not to claim a terminal.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, embedded_system_prompt, "terminal"));
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_identity) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, terminal_rendering) == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "bolds table headers") == null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "A client application hosts this conversation") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "which the client application renders") != null);
+    // Every other section is shared with the terminal prompt.
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Safety") != null);
+    try std.testing.expect(std.mem.find(u8, embedded_system_prompt, "# Tools and verification") != null);
+    try std.testing.expectEqual(
+        std.mem.count(u8, gateway_system_prompt, "\n"),
+        std.mem.count(u8, embedded_system_prompt, "\n"),
+    );
+    try std.testing.expectEqualStrings(embedded_system_prompt, prompt_policy.systemPromptFor(false));
+    try std.testing.expectEqualStrings(gateway_system_prompt, prompt_policy.systemPromptFor(true));
 }
 
 test "model prompt overlay is opt-in and transient guidance stays out of the base prompt" {

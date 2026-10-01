@@ -84,7 +84,7 @@ function normalizeFast(value) {
   return value;
 }
 
-function normalizeAgentOptions(value) {
+export function normalizeAgentOptions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError("createFxAgent() options must be an object");
   }
@@ -93,9 +93,24 @@ function normalizeAgentOptions(value) {
     throw new TypeError("createFxAgent() does not accept env; pass apiKey and model directly");
   }
   options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
-  options.model = boundedString(options.model, "model", maxModelBytes, false);
-  options.effort = normalizeEffort(options.effort);
-  options.fast = normalizeFast(options.fast);
+  if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
+    if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast")) {
+      throw new TypeError("model options cannot be mixed with top-level effort or fast");
+    }
+    const model = options.model;
+    for (const name of Object.keys(model)) {
+      if (name !== "id" && name !== "effort" && name !== "fast") {
+        throw new TypeError(`unsupported model option: ${name}`);
+      }
+    }
+    options.model = boundedString(model.id, "model.id", maxModelBytes, true);
+    options.effort = normalizeEffort(model.effort);
+    options.fast = normalizeFast(model.fast);
+  } else {
+    options.model = boundedString(options.model, "model", maxModelBytes, false);
+    options.effort = normalizeEffort(options.effort);
+    options.fast = normalizeFast(options.fast);
+  }
   validateGatewayChatUrl(options.gatewayChatUrl);
   return options;
 }
@@ -110,16 +125,15 @@ function agentEnvironment(options) {
   };
 }
 
-// The kernel rejects an unsupported effort or fast lane during initialize;
-// these messages originate only from that validation, so the rejection is
-// safe to retype.
-function agentBootstrapError(error) {
-  if (error instanceof Error &&
-    (error.message === "Invalid reasoning effort" || error.message.startsWith("Reasoning effort"))) {
-    error.code ??= "LIBFX_UNSUPPORTED_EFFORT";
-  }
-  if (error instanceof Error && error.message.startsWith("Fast mode")) {
-    error.code ??= "LIBFX_UNSUPPORTED_FAST";
+function agentRpcError(response) {
+  const error = new Error(response.message);
+  const data = response.data;
+  if (data && ["LIBFX_MODEL_UNSUPPORTED_EFFORT", "LIBFX_MODEL_UNSUPPORTED_FAST"].includes(data.code) &&
+    typeof data.model === "string" &&
+    data.capability === (data.code === "LIBFX_MODEL_UNSUPPORTED_FAST" ? "fast" : "effort")) {
+    error.code = data.code;
+    error.model = data.model;
+    error.capability = data.capability;
   }
   return error;
 }
@@ -1276,6 +1290,15 @@ export async function createFxTerminal(options) {
   };
 }
 
+function blobByteLength(value) {
+  if (typeof Blob === "undefined" || value == null) return null;
+  try {
+    return Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value);
+  } catch {
+    return null;
+  }
+}
+
 function normalizePromptInput(input) {
   if (typeof input === "string") return [{ type: "text", text: input }];
   if (!Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of prompt blocks");
@@ -1284,24 +1307,34 @@ function normalizePromptInput(input) {
   return input.map((block, index) => {
     if (!block || typeof block !== "object") throw new TypeError(`prompt block ${index} must be an object`);
     if (block.type === "image") {
-      if (typeof block.data !== "string" || block.data.length === 0) {
-        throw new TypeError(`image prompt block ${index} requires base64 data`);
+      const size = blobByteLength(block.data);
+      const blob = size !== null;
+      if (!blob && (typeof block.data !== "string" || block.data.length === 0)) {
+        throw new TypeError(`image prompt block ${index} requires base64 data or a Blob`);
       }
-      if (typeof block.mimeType !== "string" || block.mimeType.length === 0 || block.mimeType.length > 128) {
+      const mimeType = blob ? block.data.type : block.mimeType;
+      if (blob && block.mimeType !== undefined && block.mimeType !== mimeType) {
+        throw new TypeError(`image prompt block ${index} mimeType disagrees with Blob.type`);
+      }
+      if (typeof mimeType !== "string" || mimeType.length === 0 || mimeType.length > 128) {
         throw new TypeError(`image prompt block ${index} requires a mimeType`);
       }
-      if (block.data.length > maxPromptImageDataBytes) {
+      if (blob && (!Number.isSafeInteger(size) || size <= 0)) {
+        throw new TypeError(`image prompt block ${index} requires a non-empty Blob with a valid size`);
+      }
+      const encodedLength = blob ? Math.ceil(size / 3) * 4 : block.data.length;
+      if (encodedLength > maxPromptImageDataBytes) {
         throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
       }
       imageCount += 1;
       if (imageCount > maxPromptImages) {
         throw new RangeError(`prompt cannot contain more than ${maxPromptImages} images`);
       }
-      imageBytes += block.data.length;
+      imageBytes += encodedLength;
       if (imageBytes > maxPromptImagesBytes) {
         throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
       }
-      return { type: "image", data: block.data, mimeType: block.mimeType };
+      return { type: "image", data: block.data, mimeType };
     }
     if (block.type === "text") {
       if (typeof block.text !== "string") throw new TypeError(`text prompt block ${index} requires text`);
@@ -1315,6 +1348,50 @@ function normalizePromptInput(input) {
     }
     throw new TypeError(`unsupported prompt block type: ${String(block.type)}`);
   });
+}
+
+function promptFrameSize(prompt) {
+  let blobDataBytes = 0;
+  const projected = prompt.map((block) => {
+    if (block.type !== "image" || typeof block.data === "string") return block;
+    const size = blobByteLength(block.data);
+    if (!Number.isSafeInteger(size)) throw new TypeError("image prompt requires a valid Blob size");
+    blobDataBytes += Math.ceil(size / 3) * 4;
+    return { type: "image", data: "", mimeType: block.mimeType };
+  });
+  return encoder.encode(JSON.stringify({ sessionId: "", prompt: projected })).length + blobDataBytes + promptFrameEnvelopeBytes;
+}
+
+async function materializePromptBlobs(blocks, isCancelled) {
+  const encoded = [];
+  let imageBytes = 0;
+  for (const [index, block] of blocks.entries()) {
+    if (isCancelled()) return null;
+    if (block.type !== "image") {
+      encoded.push(block);
+      continue;
+    }
+    if (typeof block.data === "string") {
+      imageBytes += block.data.length;
+      if (imageBytes > maxPromptImagesBytes) {
+        throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+      }
+      encoded.push(block);
+      continue;
+    }
+    const bytes = new Uint8Array(await block.data.arrayBuffer());
+    if (isCancelled()) return null;
+    const encodedLength = Math.ceil(bytes.length / 3) * 4;
+    if (encodedLength > maxPromptImageDataBytes) {
+      throw new RangeError(`image prompt block ${index} exceeds the ${maxPromptImageDataBytes} byte per-image libfx limit`);
+    }
+    imageBytes += encodedLength;
+    if (imageBytes > maxPromptImagesBytes) {
+      throw new RangeError(`prompt images exceed the ${maxPromptImagesBytes} byte libfx frame limit`);
+    }
+    encoded.push({ type: "image", data: bytesToBase64(bytes), mimeType: block.mimeType });
+  }
+  return normalizePromptInput(encoded);
 }
 
 function normalizeSteeringInput(input) {
@@ -1443,6 +1520,7 @@ export async function createFxAgent(options = {}) {
   let sessionId = null;
   let activeTurn = null;
   let closing = false;
+  let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
   const emit = (type, detail = {}) => {
     try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
@@ -1572,7 +1650,9 @@ export async function createFxAgent(options = {}) {
   const send = (message) => {
     if (closing) throw new Error("fx agent is closing");
     emit("acp.send", { message });
+    if (message.method === "session/prompt" && activeTurn?.cancelled) throw new Error("Cancelled");
     runtime.write(`${JSON.stringify(message)}\n`);
+    if (message.method === "session/prompt") activeTurn?.promptWritten();
   };
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
@@ -1580,11 +1660,13 @@ export async function createFxAgent(options = {}) {
     try { send({ jsonrpc: "2.0", id, method, params }); } catch (error) { pending.delete(id); reject(error); }
   });
   runtime.exited.then((code) => {
-    emit("runtime.exit", { code });
     closing = true;
     const error = runtime.error ?? new Error(`fx-core exited with code ${code} before completing the ACP request`);
+    coreExitError = error;
+    activeTurn?.failPendingBlob(error);
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
+    emit("runtime.exit", { code });
   });
   runtime.setLineHandler((message, size) => {
     emit("acp.receive", { message });
@@ -1623,7 +1705,7 @@ export async function createFxAgent(options = {}) {
       return;
     }
     const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
-    if (message.error) waiter.reject(new Error(message.error.message)); else waiter.resolve(message.result);
+    if (message.error) waiter.reject(agentRpcError(message.error)); else waiter.resolve(message.result);
   }
   try {
     await request("initialize", {
@@ -1648,7 +1730,7 @@ export async function createFxAgent(options = {}) {
     try { runtime.abortHostEffects(); } catch {}
     try { runtime.closeStdin(); } catch {}
     try { await runtime.exited; } catch {}
-    throw agentBootstrapError(error);
+    throw error;
   }
 
   const agent = {
@@ -1765,7 +1847,8 @@ export async function createFxAgent(options = {}) {
 
   function startTurn(input, promptOptions) {
     const prompt = normalizePromptInput(input);
-    if (encoder.encode(JSON.stringify({ sessionId: "", prompt })).length + promptFrameEnvelopeBytes > maxPromptFrameBytes) {
+    const hasBlobs = prompt.some((block) => block.type === "image" && typeof block.data !== "string");
+    if (promptFrameSize(prompt) > maxPromptFrameBytes) {
       throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
     }
     const signal = promptOptions.signal;
@@ -1778,6 +1861,12 @@ export async function createFxAgent(options = {}) {
     let terminalError;
     let reportedPressure = false;
     let discardedBytes = 0;
+    let cancelBlobRead = null;
+    let rejectBlobRead = null;
+    let resolvePromptStart = null;
+    const promptStarted = hasBlobs ? new Promise((resolve) => { resolvePromptStart = resolve; }) : null;
+    let pendingSteeringCount = 0;
+    let pendingSteeringBytes = 0;
     const toolControllers = new Set();
     let finished = false;
     let cancelled = false;
@@ -1802,34 +1891,63 @@ export async function createFxAgent(options = {}) {
       transportBytes: 0,
       lastTransportActivityAt: null,
       get cancelled() { return cancelled; },
+      failPendingBlob(error) {
+        rejectBlobRead?.(error);
+        rejectBlobRead = null;
+        cancelBlobRead = null;
+      },
+      promptWritten() {
+        resolvePromptStart?.(true);
+        resolvePromptStart = null;
+      },
       steer(text) {
         if (finished || cancelled || activeTurn !== turn) {
           return Promise.reject(new Error("no prompt is running"));
         }
-        let accepted;
-        try {
-          if (typeof runtime.steer === "function") {
-            runtime.steer(text);
-            void turn.push({
-              sessionUpdate: "user_message_chunk",
-              content: { type: "text", text },
-            });
-            accepted = Promise.resolve();
-          } else {
-            accepted = request("libfx/steer", { sessionId, text });
+        if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+        const apply = () => {
+          if (finished || cancelled || activeTurn !== turn) {
+            return Promise.reject(new Error("no prompt is running"));
           }
-        } catch (error) {
-          return Promise.reject(error);
+          if (closing) return Promise.reject(coreExitError ?? new Error("fx agent is closing"));
+          try {
+            if (typeof runtime.steer === "function") {
+              runtime.steer(text);
+              void turn.push({
+                sessionUpdate: "user_message_chunk",
+                content: { type: "text", text },
+              });
+              return Promise.resolve();
+            }
+            return request("libfx/steer", { sessionId, text });
+          } catch (error) {
+            return Promise.reject(error);
+          }
+        };
+        if (!resolvePromptStart) return apply();
+        const bytes = encoder.encode(text).length;
+        if (pendingSteeringCount >= maxSteeringMessages || bytes > maxSteeringQueueBytes - pendingSteeringBytes) {
+          return Promise.reject(new Error("steering queue is full"));
         }
-        return accepted;
+        pendingSteeringCount++;
+        pendingSteeringBytes += bytes;
+        return promptStarted.then((started) => {
+          if (coreExitError && !cancelled) throw coreExitError;
+          return started === true ? apply() : Promise.reject(started instanceof Error ? started : new Error("no prompt is running"));
+        }).finally(() => { pendingSteeringCount--; pendingSteeringBytes -= bytes; });
       },
       cancel() {
         if (finished || cancelled) return;
         cancelled = true;
+        cancelBlobRead?.();
+        cancelBlobRead = null;
+        rejectBlobRead = null;
+        resolvePromptStart?.(false);
+        resolvePromptStart = null;
         runtime.closeSteering?.();
         resumeOutput?.();
         resumeOutput = null;
-        send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+        if (!closing) send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
         for (const controller of toolControllers) controller.abort();
         runtime.abortHostEffects();
       },
@@ -1854,6 +1972,8 @@ export async function createFxAgent(options = {}) {
       },
     };
     if (signal?.aborted) {
+      resolvePromptStart?.(false);
+      resolvePromptStart = null;
       finished = true;
       turn.result = Promise.resolve({ stopReason: "cancelled" });
       return turn;
@@ -1862,10 +1982,37 @@ export async function createFxAgent(options = {}) {
     runtime.openSteering?.();
     const abort = () => turn.cancel();
     signal?.addEventListener("abort", abort, { once: true });
-    turn.result = request("session/prompt", { sessionId, prompt })
-      .then((response) => ({ stopReason: cancelled ? "cancelled" : response.stopReason, usage: response.usage }))
+    const blobReadCancelled = hasBlobs ? new Promise((resolve, reject) => {
+      cancelBlobRead = () => resolve(null);
+      rejectBlobRead = reject;
+    }) : null;
+    const response = hasBlobs
+      ? Promise.race([
+        Promise.resolve().then(() => materializePromptBlobs(prompt, () => cancelled || closing)),
+        blobReadCancelled,
+      ]).then((encodedPrompt) => {
+        cancelBlobRead = null;
+        rejectBlobRead = null;
+        if (coreExitError && !cancelled) throw coreExitError;
+        if (encodedPrompt === null || cancelled || closing) {
+          resolvePromptStart?.(false);
+          resolvePromptStart = null;
+          return { stopReason: "cancelled" };
+        }
+        if (promptFrameSize(encodedPrompt) > maxPromptFrameBytes) {
+          throw new RangeError(`prompt exceeds the ${maxPromptFrameBytes} byte libfx frame limit`);
+        }
+        return request("session/prompt", { sessionId, prompt: encodedPrompt });
+      })
+      : request("session/prompt", { sessionId, prompt });
+    turn.result = response
+      .then((value) => ({ stopReason: cancelled ? "cancelled" : value.stopReason, usage: value.usage }))
       .catch((error) => {
-        if (error.message === "Cancelled") return { stopReason: "cancelled" };
+        cancelBlobRead = null;
+        rejectBlobRead = null;
+        resolvePromptStart?.(error);
+        resolvePromptStart = null;
+        if (cancelled && error.message === "Cancelled") return { stopReason: "cancelled" };
         terminalError = error;
         throw error;
       })
