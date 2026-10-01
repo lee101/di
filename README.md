@@ -2,11 +2,11 @@
   <img src="art/di-roman-ii.png" width="240" alt="di Roman numeral II mark">
 </p>
 
-fx is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
+di is a coding agent CLI written in Zig: a small native binary that is open source (Apache-2.0), model-agnostic, and embeddable as a harness in larger systems. Its interface stays closer to a Unix shell than an IDE in the terminal.
 
 ## Highlights
 
-- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter [OpenPaths](https://openpaths.io)
 - **Any interface:** interactive shell, one-shot `fx ask` for scripts, or embedded through libfx and ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Inline images:** PNG screenshots and attachments render in the transcript through Kitty graphics, with a text fallback in other terminals
