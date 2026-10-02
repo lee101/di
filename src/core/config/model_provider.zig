@@ -122,7 +122,8 @@ pub const ProviderSelection = struct {
 
 pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "openpaths")) return .openpaths;
-    if (std.ascii.eqlIgnoreCase(value, "openrouter")) return .openpaths;
+    // A connection named `openrouter` is a configured provider, so the name is
+    // not aliased to OpenPaths here. The OpenPaths route keeps its own name.
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
