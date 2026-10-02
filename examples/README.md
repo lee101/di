@@ -16,8 +16,8 @@ The examples pin libfx 0.0.8. They do not use the CLI's built-in tools.
 Clone this repository, then open the example directory:
 
 ```sh
-git clone https://github.com/vercel-labs/fx.git
-cd fx/examples/node-chat
+git clone https://github.com/lee101/di.git
+cd di/examples/node-chat
 npm install
 ```
 
