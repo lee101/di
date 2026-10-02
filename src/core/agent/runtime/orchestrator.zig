@@ -7046,6 +7046,10 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
+        var remaining_steps_buffer: [256]u8 = undefined;
+        if (agent_steps.remaining_steps_notice(&remaining_steps_buffer, config.agent_step_limit, step)) |notice| {
+            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = notice });
+        }
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }

@@ -259,6 +259,8 @@ How the cycle runs:
 
 Autonomous mode requires session saving and cannot be combined with `--no-save`. Pair it with `--json` to get one parseable result object per turn on stdout.
 
+When you set `max_agent_steps` or `FX_MAX_AGENT_STEPS`, the model receives a remaining-budget reminder during the last three calls. The cap stays exact; unfinished turns still exit unsuccessfully. The default unbounded mode adds no reminder.
+
 ## di improves di
 
 di can act as a subagent on its own repository. Every iteration starts from a

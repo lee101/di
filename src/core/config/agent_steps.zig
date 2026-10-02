@@ -24,6 +24,25 @@ pub fn allowsStep(limit: usize, completed_steps: usize) bool {
     return limit == 0 or completed_steps < limit;
 }
 
+/// Returns a borrowed notice in buffer only near an explicit turn limit.
+pub fn remaining_steps_notice(buffer: []u8, limit: usize, completed_steps: usize) ?[]const u8 {
+    if (limit == 0 or completed_steps >= limit) return null;
+    const remaining = limit - completed_steps;
+    if (remaining > 3) return null;
+    return std.fmt.bufPrint(buffer, "Turn budget: {d} model call{s} left, including this one. Prioritize required fixes and verification over optional exploration. Leave a final response when possible and report unfinished work honestly.", .{ remaining, if (remaining == 1) "" else "s" }) catch null;
+}
+
+test "remaining step notices preserve unbounded and exact cap semantics" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expect(remaining_steps_notice(&buffer, 0, 100) == null);
+    try std.testing.expect(remaining_steps_notice(&buffer, 24, 20) == null);
+    try std.testing.expect(std.mem.startsWith(u8, remaining_steps_notice(&buffer, 24, 21).?, "Turn budget: 3 model calls"));
+    try std.testing.expect(std.mem.startsWith(u8, remaining_steps_notice(&buffer, 24, 23).?, "Turn budget: 1 model call"));
+    try std.testing.expect(remaining_steps_notice(&buffer, 24, 24) == null);
+    try std.testing.expect(remaining_steps_notice(&buffer, 24, 25) == null);
+    try std.testing.expect(remaining_steps_notice(buffer[0..1], 1, 0) == null);
+}
+
 test "resolve max agent steps preserves explicit unbounded zero" {
     try std.testing.expectEqual(@as(usize, 25), resolveMaxAgentSteps(null, 25));
     try std.testing.expectEqual(@as(usize, 0), resolveMaxAgentSteps(0, 25));
