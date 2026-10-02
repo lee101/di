@@ -87,6 +87,10 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    if (request.session_id) |session_id| if (session_id.len > 0) {
+        try writer.writeAll(",\"prompt_cache_key\":");
+        try std.json.Stringify.value(session_id, .{}, writer);
+    };
     // Codex exposes Fast mode as its priority service tier for supported
     // ChatGPT subscription models.
     if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
@@ -606,6 +610,38 @@ test "OpenAI Codex standard requests omit the priority service tier" {
     defer std.testing.allocator.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+}
+
+test "OpenAI Codex sends the session id as prompt_cache_key and omits it without one" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const with_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+        .session_id = "session_abc",
+    });
+    defer std.testing.allocator.free(with_id);
+    try std.testing.expect(std.mem.find(u8, with_id, "\"prompt_cache_key\":\"session_abc\"") != null);
+
+    const empty_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+        .session_id = "",
+    });
+    defer std.testing.allocator.free(empty_id);
+    try std.testing.expect(std.mem.find(u8, empty_id, "prompt_cache_key") == null);
+
+    const without_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(without_id);
+    try std.testing.expect(std.mem.find(u8, without_id, "prompt_cache_key") == null);
 }
 
 test "OpenAI Codex serializes each verified image directly once" {
