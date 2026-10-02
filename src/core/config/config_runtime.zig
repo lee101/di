@@ -352,11 +352,35 @@ pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-fn resolve_provider_selection(settings: *Settings) !void {
+fn resolve_provider_selection(
+    alloc: Allocator,
+    settings: *Settings,
+    diagnostics: ?*std.ArrayList(ConfigDiagnostic),
+) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
-    if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
+    const provider = settings.provider orelse return;
+    settings.provider = provider.bind(settings.providers orelse .{}) catch |err| switch (err) {
+        // A profile naming a connection this build cannot bind is a settings
+        // defect, not a reason to refuse to start. Fall back to the default
+        // route and report it the way every other bad key is reported.
+        error.UnknownConfiguredProvider, error.ConfiguredProviderChanged => blk: {
+            debug_trace.logf(
+                "config",
+                "provider={s} cannot bind: {s}",
+                .{ provider.label(), @errorName(err) },
+            );
+            if (diagnostics) |list| {
+                try list.append(alloc, .{
+                    .layer = .user,
+                    .cause = .malformed_settings,
+                    .setting_key = try alloc.dupe(u8, "provider"),
+                });
+            }
+            break :blk null;
+        },
+    };
 }
 
 /// Reads only profile-global connection definitions. Caller owns the registry.
@@ -644,7 +668,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings, &diagnostics);
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (modelEnvOverride() != null) {
         const override_provider = model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider));
@@ -1344,12 +1368,12 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
-        try resolve_provider_selection(&settings);
+        try resolve_provider_selection(alloc, &settings, null);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings, null);
     return settings;
 }
 
@@ -4827,7 +4851,10 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
 test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    // The settings store reads the profile only when these directories are
+    // private, so the fixture creates them with the mode it requires.
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -4862,4 +4889,31 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+test "a provider that cannot bind degrades to a diagnostic instead of refusing to start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"openrouter\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer detailed.deinit(std.testing.allocator);
+
+    // No `providers` entry binds that name, so the run falls back to the
+    // default route instead of exiting with an internal error tag.
+    try std.testing.expect(detailed.settings.provider == null);
+    var reported = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .malformed_settings) reported = true;
+    }
+    try std.testing.expect(reported);
 }

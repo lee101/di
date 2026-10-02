@@ -2432,7 +2432,10 @@ test "ultrafast startup separates profile preferences from process overrides" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    // The settings store reads the profile only when these directories are
+    // private, so the fixture creates them with the mode it requires.
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-off");
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-on");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");

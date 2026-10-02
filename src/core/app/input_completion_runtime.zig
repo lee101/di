@@ -1187,9 +1187,12 @@ pub fn CompletionRuntime(comptime App: type) type {
                         return true;
                     };
                     const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (capabilities.supports_fast_mode) {
+                    // A model can support Ultra without Fast, so the speed
+                    // column opens for either; Fast stays unselected when the
+                    // model cannot serve it.
+                    if (capabilities.supports_fast_mode or capabilities.supports_ultrafast_mode) {
                         try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
+                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), capabilities.supports_fast_mode, false, .fast);
                     } else {
                         try applyModelSelection(app, model, effort, app.fast_mode, false);
                         app.input_runtime.inputResetState().clearCurrent(app.alloc);

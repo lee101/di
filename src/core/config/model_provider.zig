@@ -102,14 +102,11 @@ pub const NameKey = struct {
 };
 
 /// Default model served when the OpenPaths provider is active and the user has
-/// not chosen one. Verified against the OpenPaths catalog. OpenPaths serves
-/// the same stealth route the OpenRouter catalog exposes, so this id is
-/// reachable on either route.
+/// not chosen one. The stealth route is only served to a caller that
+/// authenticated with `OPENROUTER_API_KEY`; an OpenPaths key resolves to a
+/// catalog without this id, so the route is chosen by the credential rather
+/// than by the provider name.
 pub const openpaths_default_model = "stealth/space-bunny-alpha";
-
-/// The stealth route can be retired or replaced without notice, so
-/// `model_fallback.zig` pairs it with the MiMo pro id it fails over to.
-pub const openrouter_default_model = "stealth/space-bunny-alpha";
 
 pub fn openpathsDefaultModel() []const u8 {
     return openpaths_default_model;
@@ -239,7 +236,6 @@ fn hasNonEmptyEnv(name: []const u8) bool {
 }
 test "the compiled default model is the stealth space bunny id" {
     try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpaths_default_model);
-    try std.testing.expectEqualStrings(openrouter_default_model, openpathsDefaultModel());
     try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModel());
 }
 

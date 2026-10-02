@@ -1415,6 +1415,7 @@ fn askErrorNotice(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
+        error.UltrafastUnavailable => "ultrafast is unavailable for this provider or model; rerun without it",
         else => null,
     };
 }
@@ -1972,6 +1973,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     {
         // Ultra mode must never follow an explicit model override by default.
         ctx.ultrafast_mode = false;
+    }
+    if (ctx.ultrafast_mode) {
+        // Interactive and ACP hosts refuse an unsupported Ultra request before
+        // sending it. `di ask` needs the same check: without it the turn is
+        // rejected outright by resolveUltrafastProviderOptions.
+        const capabilities = availableModelCapabilities(&ctx, ctx.model);
+        const served = ctx.provider == .gateway and
+            std.mem.startsWith(u8, ctx.model, "openai/") and
+            capabilities.supports_ultrafast_mode;
+        if (!served) {
+            ctx.ultrafast_mode = false;
+            try options.deps.write_stderr(
+                options.deps.stderr_ctx,
+                "di ask: Ultra mode is unavailable for this provider or model and may increase cost; continuing without it\n",
+            );
+        }
     }
     if (options.provider_order_override) |order| {
         ctx.provider_order = order;

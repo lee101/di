@@ -1321,6 +1321,11 @@ pub fn authentication_error_message(err: anyerror) []const u8 {
         error.McpAuthorizationDenied => "Authorization was declined. Run the connection command again to retry",
         error.McpAuthorizationCallbackTimedOut => "Authorization timed out. Run the connection command again and finish authorization in your browser while di stays open",
         error.SlackScopeConfigurationMismatch => "Your configured Slack scopes request fewer permissions than di requires. Authorization was not started. Custom scope subsets are not supported for the di app. Remove the local scopes override only if you want to authorize the full shared scope set",
+        error.MissingAuthorizationCompletion => "Slack authorization needs the di session to report completion. Run it from di rather than a raw shell",
+        error.SlackBridgeUnavailable => "Could not reach the Slack authorization service. Check the network and retry",
+        error.InvalidSlackBridgeConfiguration => "Slack returned an authorization configuration this build cannot use. Update di and retry",
+        error.InvalidSlackAuthorizationEndpoint => "Slack authorization resolved to an unexpected endpoint. Authorization was not started",
+        error.InvalidSlackAuthorizationResource => "Slack authorization resolved to an unexpected resource. Authorization was not started",
         else => @errorName(err),
     };
 }

@@ -252,7 +252,14 @@ const LocalSurfaceOptions = struct {
 fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
-    return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+    // Only the providers the usage line documents can be signed into. The
+    // catalog also answers to route names such as `openpaths`, and signing out
+    // of one would fall through to the Vercel credential instead.
+    const provider = provider_catalog.parse(rest[0]) orelse return error.InvalidLoginProviderArgs;
+    return switch (provider) {
+        .gateway, .codex, .grok => provider,
+        .openpaths, .configured => error.InvalidLoginProviderArgs,
+    };
 }
 
 fn selectCatalogModel(
@@ -1057,7 +1064,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("di: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: di [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
+        try writer.writer.writeAll("usage: di [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--sessions-v2] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -2948,14 +2955,6 @@ fn permissionModeForSnapshot(mode: anytype) types.PermissionMode {
         .ask => .ask,
         .auto => .auto,
         .yolo => .yolo,
-    };
-}
-
-fn permissionModeLabel(mode: anytype) []const u8 {
-    return switch (mode) {
-        .ask => "ask",
-        .auto => "auto",
-        .yolo => "yolo",
     };
 }
 
