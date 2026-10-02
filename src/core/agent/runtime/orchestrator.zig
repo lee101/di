@@ -45,6 +45,7 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
+const runtime_live_context = @import("live_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
@@ -4725,6 +4726,7 @@ fn disableFastRouteAfterFailure(
 /// can never splice output across two different models.
 noinline fn applyCircuitBreakerFallback(
     provider: model_provider.ProviderId,
+    credential_source: ?types.CredentialSource,
     fallback_slot: *?[]const u8,
     route_model: *[]const u8,
     cause: model_response_recovery.FailureCause,
@@ -4732,7 +4734,7 @@ noinline fn applyCircuitBreakerFallback(
     latest_diagnostic: *?types.ModelFailureDiagnostic,
     trace_ctx: TraceContext,
 ) bool {
-    if (provider != .gateway and provider != .openpaths) return false;
+    if (provider != .openpaths or credential_source != .openrouter_api_key) return false;
     if (!replay_safe) return false;
     if (cause != .provider_unavailable and cause != .transport_interrupted) return false;
     if (fallback_slot.* != null) return false;
@@ -4753,12 +4755,13 @@ noinline fn applyCircuitBreakerFallback(
 test "model circuit breaker is limited to compatible gateway transports" {
     const original = model_provider.openpaths_default_model;
 
-    inline for (.{ model_provider.ProviderId.codex, model_provider.ProviderId.grok }) |provider| {
+    inline for (.{ model_provider.ProviderId.codex, model_provider.ProviderId.grok, model_provider.ProviderId.gateway }) |provider| {
         var fallback: ?[]const u8 = null;
         var route: []const u8 = original;
         var diagnostic: ?types.ModelFailureDiagnostic = null;
         try std.testing.expect(!applyCircuitBreakerFallback(
             provider,
+            .openrouter_api_key,
             &fallback,
             &route,
             .provider_unavailable,
@@ -4771,11 +4774,21 @@ test "model circuit breaker is limited to compatible gateway transports" {
         try std.testing.expect(diagnostic == null);
     }
 
+    inline for (.{ @as(?types.CredentialSource, null), @as(?types.CredentialSource, .openpaths_api_key) }) |source| {
+        var fallback: ?[]const u8 = null;
+        var route: []const u8 = original;
+        var diagnostic: ?types.ModelFailureDiagnostic = null;
+        try std.testing.expect(!applyCircuitBreakerFallback(.openpaths, source, &fallback, &route, .provider_unavailable, true, &diagnostic, .{}));
+        try std.testing.expect(fallback == null);
+        try std.testing.expectEqualStrings(original, route);
+    }
+
     var fallback: ?[]const u8 = null;
     var route: []const u8 = "openpaths/stealth/ox-alpha";
     var diagnostic: ?types.ModelFailureDiagnostic = null;
     try std.testing.expect(applyCircuitBreakerFallback(
         .openpaths,
+        .openrouter_api_key,
         &fallback,
         &route,
         .provider_unavailable,
@@ -4783,7 +4796,7 @@ test "model circuit breaker is limited to compatible gateway transports" {
         &diagnostic,
         .{},
     ));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", fallback.?);
+    try std.testing.expectEqualStrings("openrouter/free", fallback.?);
     try std.testing.expectEqualStrings(fallback.?, route);
     try std.testing.expect(diagnostic != null);
 }
@@ -7346,9 +7359,13 @@ fn processQueuedPromptLoop(
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            var request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            }
+            if (try runtime_live_context.project(overlay_arena, config, request_messages)) |projection| {
+                request_messages = try with_replyable_conversation_tail(overlay_arena, projection.messages);
+                try gateway_instructions.append(overlay_arena, .{ .role = .system, .content = projection.instructions });
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
@@ -7715,6 +7732,7 @@ fn processQueuedPromptLoop(
                 latest_recovery_diagnostic = failure_diagnostic;
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     failure_cause,
@@ -8367,6 +8385,7 @@ fn processQueuedPromptLoop(
                 const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,
@@ -8764,6 +8783,7 @@ fn processQueuedPromptLoop(
                 );
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,
@@ -12213,7 +12233,7 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 &summary_accumulator,
                 assistant_text,
-                .completed,
+                .failed,
                 null,
                 &finish_trace,
                 "terminal_validation_retry",

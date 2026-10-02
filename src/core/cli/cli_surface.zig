@@ -1553,6 +1553,7 @@ fn runNonInteractiveWithDeps(
             defer mcp_inspection.deinit(alloc);
             var snapshot = try doctor_runtime.collect(
                 alloc,
+                workspace_root,
                 cfg.secret_store,
                 cfg.default_model,
                 cfg.default_agent_step_limit,

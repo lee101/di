@@ -17,26 +17,58 @@ pub const EditError = error{ StaleRevision, StaleBaseline, InvalidRange, SplitTo
 pub const max_notes_bytes = 64 * 1024;
 pub const max_edits = 128;
 
+/// Binds edits to context content, excluding request-only origin and tail flags.
 pub fn digest(messages: []const types.ChatMessage) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hashCount(&hash, messages.len);
     for (messages) |message| {
-        hash.update(@tagName(message.role));
+        hashField(&hash, @tagName(message.role));
         hashField(&hash, message.content orelse "");
         hashField(&hash, message.tool_call_id orelse "");
+        hashField(&hash, message.tool_name orelse "");
+        hashValue(&hash, message.provider_replay);
+        hashValue(&hash, .{
+            message.tool_result_status,
+            message.tool_result_memory,
+            message.permission_feedback,
+            message.restored_steering,
+        });
+        hashCount(&hash, message.images.len);
+        for (message.images) |image| {
+            hashField(&hash, image.path);
+            hashField(&hash, image.media_type);
+            hashField(&hash, image.snapshot_path orelse "");
+            hashField(&hash, image.snapshot_sha256 orelse "");
+            hashField(&hash, image.inline_data orelse "");
+        }
+        hashCount(&hash, message.tool_calls.len);
         for (message.tool_calls) |call| {
             hashField(&hash, call.id);
             hashField(&hash, call.name);
             hashField(&hash, call.arguments_json);
+            hashField(&hash, call.provider_result orelse "");
         }
     }
     return hash.finalResult();
 }
 
+fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256).initHasher(hash.*, &buffer);
+    std.json.Stringify.value(value, .{}, &writer.writer) catch unreachable;
+    writer.writer.flush() catch unreachable;
+    hash.* = writer.hasher;
+}
+
 fn hashField(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
-    var length: [8]u8 = undefined;
-    std.mem.writeInt(u64, &length, @intCast(value.len), .little);
-    hash.update(&length);
+    hashCount(hash, value.len);
     hash.update(value);
+}
+
+fn hashCount(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(value), .little);
+    hash.update(&length);
 }
 
 /// Caller owns the returned slice. Its contents borrow the source and proposal.
@@ -123,4 +155,52 @@ test "live context rejects stale edits and split tool groups" {
     const projected = try apply(std.testing.allocator, &source, 1, proposal);
     defer std.testing.allocator.free(projected);
     try std.testing.expectEqual(@as(usize, 1), projected.len);
+}
+
+test "live context validates ranges notes and pending parallel calls" {
+    const source = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{
+            .{ .id = "a", .name = "shell", .arguments_json = "{}" },
+            .{ .id = "b", .name = "shell", .arguments_json = "{}" },
+        } },
+        .{ .role = .tool, .tool_call_id = "b", .content = "second" },
+        .{ .role = .tool, .tool_call_id = "a", .content = "first" },
+    };
+    const base = digest(&source);
+    const Cases = struct { edits: []const Edit, expected: EditError };
+    for ([_]Cases{
+        .{ .edits = &.{.{ .start = 0, .end = 2, .notes = "partial" }}, .expected = error.SplitToolGroup },
+        .{ .edits = &.{.{ .start = 1, .end = 3, .notes = "orphan" }}, .expected = error.SplitToolGroup },
+        .{ .edits = &.{.{ .start = 0, .end = 4, .notes = "range" }}, .expected = error.InvalidRange },
+        .{ .edits = &.{.{ .start = 0, .end = 3, .notes = "\xff" }}, .expected = error.InvalidNotes },
+        .{ .edits = &.{.{ .start = 0, .end = 3, .notes = "\x00" }}, .expected = error.InvalidNotes },
+    }) |case| try std.testing.expectError(case.expected, apply(std.testing.allocator, &source, 0, .{ .revision = 0, .baseline = base, .edits = case.edits }));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(alloc: std.mem.Allocator, input: []const types.ChatMessage) !void {
+            const result = try apply(alloc, input, 0, .{ .revision = 0, .baseline = digest(input), .edits = &.{.{ .start = 0, .end = input.len, .notes = "both calls succeeded" }} });
+            defer alloc.free(result);
+            try std.testing.expectEqual(@as(usize, 1), result.len);
+        }
+    }.check, .{@as([]const types.ChatMessage, &source)});
+}
+
+test "live context baseline includes retained metadata and image content" {
+    var source = [_]types.ChatMessage{.{ .role = .tool, .tool_call_id = "call", .content = "result" }};
+    const initial = digest(&source);
+    source[0].context_origin = .user_turn;
+    source[0].standalone_response = true;
+    try std.testing.expectEqualSlices(u8, &initial, &digest(&source));
+    source[0].tool_result_memory = .{ .review_feedback = true, .preview = "different view" };
+    try std.testing.expect(!std.mem.eql(u8, &initial, &digest(&source)));
+    const with_memory = digest(&source);
+    source[0].tool_result_memory.?.review_feedback = false;
+    try std.testing.expect(!std.mem.eql(u8, &with_memory, &digest(&source)));
+
+    var path = [_]u8{'p'};
+    var media_type = [_]u8{'m'};
+    var image_bytes = [_]u8{1};
+    source[0].images = &.{.{ .path = &path, .media_type = &media_type, .inline_data = &image_bytes }};
+    const with_image = digest(&source);
+    image_bytes[0] = 2;
+    try std.testing.expect(!std.mem.eql(u8, &with_image, &digest(&source)));
 }

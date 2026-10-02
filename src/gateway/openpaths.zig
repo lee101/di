@@ -1087,6 +1087,10 @@ fn fetchBoundedGet(
 }
 
 fn modelsUrl(alloc: Allocator, source: types.CredentialSource) ![]const u8 {
+    if (io_mod.getenv("FX_E2E_OPENPATHS_MODELS_URL")) |override| {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenPathsEndpoint;
+        return alloc.dupe(u8, override);
+    }
     if (io_mod.getenv(e2e_endpoint_env)) |_| {
         // The e2e chat override only covers POST /chat/completions; catalogs stay live.
         return switch (source) {

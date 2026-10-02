@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
@@ -10,6 +10,162 @@ async function withReasoning(response: Response, ...deltas: Record<string, unkno
 }
 
 describe("configured providers", () => {
+  for (const openpaths_key of [undefined, "synthetic-openpaths-key"]) {
+    test(`automatically chooses Space Bunny with ${openpaths_key ? "both compatible keys" : "an unconfigured OpenRouter key"}`, async () => {
+      const f = fixture(body => {
+        expect(body.model).toBe("stealth/space-bunny-alpha");
+        return completion(body.model, "default free route selected");
+      });
+      try {
+        const base = f.settings.providers.local.base_url;
+        writeFileSync(f.settingsPath, JSON.stringify({ auto_upgrade: false }), { mode: 0o600 });
+        const env = { ...f.env, OPENPATHS_API_KEY: openpaths_key, OPENROUTER_API_KEY: "synthetic-default-key",
+          AI_GATEWAY_API_KEY: undefined, FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_OPENPATHS_CHAT_URL: `${base}/chat/completions`,
+          FX_E2E_OPENPATHS_MODELS_URL: `${base}/models` };
+        const result = await runFx(["ask", "--json", "--quiet", "Respond briefly"], {
+          cwd: f.workspace,
+          env,
+          timeoutMs: 20000,
+        });
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout).model).toBe("stealth/space-bunny-alpha");
+        expect(JSON.parse(result.stdout).output).toBe("default free route selected");
+        expect(f.requests).toHaveLength(1);
+        expect(f.requests[0].authorization).toBe("Bearer synthetic-default-key");
+        const doctor = await runFx(["doctor", "--json"], { cwd: f.workspace, env });
+        expect(doctor.code).toBe(0);
+        const snapshot = JSON.parse(doctor.stdout);
+        expect(snapshot.model).toBe("stealth/space-bunny-alpha");
+        expect(snapshot.auth).toBe("OPENROUTER_API_KEY");
+        expect(snapshot.checks.find((check: { name: string }) => check.name === "auth").status).toBe("ok");
+        expect(f.requests).toHaveLength(1);
+      } finally { f.close(); }
+    }, 30000);
+  }
+
+  test("built-in OpenRouter recovery switches only to the free router", async () => {
+    const f = fixture(body => {
+      if (body.model === "stealth/space-bunny-alpha") {
+        return new Response(JSON.stringify({ error: { message: "primary unavailable" } }), { status: 503 });
+      }
+      expect(body.model).toBe("openrouter/free");
+      return completion(body.model, "free recovery succeeded");
+    });
+    try {
+      const base = f.settings.providers.local.base_url;
+      const result = await runFx(["ask", "--json", "--quiet", "Respond briefly"], {
+        cwd: f.workspace,
+        env: { ...f.env, FX_PROVIDER: "openpaths", FX_MODEL: "stealth/space-bunny-alpha",
+          OPENPATHS_API_KEY: undefined, OPENROUTER_API_KEY: "synthetic-free-router-key",
+          AI_GATEWAY_API_KEY: undefined, FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_OPENPATHS_CHAT_URL: `${base}/chat/completions`,
+          FX_E2E_OPENPATHS_MODELS_URL: `${base}/models` },
+        timeoutMs: 30000,
+      });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toBe("free recovery succeeded");
+      expect(f.requests.some(request => request.body.model === "openrouter/free")).toBe(true);
+      for (const request of f.requests) {
+        expect(["stealth/space-bunny-alpha", "openrouter/free"]).toContain(request.body.model);
+        expect(request.authorization).toBe("Bearer synthetic-free-router-key");
+      }
+    } finally { f.close(); }
+  }, 45000);
+
+  test("explicit OpenPaths credential selection wins over automatic free routing", async () => {
+    const f = fixture(body => completion(body.model, "explicit source preserved"));
+    try {
+      const base = f.settings.providers.local.base_url;
+      writeFileSync(f.settingsPath, JSON.stringify({ auto_upgrade: false, provider: "openpaths",
+        credential_source: "openpaths_api_key", models: { openpaths: "fixture-openpaths-model" } }), { mode: 0o600 });
+      const result = await runFx(["ask", "--json", "--quiet", "Respond briefly"], {
+        cwd: f.workspace,
+        env: { ...f.env, OPENPATHS_API_KEY: "synthetic-openpaths-key", OPENROUTER_API_KEY: "synthetic-router-key",
+          AI_GATEWAY_API_KEY: undefined, FX_DISABLE_KEYCHAIN: "1",
+          FX_E2E_OPENPATHS_CHAT_URL: `${base}/chat/completions`,
+          FX_E2E_OPENPATHS_MODELS_URL: `${base}/models` },
+        timeoutMs: 20000,
+      });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toBe("explicit source preserved");
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.model).toBe("fixture-openpaths-model");
+      expect(f.requests[0].authorization).toBe("Bearer synthetic-openpaths-key");
+    } finally { f.close(); }
+  }, 30000);
+
+  test("recovery checkpoints reuse unchanged large edit snapshots", async () => {
+    let calls = 0;
+    let snapshot: string | undefined;
+    let modified: bigint | undefined;
+    const f = fixture(body => {
+      calls++;
+      if (calls === 1) return toolCompletion(body.model, "write_file", { path: "large.txt", content: "line\n".repeat(4000) }, "large-write");
+      if (calls === 2) return toolCompletion(body.model, "read_file", { path: "large.txt" }, "read-after-write");
+      if (calls === 3) {
+        const sessions = join(f.home, ".fx", "sessions");
+        const session = readdirSync(sessions).find(name => existsSync(join(sessions, name, "tool-results")))!;
+        const results = join(sessions, session, "tool-results");
+        snapshot = join(results, readdirSync(results).find(name => name.startsWith("diff-"))!);
+        modified = statSync(snapshot, { bigint: true }).mtimeNs;
+        return toolCompletion(body.model, "read_file", { path: "large.txt" }, "read-again");
+      }
+      expect(statSync(snapshot!, { bigint: true }).mtimeNs).toBe(modified!);
+      return completion(body.model, "snapshot reused");
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--quiet", "Create and inspect large.txt"], { cwd: f.workspace, env: { ...f.env, FX_PERMISSION_MODE: "full-access" }, timeoutMs: 30000 });
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout).output).toBe("snapshot reused");
+      expect(readFileSync(join(f.workspace, "large.txt"), "utf8")).toBe("line\n".repeat(4000));
+      expect(f.requests).toHaveLength(4);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("sends only explicitly declared reasoning effort using the selected wire format", async () => {
+    const f = fixture(body => {
+      expect(body.reasoning).toEqual({ effort: "low" });
+      expect(body.reasoning_effort).toBeUndefined();
+      return completion(body.model, "low effort accepted");
+    });
+    try {
+      (f.settings.providers.local as any).reasoning_format = "openrouter";
+      (f.settings.providers.local.model_metadata["local-model"] as any).reasoning_efforts = ["low", "high"];
+      f.save();
+      const result = await runFx(["ask", "--json", "--quiet", "--effort", "low", "Respond briefly"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout).output).toBe("low effort accepted");
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 30000);
+
+  test("merges unsigned reasoning fragments across tool continuation and saved resume", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      if (calls === 1) return withReasoning(toolCompletion(body.model, "read_file", { path: "note.txt" }), {
+        reasoning_details: Array.from({ length: 2000 }, () => ({ type: "reasoning.text", text: "x", index: 0, format: "unknown" })),
+      });
+      const replay = body.messages.find((message: any) => message.reasoning_details)?.reasoning_details;
+      expect(replay).toEqual([{ type: "reasoning.text", text: "x".repeat(2000), index: 0, format: "unknown" }]);
+      return completion(body.model, "compact replay accepted");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const first = await runFx(["ask", "--json", "--quiet", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(first.code).toBe(0);
+      expect(first.stderr).toBe("Reading note.txt\n");
+      const saved = JSON.parse(first.stdout);
+      const resumed = await runFx(["ask", "--json", "--quiet", "--resume", saved.session_id, "Continue"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(JSON.parse(resumed.stdout).output).toBe("compact replay accepted");
+      expect(f.requests).toHaveLength(3);
+    } finally { f.close(); }
+  }, 45000);
+
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
     const f = fixture(body => {
@@ -336,6 +492,34 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
+  test.each([429, 500, 502, 503, 504, 400, 401, 403, 413])("custom review retries temporary HTTP %i failures without duplicate effects", async status => {
+    const temporary = [429, 500, 502, 503, 504].includes(status);
+    let marker = "", reviews = 0;
+    const f = fixture(body => {
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) {
+        reviews++;
+        if (reviews === 1) return new Response(JSON.stringify({ error: { message: "fixture provider failure" } }), { status });
+        return toolCompletion(body.model, "permission_decision", { decision: "clear", rationale: "fixture review" });
+      }
+      if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
+      return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'from pathlib import Path; p=Path(${JSON.stringify(marker)}); p.write_text(p.read_text()+"one\\n")'` } });
+    });
+    try {
+      marker = join(f.workspace, "review-effects.txt");
+      writeFileSync(marker, "");
+      f.settings.permission_mode = "auto";
+      f.settings.models.local = "stealth/space-bunny-alpha";
+      (f.settings.providers.local.model_metadata as any)["stealth/space-bunny-alpha"] = { context_window: 1000000, max_output_tokens: 16384, supports_tool_use: true };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(reviews).toBe(temporary ? 2 : 1);
+      expect(readFileSync(marker, "utf8")).toBe(temporary ? "one\n" : "");
+      const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
+      if (temporary) expect(requests[1].body).toEqual(requests[0].body);
+    } finally { f.close(); }
+  }, 20000);
+
   test.each(["clear", "caution", "missing", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
     let marker = "";
     let reviews = 0;
@@ -480,7 +664,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("di: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }

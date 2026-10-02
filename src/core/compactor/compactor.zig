@@ -38,6 +38,7 @@ const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const live_context = @import("live_context.zig");
+pub const live_context_mirror = @import("live_context_mirror.zig");
 
 pub const Size = window.Size;
 
@@ -363,6 +364,8 @@ test "an unreadable checkpoint numbers new turns, tool calls and ledgers after t
 }
 
 test {
+    _ = live_context;
+    _ = live_context_mirror;
     _ = window;
     _ = summarize;
     _ = ledger;

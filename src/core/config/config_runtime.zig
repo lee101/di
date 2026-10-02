@@ -330,7 +330,7 @@ pub fn selectProviderModel(
     provider_override: ?model_provider.ProviderId,
     run_model: ?[]const u8,
 ) ModelSelectionError!model_provider.ProviderSelection {
-    const provider = provider_override orelse settings.provider orelse .gateway;
+    const provider = model_provider.effectiveProvider(provider_override orelse settings.provider);
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
         .openpaths => run_model orelse model_provider.openpaths_default_model,
@@ -4802,6 +4802,14 @@ test "selectProviderModel chooses only its provider-scoped model" {
     );
     const overridden_gateway = try selectProviderModel("default/model", &codex_settings, .gateway, null);
     try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
+}
+
+test "selectProviderModel respects credential discovery when no provider is configured" {
+    const settings = Settings{};
+    const selected = try selectProviderModel("default/model", &settings, null, null);
+    const expected = model_provider.defaultId();
+    try std.testing.expectEqual(expected, selected.provider);
+    try std.testing.expectEqualStrings(if (expected == .openpaths) model_provider.openpaths_default_model else "default/model", selected.model);
 }
 
 test "selectProviderModel accepts the run model when the provider has none saved" {

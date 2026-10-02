@@ -72,7 +72,7 @@ const todo_list_entry_schema = model_tool_schema.ObjectSchema{
     .additional_properties = false,
 };
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
+    "Run every command with shell.run. For ordinary commands omit profile and shell; never provide both. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -1234,6 +1234,7 @@ test "shell advertises only run interact and stop" {
 }
 
 test "shell run schema separates profile and explicit shell forms" {
+    try std.testing.expect(std.mem.find(u8, shell_description, "omit profile and shell; never provide both") != null);
     try std.testing.expectEqual(@as(usize, 4), shell_action_schemas.len);
     const profile_run = shell_action_schemas[0];
     const explicit_run = shell_action_schemas[1];
