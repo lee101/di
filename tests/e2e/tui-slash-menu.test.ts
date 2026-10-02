@@ -2903,10 +2903,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await waitForModelsMenu(session, 4);
       await session.sendLiteralText("gemini");
-      grid = await waitForModelsMenu(session, 1);
+      grid = await waitForModelsMenu(session, 2);
       pane = grid.join("\n");
       expect(composerContains(pane, "gemini")).toBe(true);
       expect(pane).toContain("google/gemini-3-pro");
+      expect(pane).toContain("Use gemini");
       expect(pane).not.toContain("openai/gpt-5.4");
 
       await session.sendKeys("C-[");
@@ -3192,7 +3193,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
       expect(pane).toContain(`Switched to ${selectedModel} (effort: default, speed: normal)`);
-      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
+      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe(`auto · deepseek-v4-pro-0813 · ${fixture.workspace}`);
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
       expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
       expect(session.isAlive()).toBe(true);
