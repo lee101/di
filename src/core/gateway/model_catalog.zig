@@ -324,6 +324,7 @@ pub const ModelCatalogEntry = struct {
     has_reasoning: bool = false,
     reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty,
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     has_vision: bool = false,
     has_file_input: bool = false,
     /// Tri-state claim: true = input_modalities contains "image", false = array
@@ -386,6 +387,7 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .has_reasoning = entry.has_reasoning,
         .reasoning_efforts = reasoning_efforts,
         .supports_fast_mode = entry.supports_fast_mode,
+        .supports_ultrafast_mode = entry.supports_ultrafast_mode,
         .has_vision = entry.has_vision,
         .has_file_input = entry.has_file_input,
         .image_input_claim = entry.image_input_claim,

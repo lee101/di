@@ -215,10 +215,10 @@ function fakeGatewayEnv(
 }
 
 // The session backends a test runs on. v2 sits behind FX_SESSIONS_V2 and
-// keeps a session's side files in ~/.fx/session-files/{id}.
+// keeps a session in one folder, ~/.fx/sessions/v2/{id} (D48).
 const SESSION_BACKENDS = [
-  { suffix: "", env: { FX_SESSIONS_V2: undefined }, sideFiles: "sessions" },
-  { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, sideFiles: "session-files" },
+  { suffix: "", env: { FX_SESSIONS_V2: undefined }, v2: false },
+  { suffix: " on sessions v2", env: { FX_SESSIONS_V2: "1" }, v2: true },
 ] as const;
 
 function acpContentText(content: unknown): string {
@@ -2056,6 +2056,45 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP compacts automatically at the configured percent",
+    async () => {
+      // Replies without provider usage, so fx sizes the conversation by its
+      // own estimate.
+      const reply = (text: string) => fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: text },
+        { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+      ]);
+      // About 30,000 estimated tokens: past 20 percent of the model's input,
+      // well short of the default 80 percent.
+      const large = "ACP_LARGE_REPLY\n" + "historical reference line, not new completed work.\n".repeat(2_400);
+      for (const percent of [undefined, "20"]) {
+        const root = createIsolatedRoot("fx-acp-compact-percent-");
+        const gateway = startFakeGateway([reply(large), reply("ACP_AFTER_REPLY")], {
+          models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000 }],
+        });
+        try {
+          client = await AcpClient.create({
+            cwd: root.workspace,
+            env: { ...fakeGatewayEnv(root, gateway), ...(percent ? { FX_AUTO_COMPACT_PERCENT: percent } : {}) },
+          });
+          await startCodeSession(client);
+          expect((await runPrompt(client, "Write the large reply.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          expect((await runPrompt(client, "Continue.", TIMEOUT)).promptResult.result.stopReason).toBe("end_turn");
+          // A plain turn has nothing to note, so compacting it needs no model call.
+          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests[1]!.body.includes("compacted_conversation"), `percent ${percent ?? "default"}`).toBe(percent !== undefined);
+          expect(client.stderr).toBe("");
+        } finally {
+          await client?.close();
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "ACP session/load replays structured tool call frames",
     async () => {
       const root = createIsolatedRoot("fx-acp-load-tool-replay-");
@@ -3280,33 +3319,44 @@ describe("acp: model-independent", () => {
           expect(client.stderr).toBe("");
           await client.close();
 
-          // A stored prompt that cannot be read fails the load instead of
-          // running the session without the client's instructions. A fresh
-          // process reads it from disk; an already active session keeps its own.
-          writeFileSync(
-            join(root.home, ".fx", backend.sideFiles, sessionId, "client", "system-prompt.txt"),
-            "corrupt\u0000prompt",
-          );
-          client = await AcpClient.create({
-            cwd: root.workspace,
-            env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
-          });
-          await client.request("initialize", { protocolVersion: 1 }, 10);
-          const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
-          expect(other.error).toBeUndefined();
-          await client.readLine();
-          const unreadable = await client.request("session/load", {
-            sessionId,
-            cwd: root.workspace,
-            mcpServers: [],
-          }, 12) as any;
-          expect(unreadable.error.code).toBe(-32603);
-          expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
-          // The session that was active before the failed load still runs.
-          const third = await runPrompt(client, "Still there?", TIMEOUT);
-          expect(third.promptResult.result.stopReason).toBe("end_turn");
-          expect(gateway.requests).toHaveLength(3);
-          expect(client.stderr).toBe("");
+          if (backend.v2) {
+            // v2 keeps the prompt as one setting in the session's own log
+            // (D46): nothing beside the log can go bad on its own.
+            const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId, "log.jsonl"), "utf8");
+            const prompts = log.trimEnd().split("\n").map((line) => JSON.parse(line))
+              .filter((line) => line.kind === "set" && line.key === "client_prompt");
+            expect(prompts).toHaveLength(1);
+            expect(JSON.stringify(prompts[0].value)).toContain(marker);
+            expect(existsSync(join(root.home, ".fx", "session-files"))).toBe(false);
+          } else {
+            // A stored prompt that cannot be read fails the load instead of
+            // running the session without the client's instructions. A fresh
+            // process reads it from disk; an already active session keeps its own.
+            writeFileSync(
+              join(root.home, ".fx", "sessions", sessionId, "client", "system-prompt.txt"),
+              "corrupt\u0000prompt",
+            );
+            client = await AcpClient.create({
+              cwd: root.workspace,
+              env: { ...fakeGatewayEnv(root, gateway), ...backend.env },
+            });
+            await client.request("initialize", { protocolVersion: 1 }, 10);
+            const other = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 11) as any;
+            expect(other.error).toBeUndefined();
+            await client.readLine();
+            const unreadable = await client.request("session/load", {
+              sessionId,
+              cwd: root.workspace,
+              mcpServers: [],
+            }, 12) as any;
+            expect(unreadable.error.code).toBe(-32603);
+            expect(unreadable.error.message).toBe("Session client system prompt could not be restored");
+            // The session that was active before the failed load still runs.
+            const third = await runPrompt(client, "Still there?", TIMEOUT);
+            expect(third.promptResult.result.stopReason).toBe("end_turn");
+            expect(gateway.requests).toHaveLength(3);
+            expect(client.stderr).toBe("");
+          }
         } finally {
           await client?.close();
           gateway.stop();

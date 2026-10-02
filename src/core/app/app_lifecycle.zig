@@ -17,6 +17,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
@@ -136,9 +137,14 @@ pub const StartupState = struct {
     permission_rules: types.PermissionRuleSet = .{},
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
+    configured_ultrafast_mode: bool = false,
+    ultrafast_process_override: ?bool = null,
+    ultrafast_mode_source: config_runtime.ConfigSource = .compiled_default,
     fast_mode_model_bound: bool = false,
     fast_mode_source: config_runtime.ConfigSource = .compiled_default,
     slash_menu_categories: bool = true,
@@ -248,10 +254,9 @@ pub const StartupState = struct {
         }
     }
 
-    /// Applies the per-launch `--effort`/`--fast` overrides after session
-    /// preferences are configured, so the flags shape runtime state without
-    /// rewriting what the workspace or session stored.
-    pub fn applyLaunchTurnOverrides(self: *StartupState, effort: ?types.ReasoningEffort, fast: ?bool) void {
+    /// Applies per-launch turn overrides after session preferences are
+    /// configured, so they shape runtime state without rewriting persistence.
+    pub fn applyLaunchTurnOverrides(self: *StartupState, effort: ?types.ReasoningEffort, fast: ?bool, ultrafast: ?bool) void {
         if (effort) |value| self.effort = value;
         if (fast) |value| {
             self.fast_mode = value;
@@ -259,6 +264,11 @@ pub const StartupState = struct {
             // footer indicator reflects it; --no-fast clears the binding.
             self.fast_mode_model_bound = value;
         }
+        if (ultrafast) |value| {
+            self.ultrafast_process_override = value;
+            self.ultrafast_mode = value;
+        }
+        if (self.ultrafast_mode) self.fast_mode = false;
     }
 
     /// Applies per-launch `--provider-order`/`--provider-strict` flags. Like
@@ -326,6 +336,7 @@ pub const StartupStatus = struct {
     selected_model: []const u8,
     owned_selected_model: ?[]u8 = null,
     model_origin: ModelOrigin = .default,
+    ultrafast_mode: bool = false,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
     agent_step_limit: usize,
@@ -538,6 +549,7 @@ pub fn loadStartupStatusWithAuthMode(
         .selected_model = selected_model.value,
         .owned_selected_model = selected_model.owned,
         .model_origin = ModelOrigin.of(settings, configured_selection.provider, run_model),
+        .ultrafast_mode = detailed.ultrafast_mode_env_override orelse (settings.ultrafast_mode orelse false),
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
@@ -597,7 +609,14 @@ fn loadStartupStateFromOwnedWorkspace(
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
     const settings = &detailed.settings;
-    // A rejected profile cannot safely identify the destination of model data.
+    // A malformed process override must never silently fall through to a
+    // potentially paid profile preference, regardless of credential mode.
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .invalid_ultrafast_mode_override) {
+            return error.InvalidUltrafastOverride;
+        }
+    }
+    // A rejected local profile cannot safely identify the destination of model data.
     if (auth_mode == .local) for (detailed.diagnostics) |diagnostic| {
         if (diagnostic.layer != .user) continue;
         switch (diagnostic.cause) {
@@ -605,7 +624,10 @@ fn loadStartupStateFromOwnedWorkspace(
                 if (credential_mode != .stored) return error.InvalidProfileConfiguration;
                 state.model_requests_blocked = true;
             },
-            .malformed_settings, .settings_too_large, .invalid_model_id => return error.InvalidProfileConfiguration,
+            .malformed_settings,
+            .settings_too_large,
+            .invalid_model_id,
+            => return error.InvalidProfileConfiguration,
             else => {},
         }
     };
@@ -665,6 +687,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
+    state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
@@ -677,6 +700,10 @@ fn loadStartupStateFromOwnedWorkspace(
     state.fast_mode = fast_mode.enabled;
     state.fast_mode_model_bound = fast_mode.model_bound;
     state.fast_mode_source = detailed.sources.fast_mode;
+    state.configured_ultrafast_mode = settings.ultrafast_mode orelse false;
+    state.ultrafast_process_override = detailed.ultrafast_mode_env_override;
+    state.ultrafast_mode = state.ultrafast_process_override orelse state.configured_ultrafast_mode;
+    state.ultrafast_mode_source = detailed.sources.ultrafast_mode;
     state.slash_menu_categories = settings.slash_menu_categories orelse true;
     state.collapse_tool_calls = settings.collapse_tool_calls orelse false;
     state.auto_upgrade = settings.auto_upgrade orelse true;
@@ -2399,6 +2426,52 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
+}
+
+test "ultrafast startup separates profile preferences from process overrides" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "profile-off");
+    try tmp.dir.createDirPath(io_mod.getIo(), "profile-on");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const profile_off_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "profile-off");
+    defer alloc.free(profile_off_root);
+    const profile_on_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "profile-on");
+    defer alloc.free(profile_on_root);
+    const settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"workspaces\":{{\"{s}\":{{\"ultrafast_mode\":false}},\"{s}\":{{\"ultrafast_mode\":true}}}}}}\n",
+        .{ profile_off_root, profile_on_root },
+    );
+    defer alloc.free(settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings);
+
+    const env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
+        .{ .key = "FX_ULTRAFAST", .value = "1" },
+    });
+    defer env.deinit();
+    var profile_off_env_on = try loadStartupStateForWorkspace(alloc, profile_off_root, "default/model", 25);
+    defer profile_off_env_on.deinit(alloc);
+    try std.testing.expect(!profile_off_env_on.configured_ultrafast_mode);
+    try std.testing.expect(profile_off_env_on.ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, true), profile_off_env_on.ultrafast_process_override);
+
+    try env.map.put("FX_ULTRAFAST", "0");
+    var profile_on_env_off = try loadStartupStateForWorkspace(alloc, profile_on_root, "default/model", 25);
+    defer profile_on_env_off.deinit(alloc);
+    try std.testing.expect(profile_on_env_off.configured_ultrafast_mode);
+    try std.testing.expect(!profile_on_env_off.ultrafast_mode);
+    try std.testing.expectEqual(@as(?bool, false), profile_on_env_off.ultrafast_process_override);
+
+    try env.map.put("FX_ULTRAFAST", "paid");
+    try std.testing.expectError(
+        error.InvalidUltrafastOverride,
+        loadStartupStateForWorkspace(alloc, profile_on_root, "default/model", 25),
+    );
 }
 
 test "host-managed startup skips every local credential source" {

@@ -80,6 +80,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
+    "ultrafast-fake-gateway.test.ts",
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
     "yolo-permission-mode.test.ts",
@@ -381,7 +382,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(42, len(corpus.scenarios))
-        self.assertEqual(67, len(corpus.candidate_scenarios))
+        self.assertEqual(68, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
