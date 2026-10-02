@@ -2438,13 +2438,57 @@ const Date = struct {
     day: i64,
 };
 
+const frozen_date_refresh_ms: i64 = std.time.ms_per_day;
+
+/// Turn context sits ahead of the history in every request, so a field that
+/// flips mid-session invalidates the provider prompt cache for the whole
+/// conversation. The UTC date and the worktree label are captured once per
+/// process and reused; the date refreshes after 24 hours, and the worktree
+/// label is keyed to the workspace root.
+const FrozenTurnFields = struct {
+    mutex: std.Io.Mutex = .init,
+    date: [10]u8 = undefined,
+    date_captured_ms: i64 = 0,
+    date_set: bool = false,
+    worktree_root_hash: u64 = 0,
+    worktree: GitWorktreeState = .unknown,
+    worktree_set: bool = false,
+
+    fn dateText(self: *FrozenTurnFields, arena: Allocator, now_ms: i64) ![]const u8 {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.date_set or now_ms - self.date_captured_ms >= frozen_date_refresh_ms or now_ms < self.date_captured_ms) {
+            const live = try formatUtcDateFromMillis(arena, now_ms);
+            @memcpy(&self.date, live[0..10]);
+            self.date_captured_ms = now_ms;
+            self.date_set = true;
+        }
+        return arena.dupe(u8, &self.date);
+    }
+
+    fn worktreeState(self: *FrozenTurnFields, workspace_root: []const u8, live: GitWorktreeState) GitWorktreeState {
+        const hash = std.hash.Wyhash.hash(0, workspace_root);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.worktree_set or self.worktree_root_hash != hash) {
+            self.worktree = live;
+            self.worktree_root_hash = hash;
+            self.worktree_set = true;
+        }
+        return self.worktree;
+    }
+};
+
+var frozen_turn_fields: FrozenTurnFields = .{};
+
 fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]const u8 {
     const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
     const shell = shellPath() orelse "(unknown)";
     const home = homeDir() orelse "(unknown)";
-    const git = collectGitInfo(arena, workspace_root) catch GitInfo{};
+    var git = collectGitInfo(arena, workspace_root) catch GitInfo{};
+    git.worktree = frozen_turn_fields.worktreeState(workspace_root, git.worktree);
 
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
@@ -2525,7 +2569,7 @@ fn homeDir() ?[]const u8 {
 }
 
 fn todayUtcText(arena: Allocator) ![]const u8 {
-    return formatUtcDateFromMillis(arena, io_mod.milliTimestamp());
+    return frozen_turn_fields.dateText(arena, io_mod.milliTimestamp());
 }
 
 fn formatUtcDateFromMillis(arena: Allocator, epoch_ms: i64) ![]const u8 {
@@ -3197,6 +3241,27 @@ test "turn context reports unknown git worktree outside git repos" {
     const fragment = try buildTurnContextFragment(arena_state.allocator(), workspace);
     try std.testing.expect(std.mem.find(u8, fragment, "git_branch: ") == null);
     try std.testing.expect(std.mem.find(u8, fragment, "git_worktree: unknown") != null);
+}
+
+test "frozen turn fields keep the first date until a day passes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fields: FrozenTurnFields = .{};
+    const day_two_morning: i64 = 1 * std.time.ms_per_day + 1000;
+    try std.testing.expectEqualStrings("1970-01-02", try fields.dateText(arena, day_two_morning));
+    try std.testing.expectEqualStrings("1970-01-02", try fields.dateText(arena, 2 * std.time.ms_per_day - 1));
+    try std.testing.expectEqualStrings("1970-01-03", try fields.dateText(arena, day_two_morning + std.time.ms_per_day));
+    try std.testing.expectEqualStrings("1970-01-02", try fields.dateText(arena, day_two_morning));
+}
+
+test "frozen worktree label ignores later flips for the same workspace" {
+    var fields: FrozenTurnFields = .{};
+    try std.testing.expectEqual(GitWorktreeState.unknown, fields.worktreeState("/work/a", .unknown));
+    try std.testing.expectEqual(GitWorktreeState.unknown, fields.worktreeState("/work/a", .dirty));
+    try std.testing.expectEqual(GitWorktreeState.dirty, fields.worktreeState("/work/b", .dirty));
+    try std.testing.expectEqual(GitWorktreeState.dirty, fields.worktreeState("/work/b", .unknown));
+    try std.testing.expectEqual(GitWorktreeState.unknown, fields.worktreeState("/work/a", .unknown));
 }
 
 test "turn context selection is byte identical on the native path" {

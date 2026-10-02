@@ -1981,6 +1981,11 @@ fn validateKnownSettingsObject(
             if (value != .bool) return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("prompt_cache_ttl")) |value| {
+        if (value != .string or !(std.mem.eql(u8, value.string, "5m") or std.mem.eql(u8, value.string, "1h"))) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("update_channel")) |value| {
         if (value != .string or update_target.Channel.parse(value.string) == null) {
             return error.InvalidSettingsFormat;

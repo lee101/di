@@ -4280,6 +4280,10 @@ fn writeUsageTokens(writer: *std.Io.Writer, usage: types.Usage) !void {
             try writer.print("{d} {s}", .{ count, field[0] });
         }
     }
+    if (wrote_any) if (usage.input_tokens) |input| if (usage.cache_read_tokens) |cached| if (input > 0) {
+        const percent = (@as(u128, @min(cached, input)) * 100 + input / 2) / input;
+        try writer.print(" · cache-hit {d}%", .{@as(u64, @intCast(percent))});
+    };
 }
 
 /// Publishes one full-detail record per settled provider request so the
@@ -12635,7 +12639,7 @@ test "writeNetworkRecordBody renders completed and failed outcomes" {
     } } };
     try writeNetworkRecordBody(&body.writer, "gateway", "kimi-k3", 812, &completed);
     try std.testing.expectEqualStrings(
-        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read",
+        "provider: gateway · model: kimi-k3 · 812ms\nfinish: stop · generation: gen_test_123\ntokens: 1240 in · 56 out · 900 cache-read · cache-hit 73%",
         body.written(),
     );
 

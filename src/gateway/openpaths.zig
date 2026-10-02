@@ -12,6 +12,7 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const generation_usage = @import("../core/session/generation_usage_provider.zig");
+const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -69,8 +70,20 @@ fn buildRequest(
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"stream\":true,\"messages\":[");
-    try writeMessages(writer, alloc, request.instructions, request.messages, request.verified_images);
+    try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"usage\":{\"include\":true}");
+    if (prompt_cache_policy.validSessionHeader(request.session_id)) |session_id| {
+        try writer.writeAll(",\"session_id\":");
+        try std.json.Stringify.value(session_id, .{}, writer);
+    }
+    try writer.writeAll(",\"messages\":[");
+    const cache_plan = prompt_cache_policy.plan(
+        request.model,
+        request.provider_options.prompt_caching,
+        prompt_cache_policy.effectiveTtl(),
+        request.instructions,
+        request.messages,
+    );
+    try writeMessages(writer, alloc, request.instructions, request.messages, request.verified_images, cache_plan);
     try writer.writeByte(']');
     _ = try writeTools(writer, alloc, request.tools);
     try writer.writeAll(",\"tool_choice\":");
@@ -108,14 +121,17 @@ fn writeMessages(
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    cache_plan: prompt_cache_policy.Plan,
 ) !void {
     var first = true;
-    for (instructions) |message| {
+    for (instructions, 0..) |message, instruction_index| {
         const text = message.content orelse continue;
         if (text.len == 0) continue;
         try writeComma(writer, &first);
         try writer.writeAll("{\"role\":\"system\",\"content\":");
-        try std.json.Stringify.value(text, .{}, writer);
+        if (cache_plan.marksSystem(instruction_index)) |ttl| {
+            try prompt_cache_policy.writeCachedTextContent(writer, text, ttl);
+        } else try std.json.Stringify.value(text, .{}, writer);
         try writer.writeByte('}');
     }
     for (messages, 0..) |message, message_index| {
@@ -135,7 +151,9 @@ fn writeMessages(
                     if (verified_images) |value| if (is_last) value else &.{} else &.{};
                 if (images.len == 0) {
                     try writer.writeAll("{\"role\":\"user\",\"content\":");
-                    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                    if (cache_plan.marksMessage(message_index)) |ttl| {
+                        try prompt_cache_policy.writeCachedTextContent(writer, message.content orelse "", ttl);
+                    } else try std.json.Stringify.value(message.content orelse "", .{}, writer);
                     try writer.writeByte('}');
                 } else {
                     try writer.writeAll("{\"role\":\"user\",\"content\":[");
@@ -179,7 +197,9 @@ fn writeMessages(
                 try writer.writeAll("{\"role\":\"tool\",\"tool_call_id\":");
                 try std.json.Stringify.value(message.tool_call_id orelse "", .{}, writer);
                 try writer.writeAll(",\"content\":");
-                try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                if (cache_plan.marksMessage(message_index)) |ttl| {
+                    try prompt_cache_policy.writeCachedTextContent(writer, message.content orelse "", ttl);
+                } else try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 try writer.writeByte('}');
             },
         }
@@ -338,6 +358,13 @@ pub fn streamPrepared(
     defer secret.zeroAndFree(alloc, auth_header);
     const endpoint = try chatEndpoint(request.credential.credentialSource());
     const uri = try std.Uri.parse(endpoint);
+    var extra_headers_buf: [2]std.http.Header = undefined;
+    extra_headers_buf[0] = .{ .name = "accept", .value = "text/event-stream" };
+    var extra_header_count: usize = 1;
+    if (prompt_cache_policy.validSessionHeader(request.session_id)) |session_id| {
+        extra_headers_buf[1] = .{ .name = "x-session-id", .value = session_id };
+        extra_header_count = 2;
+    }
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -345,7 +372,7 @@ pub fn streamPrepared(
         .client = &client,
         .uri = uri,
         .authorization = auth_header,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = extra_headers_buf[0..extra_header_count],
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -1692,6 +1719,69 @@ test "chat completions request uses OpenAI wire shape" {
     try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":\"auto\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"max_tokens\":4096") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning_effort\"") == null);
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    return std.mem.count(u8, haystack, needle);
+}
+
+const cache_test_instructions = [_]types.ChatMessage{
+    .{ .role = .system, .content = "stable" },
+    .{ .role = .system, .content = "overlay" },
+};
+const cache_test_messages = [_]types.ChatMessage{
+    .{ .role = .user, .content = "first" },
+    .{ .role = .assistant, .content = "reply" },
+    .{ .role = .user, .content = "second" },
+    .{ .role = .assistant, .content = "calling", .tool_calls = &.{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }} },
+    .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
+};
+
+fn cacheTestBody(model: []const u8, prompt_caching: bool, session_id: ?[]const u8) ![]u8 {
+    return buildRequest(std.testing.allocator, .{
+        .model = model,
+        .instructions = &cache_test_instructions,
+        .messages = &cache_test_messages,
+        .tool_choice = .auto,
+        .provider_options = .{ .prompt_caching = prompt_caching },
+        .session_id = session_id,
+    });
+}
+
+test "openpaths marks cache breakpoints for anthropic family models" {
+    const body = try cacheTestBody("anthropic/claude-sonnet-4.5", true, "session-1");
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"session_id\":\"session-1\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"usage\":{\"include\":true}") != null);
+    try std.testing.expectEqual(@as(usize, 3), countOccurrences(body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"system\",\"content\":\"stable\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"overlay\",\"cache_control\":{\"type\":\"ephemeral\"}}]}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"contents\",\"cache_control\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"second\",\"cache_control\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"user\",\"content\":\"first\"}") != null);
+}
+
+test "openpaths adds the one hour ttl only when configured" {
+    prompt_cache_policy.setConfigured(.one_hour);
+    defer prompt_cache_policy.setConfigured(.five_minutes);
+    const body = try cacheTestBody("or/claude-opus-4", true, null);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqual(@as(usize, 3), countOccurrences(body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}"));
+    try std.testing.expect(std.mem.find(u8, body, "session_id") == null);
+}
+
+test "openpaths sends the session id but no breakpoints for other model families or when disabled" {
+    const other = try cacheTestBody("openai/gpt-5", true, "session-2");
+    defer std.testing.allocator.free(other);
+    try std.testing.expect(std.mem.find(u8, other, "\"session_id\":\"session-2\"") != null);
+    try std.testing.expect(std.mem.find(u8, other, "cache_control") == null);
+    const disabled = try cacheTestBody("anthropic/claude-sonnet-4.5", false, "session-3");
+    defer std.testing.allocator.free(disabled);
+    try std.testing.expect(std.mem.find(u8, disabled, "cache_control") == null);
+    const invalid = try cacheTestBody("openai/gpt-5", true, "bad id");
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expect(std.mem.find(u8, invalid, "session_id") == null);
 }
 
 fn testToolDecode(_: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {

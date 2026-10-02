@@ -354,6 +354,18 @@ FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 di
 
 Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
 
+## Prompt caching on OpenAI-compatible routes
+
+Requests on the OpenPaths route and on custom connections that opt in carry cache hints:
+
+- A `session_id` body field and an `x-session-id` header, so the provider can route a session to the same backend.
+- `stream_options.include_usage` and `usage: {include: true}`, so every response reports cached tokens, cache writes, and cost. Per-request cache hits show in the full transcript network record as `cache-hit N%`, and exact cost settles session usage instead of staying incomplete.
+- For Anthropic-family models (`anthropic/*` or any id containing `claude`), `cache_control: {type: "ephemeral"}` breakpoints on the last system message and the last two user or tool messages. The breakpoint on the system message also covers the tool definitions. Other model families rely on the provider's implicit prefix caching.
+
+Opt a custom connection in with `"prompt_caching": true` in its `~/.fx/settings.json` entry; without it the connection never receives these fields. Breakpoints expire after five minutes by default. Set `prompt_cache_ttl` to `"1h"` in `~/.fx/settings.json`, or `FX_PROMPT_CACHE_TTL=1h` for one launch, to request the one hour lifetime (priced higher by Anthropic).
+
+Per-step runtime context (current directory, UTC date, branch, worktree state) is sent after the conversation history rather than in the system prompt, so the cached prefix stays byte-stable between steps.
+
 ## Themes
 
 di ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
