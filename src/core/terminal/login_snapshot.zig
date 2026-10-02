@@ -62,9 +62,11 @@ pub const Resolved = struct {
     pub fn argvWith(self: Resolved, alloc: Allocator, current_path: ?[]const u8, command: []const u8) ![]const []const u8 {
         const extra: usize = if (self.relative_path) 1 else 0;
         const out = try alloc.alloc([]const u8, self.prefix.len + 1 + extra);
-        // prefix[0] is env; assignments follow, so PATH can go right after it.
-        out[0] = self.prefix[0];
-        var at: usize = 1;
+        // env options must precede assignments, including the relative PATH.
+        var options_end: usize = 1;
+        while (options_end + 1 < self.prefix.len and std.mem.eql(u8, self.prefix[options_end], "-u")) options_end += 2;
+        @memcpy(out[0..options_end], self.prefix[0..options_end]);
+        var at = options_end;
         if (self.relative_path) {
             const cur = current_path orelse "";
             const joined = try std.mem.concat(alloc, u8, &.{
@@ -75,7 +77,7 @@ pub const Resolved = struct {
             out[at] = try std.fmt.allocPrint(alloc, "PATH={s}", .{joined});
             at += 1;
         }
-        @memcpy(out[at .. at + self.prefix.len - 1], self.prefix[1..]);
+        @memcpy(out[at .. at + self.prefix.len - options_end], self.prefix[options_end..]);
         out[out.len - 1] = command;
         return out;
     }
@@ -209,6 +211,7 @@ fn buildPrefix(backing: Allocator, opts: Options, script_path: []const u8, env_b
     const alloc = arena.allocator();
     var prefix: std.ArrayList([]const u8) = .empty;
     try prefix.append(alloc, "/usr/bin/env");
+    var assignments: std.ArrayList([]const u8) = .empty;
     var path_prefix: []const u8 = "";
     var path_suffix: []const u8 = "";
     var relative_path = false;
@@ -223,8 +226,9 @@ fn buildPrefix(backing: Allocator, opts: Options, script_path: []const u8, env_b
             const name = parts.next() orelse break;
             try prefix.append(alloc, "-u");
             try prefix.append(alloc, try alloc.dupe(u8, name));
-        } else try prefix.append(alloc, try alloc.dupe(u8, first));
+        } else try assignments.append(alloc, try alloc.dupe(u8, first));
     }
+    try prefix.appendSlice(alloc, assignments.items);
     try prefix.append(alloc, try std.fmt.allocPrint(alloc, "BASH_ENV={s}", .{script_path}));
     try prefix.append(alloc, try alloc.dupe(u8, opts.shell_path));
     try prefix.append(alloc, "--noprofile");
@@ -374,6 +378,35 @@ test "assemble computes exported delta and unset list" {
     }
     try testing.expect(got_path and got_new and got_unset);
     try testing.expect(!try assemble(alloc, "no markers", &current, &script, &delta));
+}
+
+test "warm snapshot env options precede assignments and relative PATH" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/usr/bin/env", .{}) catch return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put("GONE", "old");
+    try env.put("PATH", "/usr/bin:/bin");
+    var snapshot = try buildPrefix(alloc, .{
+        .shell_path = "/bin/bash",
+        .home = "/tmp",
+        .cache_dir = "/tmp",
+        .env = &env,
+    }, "/dev/null", "NEW=value\x00-u\x00GONE\x00@PATH\x00/opt/test:\x00\x00");
+    defer snapshot.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const argv = try snapshot.argvWith(arena.allocator(), env.get("PATH"), "printf '%s|%s|%s' \"${GONE-unset}\" \"$NEW\" \"$PATH\"");
+    try testing.expectEqualStrings("-u", argv[1]);
+    try testing.expectEqualStrings("GONE", argv[2]);
+    const result = try std.process.run(alloc, io_mod.getIo(), .{ .argv = argv, .environ_map = &env });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try testing.expectEqualStrings("unset|value|/opt/test:/usr/bin:/bin", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "warm snapshot matches login shell output and skips the profile after the first run" {

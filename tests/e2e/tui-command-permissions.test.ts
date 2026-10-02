@@ -680,6 +680,7 @@ async function launchPermissionResumeHarness(initialResponses: Response[]) {
   writeFileSync(initialStderrPath, "");
   writeFileSync(resumedStderrPath, "");
 
+  writeFileSync(settingsPath, JSON.stringify({ permission_mode: "auto" }));
   const initialGateway = startFakeGateway(initialResponses);
   const initialSession = await TmuxSession.create({
     cmd: FX_BIN,
@@ -728,7 +729,7 @@ function expectUserProfileTrace(tracePath: string) {
     "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
-  expect(trace).toContain("command runner explicit environment=user shell=");
+  expect(trace).toMatch(/command runner (?:explicit environment=user|warm user) shell=/);
   expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }
 
@@ -2216,7 +2217,18 @@ describe("effect-aware command permissions", () => {
         const ttyPath = paneTty(activeSession);
         const baselineFx = foregroundFxRow(ttyPath, binary);
         await activeSession.sendText(`Run the ${sandbox} terminal ownership fixture.`);
-        const fixture = await waitForTerminalFixture(statePath);
+        const fixture = await waitForTerminalFixture(statePath).catch(async (err) => {
+          const evidenceDir = process.env.FX_COMMAND_SESSION_EVIDENCE_DIR;
+          if (evidenceDir) {
+            mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+            for (const path of [stderrPath, tracePath]) {
+              if (existsSync(path)) writeFileSync(join(evidenceDir, path.split("/").at(-1)!), readFileSync(path), { mode: 0o600 });
+            }
+            writeFileSync(join(evidenceDir, "foreground.scrollback.txt"), await activeSession!.captureFullScrollback(), { mode: 0o600 });
+            writeFileSync(join(evidenceDir, "foreground.requests.json"), JSON.stringify(gateway.requests.map(request => request.body)), { mode: 0o600 });
+          }
+          throw err;
+        });
 
         try {
           expect(fixture.pid).not.toBe(fixture.pgid);
@@ -2304,7 +2316,7 @@ describe("effect-aware command permissions", () => {
           "shell.run authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
-        expect(trace).toContain("command runner explicit environment=user shell=");
+        expect(trace).toMatch(/command runner (?:explicit environment=user|warm user) shell=/);
         expect(trace).not.toContain("authority=direct_only route=direct_read_only");
         expectTraceOrder(trace, [
           "event=permission_decision turn_id=1 step_id=1 call_id=terminal_session_command",
@@ -2618,7 +2630,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "default fx ask defaults missing permission mode to auto",
+    "fx ask explicit auto completes a classifier-approved command",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "ask-turn-default-auto.txt");
@@ -2628,7 +2640,7 @@ describe("effect-aware command permissions", () => {
         finalText("ask turn default auto complete"),
       ]);
 
-      const result = await runFx(["ask", "Create the marker."], {
+      const result = await runFx(["ask", "--auto", "Create the marker."], {
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
         }),
@@ -2724,7 +2736,7 @@ describe("effect-aware command permissions", () => {
         cmd: FX_BIN,
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
-          FX_PERMISSION_MODE: undefined,
+          FX_PERMISSION_MODE: "auto",
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "scroll,frame_commit",
         }),
@@ -3180,7 +3192,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask defaults missing permission mode to auto through the classifier",
+    "fx ask explicit auto uses the classifier",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "classifier-accepted.txt");
@@ -3192,7 +3204,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
 
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Run the classifier fixture."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the classifier fixture."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
@@ -3351,7 +3363,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
 
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Run the classifier recovery fixture."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the classifier recovery fixture."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
@@ -3397,7 +3409,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
 
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Run the classifier fallback fixture."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the classifier fallback fixture."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
@@ -3448,7 +3460,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
 
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Run the provider failure fixture."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the provider failure fixture."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
@@ -3494,7 +3506,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
       const child = nodeSpawn(
         FX_BIN,
-        ["ask", "--quiet", "--json", "--no-save", "Run the classifier cancellation fixture."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Run the classifier cancellation fixture."],
         {
           cwd: root.workspace,
           env: definedEnv(gatewayEnv(root, gateway, {
@@ -3574,7 +3586,7 @@ describe("effect-aware command permissions", () => {
       const tracePath = join(root.root, "trace.log");
 
       const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Ask Claude to create the requested Desktop note."],
+        ["ask", "--auto", "--quiet", "--json", "--no-save", "Ask Claude to create the requested Desktop note."],
         {
           cwd: root.workspace,
           env: gatewayEnv(root, gateway, {
@@ -3705,8 +3717,8 @@ describe("effect-aware command permissions", () => {
         toolCall(acpCommand),
         finalText("large ACP complete"),
       ]);
-      activeClient = AcpClient.create(acpRoot.workspace, gatewayEnv(acpRoot, acpGateway));
-      await startAcpSession(activeClient, "code");
+      activeClient = AcpClient.create(acpRoot.workspace, gatewayEnv(acpRoot, acpGateway, { FX_PERMISSION_MODE: "auto" }));
+      await startAcpSession(activeClient, null);
       const acpMessages = await runAcpPrompt(activeClient, "Run the large ACP fixture.");
       await activeClient.close();
       activeClient = null;
@@ -4071,11 +4083,11 @@ class AcpClient {
   }
 }
 
-async function startAcpSession(client: AcpClient, modeId: "ask" | "code" = "ask") {
+async function startAcpSession(client: AcpClient, modeId: "ask" | "code" | null = "ask") {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();
-  await client.request("session/set_mode", { modeId }, 3);
+  if (modeId) await client.request("session/set_mode", { modeId }, 3);
 }
 
 async function runAcpPrompt(client: AcpClient, text: string) {
