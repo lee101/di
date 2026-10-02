@@ -1886,7 +1886,8 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from this session") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "request.search finds them by text") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass request.query") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
     const input_schema = parsed.value.object.get("inputSchema").?.object;
