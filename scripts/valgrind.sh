@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 
 command -v valgrind >/dev/null || { echo "valgrind not installed" >&2; exit 2; }
 ZIG=${ZIG:-zig}
+export FX_ALLOW_DEBUG=1
 ZIG_BUILD_ARGS=${ZIG_BUILD_ARGS:--Dtarget=x86_64-linux-gnu}
 
 ask_prompt=""

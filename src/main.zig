@@ -19,6 +19,7 @@ const usage_dashboard_runtime = @import("core/app/usage_dashboard_runtime.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
+const process_hardening = @import("core/app/process_hardening.zig");
 const acp_runner = @import("core/cli/acp_runner.zig");
 const acp_server = @import("acp/server.zig");
 const app_input_runtime = @import("core/app/app_input_runtime.zig");
@@ -3510,6 +3511,7 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+    process_hardening.apply(rawEnvValue(raw_env, "FX_ALLOW_DEBUG"));
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
@@ -4905,6 +4907,7 @@ test {
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
     _ = @import("core/app/app_entry_runtime.zig");
+    _ = @import("core/app/process_hardening.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
     _ = @import("core/app/app_lifecycle.zig");
