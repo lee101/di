@@ -10,7 +10,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { FX_BIN, REPO_ROOT, providerVersionTestEnv } from "../evals/eval-helpers";
 
 let sessionCounter = 0;
@@ -580,7 +580,7 @@ export class TmuxSession {
   }): Promise<TmuxSession> {
     const {
       cmd = FX_BIN,
-      cwd = REPO_ROOT,
+      cwd: requestedCwd = REPO_ROOT,
       env: requestedEnv = {},
       width = 120,
       height = 40,
@@ -591,6 +591,7 @@ export class TmuxSession {
       isolated = false,
       socketName,
     } = opts ?? {};
+    const cwd = resolve(requestedCwd);
     const env = providerVersionTestEnv(requestedEnv);
 
     if (
@@ -666,9 +667,11 @@ export class TmuxSession {
     for (const key of DEFAULT_UNSET_ENV_KEYS) delete processEnv[key];
 
     const gatedLaunch = remainOnExit || minimumHistoryLines !== undefined;
+    // Some tmux builds retain a deleted server cwd despite new-session -c.
+    const enterWorkspace = `cd -- ${shellQuote(cwd)} &&`;
     const tmuxCommand = gatedLaunch
-      ? `tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
-      : observedCmd;
+      ? `${enterWorkspace} tmux wait-for ${shellQuote(startGate)} && exec ${observedCmd}`
+      : `${enterWorkspace} exec ${observedCmd}`;
     const tmuxPrefix = resolvedSocketName ? ["-L", resolvedSocketName] : [];
     const setupSessionName = `${name}-setup`;
     const killSetupSession = () => {
