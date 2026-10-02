@@ -67,6 +67,7 @@
   { "file": "web-search-live.test.ts", "weight": 1 },
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
   { "file": "yolo-permission-mode.test.ts", "weight": 29 },
+  { "file": "shell-request-tolerance.test.ts", "weight": 10 },
   {"file": "capability-search.test.ts", "weight": 5},
   {"file": "context-files.test.ts", "weight": 5},
   {"file": "gemini-search-fake.test.ts", "weight": 5},

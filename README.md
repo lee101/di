@@ -225,6 +225,13 @@ exact-command approval modes retain their original command. No extra model
 round trip is required. See [the op comparison](docs/op-parity.md) for coverage
 and remaining gaps.
 
+The `shell` tool tolerates common request-shape mistakes. `shell` is ignored
+unless `tty` is true, and when `profile` and `shell` are both sent with
+`tty: true` the explicit `shell` wins; the result carries a `note` saying what
+was ignored. An unusable `shell.path` (relative, not bash or zsh, or missing)
+returns a recoverable error with the corrected call, and terminal start
+failures include a `hint` with the retry shape.
+
 ## di infinity
 
 di infinity is the infinite run harness: one `di ask` invocation that keeps working across turns until you interrupt it. After every completed turn, the saved session receives a generated follow-up prompt built from the latest work summary, so progress compounds instead of stopping at the first answer.

@@ -2105,8 +2105,12 @@ fn nativeCommandEnvironment(
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     if (execution_mode == .tty) {
-        if (try explicitTtyShell(arena, args)) |shell| {
-            return shell_resolver.environmentForShellSpec(arena, configured, shell);
+        if (explicitTtyShell(arena, args) catch null) |shell| {
+            if (shell_resolver.environmentForShellSpec(arena, configured, shell)) |value| {
+                return value;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+            }
         }
     }
     const profile_raw = tool_args.nullablePlaceholderStringArg(args, "profile");
