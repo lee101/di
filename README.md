@@ -461,6 +461,8 @@ live message test.
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
 
+On Linux, di marks itself non-dumpable (`PR_SET_DUMPABLE=0`) and sets `RLIMIT_CORE` to 0 at startup, so same-user processes cannot ptrace it or read its memory, and crashes do not write core files. Child processes inherit the zero core limit. Set `FX_ALLOW_DEBUG=1` to skip this hardening when attaching gdb or running under valgrind.
+
 ## License
 
 [Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
