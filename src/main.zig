@@ -671,6 +671,7 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
+        app.session_persistence.sessions_v2 = launch.modifiers.sessions_v2;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -687,6 +688,7 @@ const App = struct {
                 .model = launch.modifiers.model_override,
                 .effort = launch.modifiers.effort_override,
                 .fast = launch.modifiers.fast_override,
+                .ultrafast = launch.modifiers.ultrafast_override,
                 .provider_order = launch.modifiers.provider_order_override,
                 .provider_strict = launch.modifiers.provider_strict_override,
             },
@@ -916,8 +918,9 @@ const App = struct {
         buffer: []u8,
         session_id: []const u8,
         terminal_cols: u16,
+        sessions_v2: bool,
     ) ![]const u8 {
-        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
+        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols, sessions_v2);
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as
@@ -1666,6 +1669,18 @@ const App = struct {
         );
     }
 
+    pub fn beginMcpSlackSetup(self: *App) !void {
+        return self.mcp.beginSlackSetup(
+            self.alloc,
+            self.workspace_root,
+            .{ .form = true, .url = true },
+            if (comptime host_target.is_wasm) loadNoMcpRuntime else builtin_mcp.loadRuntime,
+            builtin_mcp.previewNativeWorkspaceAuthority,
+            self.toolRegistry(),
+            @intCast(@max(io_mod.milliTimestamp(), 0)),
+        );
+    }
+
     pub fn beginMcpMenuReload(self: *App, generation: u64) !void {
         return self.mcp.beginMenuReload(
             self.alloc,
@@ -1902,6 +1917,10 @@ const App = struct {
         err: anyerror,
     ) !void {
         return self.mcp.recordMenuEffectFailure(self.alloc, generation, err);
+    }
+
+    pub fn addMcpSlack(self: *App) !void {
+        return app_commands.Handlers(App).addSlack(self);
     }
 
     pub fn saveMcpMenuAdd(
@@ -2300,6 +2319,21 @@ const App = struct {
             model,
             origin.label(),
         );
+    }
+
+    pub fn fetchProviderCatalog(
+        self: *App,
+        target: model_provider.ProviderId,
+        access: credentials.CatalogAccess,
+    ) !model_catalog.ProviderResult {
+        const provider = builtin_providers.native.select(target).model_catalog orelse return error.CatalogUnavailable;
+        var cancel_requested = std.atomic.Value(bool).init(false);
+        return provider.fetch(self.alloc, .{
+            .access = access,
+            .endpoint = self.model_cache.models_path,
+            .cancel_flag = &cancel_requested,
+            .view = .picker,
+        });
     }
 
     pub fn cachedModelOrigin(self: *App, model: []const u8) ?model_cache_runtime.ModelOrigin {
@@ -3824,7 +3858,9 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     const command = effective_args[0];
     if (std.mem.eql(u8, command, "mcp")) {
         if (effective_args.len < 2) return false;
-        return std.mem.eql(u8, effective_args[1], "auth") or
+        return (effective_args.len == 3 and std.mem.eql(u8, effective_args[1], "add") and
+            std.mem.eql(u8, effective_args[2], "slack")) or
+            std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout");
     }
@@ -3863,6 +3899,8 @@ test "credential-reading commands use early threaded io without full entry confi
 }
 
 test "MCP credential commands use early threaded io" {
+    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
+    try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
     for ([_][:0]const u8{ "auth", "list", "logout" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
@@ -4988,6 +5026,8 @@ test {
     _ = @import("core/session/session_commands.zig");
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
+    _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/session_layout.zig");
     _ = @import("core/session/legacy_background_migration.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");

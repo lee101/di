@@ -69,6 +69,7 @@ const input_completion_runtime = @import("input_completion_runtime.zig");
 const provider_picker_runtime = @import("provider_picker_runtime.zig");
 const input_paste_runtime = @import("input_paste_runtime.zig");
 const input_submit_runtime = @import("input_submit_runtime.zig");
+const provider_runtime = @import("provider_runtime.zig");
 const input_approval_runtime = @import("input_approval_runtime.zig");
 const input_question_runtime = @import("input_question_runtime.zig");
 const input_full_transcript_runtime = @import("input_full_transcript_runtime.zig");
@@ -102,6 +103,7 @@ const ExplicitModelSelection = struct {
     model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    ultrafast_mode: bool = false,
     has_fast_mode_token: bool = false,
 };
 
@@ -157,23 +159,30 @@ fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     }
 
     if (token_count != 3) return .invalid;
-    const fast_mode = if (std.ascii.eqlIgnoreCase(tokens[2], "fast"))
-        true
-    else if (std.ascii.eqlIgnoreCase(tokens[2], "normal"))
-        false
-    else
+    const fast_mode = std.ascii.eqlIgnoreCase(tokens[2], "fast");
+    const ultrafast_mode = std.ascii.eqlIgnoreCase(tokens[2], "ultrafast");
+    if (!fast_mode and !ultrafast_mode and !std.ascii.eqlIgnoreCase(tokens[2], "normal")) {
         return .invalid;
+    }
     return .{ .selection = .{
         .model = tokens[0],
         .effort = effort,
         .fast_mode = fast_mode,
+        .ultrafast_mode = ultrafast_mode,
         .has_fast_mode_token = true,
     } };
 }
 
 fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilities: model_capabilities.Capabilities) ExplicitModelSelectionParse {
     if (!model_capabilities.reasoningEffortSupported(capabilities, selection.effort)) return .invalid;
-    if (capabilities.supports_fast_mode != selection.has_fast_mode_token) return .invalid;
+    if (!selection.has_fast_mode_token) return .{ .selection = selection };
+    if (selection.ultrafast_mode and !capabilities.supports_ultrafast_mode) return .invalid;
+    if (selection.fast_mode and !capabilities.supports_fast_mode) return .invalid;
+    if (!selection.fast_mode and !selection.ultrafast_mode and
+        !capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode)
+    {
+        return .invalid;
+    }
     return .{ .selection = selection };
 }
 
@@ -1332,6 +1341,14 @@ pub fn Runtime(comptime App: type) type {
                     '\t' => _ = try cycleMcpMenuSection(app, 1),
                     '\r' => _ = try submitMcpMenuSelection(app),
                     'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
+                    's', 'S' => {
+                        if (comptime @hasDecl(App, "addMcpSlack") and @hasField(App, "mcp")) {
+                            if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
+                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                try app.addMcpSlack();
+                            }
+                        }
+                    },
                     'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
                     'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
                     'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
@@ -1557,7 +1574,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitAuthPickerSelection(app)) return;
-                    if (try submitModelMenuSelection(app)) return;
+                    if (try submitModelMenuSelection(app, max_prompt_history)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
                     if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
@@ -1579,7 +1596,19 @@ pub fn Runtime(comptime App: type) type {
                         if (try provider_picker_rt.submit(app)) return;
                     }
                     if (completion_rt.hasModelQuery(app)) {
-                        if (try completion_rt.submitModelPicker(app)) return;
+                        const stage_before = app.input_runtime.picker.model_picker_stage;
+                        const text_before = app.alloc.dupe(u8, app.input_runtime.edit_state.input.items) catch null;
+                        defer if (text_before) |text| app.alloc.free(text);
+                        if (try completion_rt.submitModelPicker(app)) {
+                            if (app.input_runtime.edit_state.input.items.len == 0) {
+                                if (stage_before == .model) {
+                                    recordModelSelectionHistory(app, max_prompt_history, provider_runtime.model(app));
+                                } else if (text_before) |text| {
+                                    submit_rt.recordAcceptedSlashCommandHistory(app, max_prompt_history, std.mem.trim(u8, text, " "));
+                                }
+                            }
+                            return;
+                        }
                     }
                     if (try submitExplicitModelSelection(
                         app,
@@ -2513,6 +2542,7 @@ pub fn Runtime(comptime App: type) type {
                 selected.id,
                 app.effort,
                 app.fast_mode,
+                false,
             );
             app.model_cache.closeMenu();
             app.shell.render_requests.request(.footer);
@@ -2753,7 +2783,13 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn submitModelMenuSelection(app: *App) !bool {
+        fn recordModelSelectionHistory(app: *App, max_prompt_history: usize, id: []const u8) void {
+            const command = std.fmt.allocPrint(app.alloc, "/model {s}", .{id}) catch return;
+            defer app.alloc.free(command);
+            submit_rt.recordAcceptedSlashCommandHistory(app, max_prompt_history, command);
+        }
+
+        fn submitModelMenuSelection(app: *App, max_prompt_history: usize) !bool {
             if (comptime !@hasField(App, "model_cache")) return false;
             if (!app.model_cache.menu.active) return false;
             const selected = (try app.model_cache.menu.enterSelectionAlloc(app.alloc)) orelse {
@@ -2762,6 +2798,11 @@ pub fn Runtime(comptime App: type) type {
             };
             defer if (selected.id.len > 0) app.alloc.free(selected.id);
 
+            // Ctrl+P and `/model` both continue into the inline effort and
+            // fast stages. A Ctrl+P draft stays stashed while those stages
+            // borrow the composer; settleModelPickerDraft hands it back once
+            // the flow ends, and a failure here hands it back immediately.
+            errdefer restoreModelPickerDraft(app);
             // A catalog row served by another credential or provider is
             // applied by switching to that origin. The inline effort and fast
             // stages only describe the provider already active, so a cross
@@ -2769,20 +2810,18 @@ pub fn Runtime(comptime App: type) type {
             // closeModelMenu hands the composer back to a stashed draft.
             if (comptime @hasDecl(App, "switchModelAcrossProviders")) {
                 if (try app.switchModelAcrossProviders(selected.id, selected.origin)) {
+                    recordModelSelectionHistory(app, max_prompt_history, selected.id);
                     _ = closeModelMenu(app, true);
                     return true;
                 }
             }
-
-            // Ctrl+P and `/model` both continue into the inline effort and
-            // fast stages. A Ctrl+P draft stays stashed while those stages
-            // borrow the composer; settleModelPickerDraft hands it back once
-            // the flow ends, and a failure here hands it back immediately.
-            errdefer restoreModelPickerDraft(app);
             app.model_cache.closeMenu();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             try completion_rt.beginExactModelSelection(app, selected.id);
+            if (app.input_runtime.edit_state.input.items.len == 0) {
+                recordModelSelectionHistory(app, max_prompt_history, selected.id);
+            }
             return true;
         }
 
@@ -2876,7 +2915,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "",
                         .tone = .@"error",
-                        .body = "usage: /model <id> <effort> [normal|fast]",
+                        .body = "usage: /model <id> <effort> [normal|fast|ultrafast]",
                     }, true);
                 },
                 .selection => |selection| {
@@ -2885,6 +2924,7 @@ pub fn Runtime(comptime App: type) type {
                         selection.model,
                         selection.effort,
                         selection.fast_mode,
+                        selection.ultrafast_mode,
                     );
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 },
@@ -3615,6 +3655,7 @@ const RoutingWorker = struct {
     queued_steer_text: ?[]const u8 = null,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
+    agent_turn_settings: worker_runtime.AgentTurnSettings = .{},
 
     pub fn compactionActivitySnapshot(self: *RoutingWorker) @import("../output/compaction_activity.zig").Snapshot {
         return self.compaction.snapshot;
@@ -3724,6 +3765,10 @@ const RoutingWorker = struct {
     }
 
     pub fn syncQueuedPromptFastMode(_: *RoutingWorker, _: bool) void {}
+
+    pub fn syncQueuedPromptUltrafastMode(self: *RoutingWorker, enabled: bool) void {
+        self.agent_turn_settings.ultrafast_mode = enabled;
+    }
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
 
@@ -6607,6 +6652,7 @@ test "explicit model selection parser accepts complete picker syntax" {
     );
     try std.testing.expectEqual(types.ReasoningEffort.auto, selection.effort);
     try std.testing.expect(!selection.fast_mode);
+    try std.testing.expect(!selection.ultrafast_mode);
     try std.testing.expect(selection.has_fast_mode_token);
 }
 
@@ -6659,6 +6705,21 @@ test "explicit model selection semantic validation uses resolved capabilities" {
             .supports_fast_mode = true,
         }),
     ) != .invalid);
+
+    const ultrafast = switch (parseExplicitModelSelection(
+        "/model provider/astra high ultrafast",
+    )) {
+        .selection => |selection| selection,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(ultrafast.ultrafast_mode);
+    try std.testing.expect(validateExplicitModelSelection(
+        ultrafast,
+        model_capabilities.resolveCapabilities(ultrafast.model, .{
+            .reasoning_efforts = .fromSlice(&high_efforts),
+            .supports_ultrafast_mode = true,
+        }),
+    ) != .invalid);
 }
 
 test "model picker spaces do not commit before enter" {
@@ -6674,6 +6735,7 @@ test "model picker spaces do not commit before enter" {
         "anthropic/claude-sonnet-4.6",
         0,
         false,
+        false,
         .effort,
     );
 
@@ -6686,7 +6748,7 @@ test "model picker spaces do not commit before enter" {
     );
 }
 
-test "model picker enter commits selected fast option from fast stage" {
+test "model picker enter commits normal speed from the speed stage" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -6701,6 +6763,7 @@ test "model picker enter commits selected fast option from fast stage" {
         alloc,
         "anthropic/claude-opus-4.7",
         0,
+        false,
         false,
         .fast,
     );
@@ -6722,7 +6785,7 @@ test "model picker enter commits selected fast option from fast stage" {
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Switched to anthropic/claude-opus-4.7",
+        "Switched to anthropic/claude-opus-4.7 (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Invalid /model selection") == null);
@@ -6742,6 +6805,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
         model,
         0,
         false,
+        false,
         .effort,
     );
     app.stream.active = true;
@@ -6758,7 +6822,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model,
+        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
 }
@@ -6780,7 +6844,7 @@ test "active stream Enter selects the visible model choice" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model,
+        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
@@ -7005,7 +7069,7 @@ test "app_input_runtime fast-only model opens the Fast stage while streaming" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqualStrings("Next turn will use " ++ model, app.notice_body.items);
+    try std.testing.expectEqualStrings("Next turn will use " ++ model ++ " (effort: default, speed: fast)", app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -9092,7 +9156,7 @@ test "app_input_runtime ctrl+p catalog enter failure restores the draft without 
     // Called directly, so no ingress settle runs after the failure.
     try std.testing.expectError(
         error.OutOfMemory,
-        Runtime(RoutingFakeApp).submitModelMenuSelection(&app),
+        Runtime(RoutingFakeApp).submitModelMenuSelection(&app, 100),
     );
 
     try std.testing.expect(!app.model_cache.menu.active);
@@ -12805,7 +12869,7 @@ test "composer shortcut line delete handles decoded and raw mutations" {
         try primeComposerHistoryForTest(RoutingFakeApp, &app, "draft");
         try app.input_runtime.textReplacementState().replace(alloc, "alpha\nleftMIDright\ngamma");
         app.input_runtime.edit_state.cursor = "alpha\nleftMID".len;
-        try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .fast);
+        try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .fast);
         app.input_runtime.picker.file_completion_index = 4;
 
         _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
@@ -12874,7 +12938,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .path = try alloc.dupe(u8, "/tmp/8.png"),
         .media_type = try alloc.dupe(u8, "image/png"),
     });
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .effort);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .effort);
     app.input_runtime.edit_state.cursor = 0;
 
     const line_start_action = test_ui_input.shortcutFromControlByte(21);
@@ -12900,7 +12964,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
 
     app.shell.render_requests.clearReason(.footer);
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 4, true, .fast);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 4, true, false, .fast);
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
     _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
         &app,
@@ -15354,7 +15418,7 @@ test "app_input_runtime image path paste rejects the complete edit without chang
     defer app.deinit();
     try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
     app.input_runtime.edit_state.cursor = 2;
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 2, true, .fast);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 2, true, false, .fast);
     app.input_runtime.picker.file_completion_index = 4;
     try appendOwnedPendingImage(&app, 3, "/tmp/original.png");
     app.next_image_id_counter = 7;

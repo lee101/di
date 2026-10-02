@@ -385,14 +385,19 @@ pub const ModelMenu = struct {
         return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
     }
 
-    /// Enter resolution for the model menu. A non-empty query names the model
-    /// directly: an exact listed id selects that row, otherwise the typed id
-    /// becomes the selection (the trailing "Use <query>" row) and invalid typed
-    /// ids are rejected. Empty queries keep the ordinary highlighted selection.
+    /// Enter resolution for the model menu. A highlighted listed row always
+    /// wins, so a filtered query never overrides what the user picked. With
+    /// the trailing "Use <query>" row highlighted (or nothing listed), the
+    /// typed id becomes the selection and invalid typed ids are rejected.
     pub fn enterSelectionAlloc(self: *const ModelMenu, alloc: Allocator) !?SelectedModel {
         if (!self.active) return null;
         const typed = std.mem.trim(u8, self.query(), " \t\r\n");
         if (typed.len == 0) return self.selectedItemAlloc(alloc);
+        if (self.load_state == .ready) {
+            if (self.itemAt(self.selected_index)) |item| {
+                if (!item.custom) return .{ .id = try alloc.dupe(u8, item.id), .origin = item.origin };
+            }
+        }
         for (self.items.items) |item| {
             if (item.custom) continue;
             if (std.mem.eql(u8, item.id, typed)) {
@@ -2131,6 +2136,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
             .has_file_input = true,
             .has_web_search = true,
             .supports_fast_mode = true,
+            .supports_ultrafast_mode = true,
         },
         .{
             .id = @constCast("private/blue-hornbill"),
@@ -2153,6 +2159,7 @@ test "model menu owns resolved catalog state and filters without changing catalo
     try std.testing.expect(runtime.menu.itemAt(0).?.capabilities.supports_vision);
     try std.testing.expectEqual(@as(?u32, 256_000), runtime.menu.itemAt(0).?.capabilities.context_window);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_fast_mode);
+    try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_ultrafast_mode);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_file_input);
     try std.testing.expect(runtime.menu.itemAt(1).?.capabilities.supports_web_search);
 
@@ -2506,6 +2513,21 @@ test "model menu Enter accepts typed ids and rejects invalid input" {
         defer alloc.free(selected.id);
         try std.testing.expectEqualStrings("typed/while-failed", selected.id);
     }
+}
+
+test "model menu Enter prefers the highlighted row over the typed query" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    var entries = try testCatalog(alloc, "stealth/space-bunny-alpha");
+    defer model_catalog.freeModelCatalog(alloc, &entries);
+    runtime.menu.active = true;
+    try hydrateMenuSnapshot(alloc, &runtime.menu, entries.items, &.{}, null);
+
+    runtime.menu.setQuery(alloc, "bunn");
+    const selected = (try runtime.menu.enterSelectionAlloc(alloc)).?;
+    defer alloc.free(selected.id);
+    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", selected.id);
 }
 
 test "model menu offers a Use query row for non-exact typed ids" {

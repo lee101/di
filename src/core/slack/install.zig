@@ -89,7 +89,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
         var state_buf: [43]u8 = undefined;
         const state = std.base64.url_safe_no_pad.Encoder.encode(&state_buf, &entropy);
         const start_url = try std.fmt.allocPrint(alloc, "{s}/api/slack/install?state={s}&challenge={s}&port={d}", .{ origin, state, challenge, listener.socket.address.getPort() });
-        try std.Io.File.stderr().writeStreamingAll(io.getIo(), "Authorize the workspace installation in your browser. Keep fx running.\n");
+        try std.Io.File.stderr().writeStreamingAll(io.getIo(), "Authorize the workspace installation in your browser. Keep di running.\n");
         if (io.getenv("FX_NO_OPEN_BROWSER") != null or !try opener.open(alloc, start_url)) {
             try std.Io.File.stderr().writeStreamingAll(io.getIo(), try std.fmt.allocPrint(alloc, "Open on this computer: {s}\n", .{start_url}));
         }

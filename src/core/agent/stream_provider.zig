@@ -429,10 +429,11 @@ fn dupeUsageReference(alloc: Allocator, source: DeferredUsageReference) Allocato
     };
 }
 
-test "owned stream result copies survive the source allocator and allocation failures" {
+test "owned stream result copies preserve service tier metadata" {
     const source = Result{ .completed = .{
         .completion = .{
             .content = "answer",
+            .service_tier = .ultrafast,
             .tool_calls = &.{.{
                 .id = "call_1",
                 .name = "read_file",
@@ -477,6 +478,7 @@ test "owned stream result copies survive the source allocator and allocation fai
             defer copied.deinit(alloc);
             const completion = copied.completed.completion;
             try std.testing.expectEqualStrings("answer", completion.content.?);
+            try std.testing.expectEqual(types.ProviderServiceTier.ultrafast, completion.service_tier.?);
             try std.testing.expectEqualStrings("gen_1", completion.generation_id.?);
             try std.testing.expectEqualStrings("detail", completion.provider_failure_detail.?);
             try std.testing.expectEqualStrings("[]", completion.provider_state_json.?);

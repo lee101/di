@@ -383,7 +383,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  di ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  di ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--auto-next-goal [--goal-tokens N] [--goal-turns N] [--goal-time D]] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
 
 Options:
   --auto                      Automatically review unresolved permission requests
@@ -391,10 +391,16 @@ Options:
   --yolo                      Alias for --full-access
   --auto-next-steps           Continue with the next logical implementation steps after each turn
   --auto-next-idea            Brainstorm and implement follow-up improvements after each turn
+  --auto-next-goal            Pursue the prompt as a persistent workspace goal until complete, blocked, stalled or over budget; omit the prompt to resume
+  --goal-tokens <n>           Goal token budget (k and m suffixes)
+  --goal-turns <n>            Goal turn budget
+  --goal-time <d>             Goal time budget (s, m, h)
   --model <id>                Override the model for this request
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
   --no-fast                   Disable Fast mode for this request
+  --ultrafast                 Request Ultra mode for this request when the model supports it
+  --no-ultrafast              Disable Ultra mode for this request
   --provider-order <a,b,...>  Prefer these gateway providers in order for this request
   --provider-strict           Restrict this request to only the providers in --provider-order
   --no-provider-strict        Clear the provider restriction for this request
@@ -404,6 +410,7 @@ Options:
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
   --no-save                   Do not save the session; incompatible with --resume and --resume-id
+  --sessions-v2               Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it
   --no-color                  Render TTY output without colors or hyperlinks
   --resume <last|id>          Continue the last session or a session by id
   --resume-id <id>            Continue a session by exact id
@@ -457,9 +464,11 @@ Autonomous flags keep the saved session running until interrupted; they cannot b
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  di acp [--model <id>] [--log-file <path>]",
+          "Usage:\n  di acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
+        expect(r.stdout).toContain("--ultrafast");
+        expect(r.stdout).toContain("--no-ultrafast");
         expect(r.stdout).toContain("--log-file <path>");
       }
     },
@@ -487,7 +496,7 @@ Autonomous flags keep the saved session running until interrupted; they cannot b
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: di acp [--model <id>] [--log-file <path>]\n",
+          "usage: di acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n",
         );
       }
     },
@@ -4940,7 +4949,7 @@ describe("cli: error handling", () => {
             "di ask: --no-save cannot be used with --resume or --resume-id",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--auto-next-goal [--goal-tokens N] [--goal-turns N] [--goal-time D]] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);

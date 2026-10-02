@@ -1336,7 +1336,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             );
         }
 
-        fn recordAcceptedSlashCommandHistory(
+        pub fn recordAcceptedSlashCommandHistory(
             app: *App,
             max_prompt_history: usize,
             command: []const u8,
