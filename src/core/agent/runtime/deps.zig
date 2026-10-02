@@ -250,6 +250,10 @@ pub const AgentRuntimeDeps = struct {
     propagate_history_turn: *const fn (ctx: *anyopaque, turn: HistoryTurn) anyerror!void,
     commit_context_compaction: ?ContextCompactionCommitEffect = null,
     compaction_activity: ?CompactionActivityEffect = null,
+    /// True while a prompt waits behind the running worker. Only hosts with a
+    /// threaded worker that queues prompts provide it; without it, warm
+    /// compaction after a turn never runs.
+    prompt_waiting: ?*const fn (ctx: *anyopaque) bool = null,
     /// Call-scoped output for the exact error returned through compaction, never retained.
     compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,

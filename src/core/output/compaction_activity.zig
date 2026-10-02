@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Process-local identity, distinct from a turn: one turn can compact repeatedly.
 pub const OperationId = enum(u64) { _ };
-pub const Origin = enum { manual, automatic, provider_overflow };
+pub const Origin = enum { manual, automatic, provider_overflow, warm };
 pub const Stage = enum { preparation, summary, publication };
 pub const Publication = enum { not_published, committed, uncertain };
 pub const Outcome = enum { succeeded, no_op, busy, cancelled, failed };

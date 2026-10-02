@@ -75,5 +75,6 @@
   {"file": "read-tool-result.test.ts", "weight": 5},
   {"file": "settings-permissions-warning.test.ts", "weight": 5},
   {"file": "think-tool.test.ts", "weight": 5},
-  {"file": "tui-slash-preferences.test.ts", "weight": 30}
+  {"file": "tui-slash-preferences.test.ts", "weight": 30},
+  {"file": "tui-warm-compaction.test.ts", "weight": 60}
 ]

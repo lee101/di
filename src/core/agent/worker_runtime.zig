@@ -24,6 +24,7 @@ const compaction_activity = @import("../output/compaction_activity.zig");
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
+    auto_compact_warm_percent: u8 = compactor.default_warm_percent,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,

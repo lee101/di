@@ -50,6 +50,9 @@ pub const Settings = struct {
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
+    /// Share of usable input at which a finished turn is compacted while the
+    /// provider cache is warm; 0 turns it off. Profile-only.
+    auto_compact_warm_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
@@ -1716,6 +1719,11 @@ fn parseProfileOnlyFields(
         if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
         settings.auto_compact_percent = @intCast(value.integer);
     }
+    if (root.object.get("auto_compact_warm_percent")) |value| {
+        if (value != .integer) return error.InvalidAutoCompactWarmPercentType;
+        if (value.integer < 0 or !compactor.isValidWarmPercent(@intCast(value.integer))) return error.InvalidAutoCompactWarmPercentValue;
+        settings.auto_compact_warm_percent = @intCast(value.integer);
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -2034,6 +2042,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
+    if (incoming.auto_compact_warm_percent) |value| target.auto_compact_warm_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
@@ -4746,6 +4755,21 @@ test "theme setting rejects non-string values" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
+}
+
+test "warm compaction percent is a profile setting that is zero or between 10 and 79" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":45}");
+    defer global.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 45), global.auto_compact_warm_percent);
+    var off = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":0}");
+    defer off.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 0), off.auto_compact_warm_percent);
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":80}"));
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":5}"));
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentType, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":\"50\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_warm_percent\":50}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, null), project.auto_compact_warm_percent);
 }
 
 test "auto compaction percent is a profile setting between 10 and 80" {

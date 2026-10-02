@@ -67,6 +67,7 @@ const model_response_recovery = @import("model_response_recovery.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
 const model_fallback = @import("../../config/model_fallback.zig");
+const runtime_warm_compaction = @import("warm_compaction.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -7104,6 +7105,7 @@ fn processQueuedPromptLoop(
         var gateway_model: []const u8 = job.model;
         var successful_gateway_model: []const u8 = "";
         var successful_request_cost: ?runtime_prompt_context.RequestCost = null;
+        var warm: runtime_warm_compaction.Turn = .{ .deps = deps, .config = &config, .job = &job, .agent = agent };
         var circuit_fallback_model: ?[]const u8 = null;
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
         var successful_vision_mode: runtime_gateway_step.VisionToolMode = .unavailable;
@@ -9004,6 +9006,7 @@ fn processQueuedPromptLoop(
 
             successful_gateway_model = gateway_model;
             successful_request_cost = request_cost_for_attempt;
+            warm.capture(request_data, request_cost_for_attempt, request_capabilities, active_api_key, gateway_model);
             successful_vision_route = vision_route;
             successful_vision_mode = vision_mode;
             successful_recovery_strategy = recovery_strategy;
@@ -9505,6 +9508,7 @@ fn processQueuedPromptLoop(
                     "assistant",
                     .{ .role = .assistant, .content = history_text, .provider_replay = history_replay },
                 );
+                warm.run(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay }, compaction_history, active_compaction_handoff != null, step_ctx);
                 return;
             }
 
@@ -9585,6 +9589,7 @@ fn processQueuedPromptLoop(
                         "assistant",
                         null,
                     );
+                    warm.run(arena, .{ .role = .assistant, .content = history_text, .provider_replay = history_replay }, compaction_history, active_compaction_handoff != null, step_ctx);
                     return;
                 },
                 .continue_once => |context| {

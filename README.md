@@ -371,6 +371,13 @@ Automatic compaction starts when a request reaches 80 percent of the model's usa
 { "auto_compact_percent": 60 }
 ```
 
+Warm compaction runs after a turn instead of inside the next one. When a turn finishes with its last request at 60 percent of the model's usable input or more, di compacts right away while the provider still has that request cached, so the next turn starts small. The summary request is that last request exactly as sent, followed by the final reply and the compaction instruction, and the turn that just finished stays unchanged. Set `auto_compact_warm_percent` in `~/.fx/settings.json` to `0` to turn it off or to a value from 10 to 79, or `FX_AUTO_COMPACT_WARM_PERCENT` for a single launch. The value must stay below `auto_compact_percent`; one at or above it turns warm compaction off, and when you set only `auto_compact_percent` the default drops to three quarters of it if that is below 60. A prompt you submit while it runs waits behind it, and one that has waited 8 seconds cancels it and runs with the usual compaction at `auto_compact_percent`. Warm compaction runs only in the interactive terminal, never for subagents, a cancelled or failed turn, or a turn that already compacted, and a failed or cancelled attempt is silent. `/trace` lists each decision as `warm_decision` and `warm_committed`.
+
+```jsonc
+// ~/.fx/settings.json
+{ "auto_compact_warm_percent": 50 }
+```
+
 ## Embed di
 
 di builds as a native binary or WebAssembly. Applications embedding di can provide network transport, session storage, configuration, permission handling, and terminal I/O. The experimental JavaScript SDK keeps its existing `fx-*` artifact names for upstream compatibility.

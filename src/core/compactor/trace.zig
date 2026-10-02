@@ -63,6 +63,8 @@ pub const Kind = enum {
     installed,
     overflow_recovery_incomplete,
     provider_overflow_recovery,
+    warm_decision,
+    warm_committed,
 };
 
 pub const Event = struct {

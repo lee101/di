@@ -7,7 +7,7 @@ const ActivityProjection = @import("activity_runtime.zig").ActivityProjection;
 
 /// Selects the display clock without changing the underlying turn or its accounting.
 pub fn compactionClock(stream: StreamState, operation: compaction_activity.Operation) StreamState {
-    return if (operation.origin == .manual)
+    return if (operation.origin == .manual or operation.origin == .warm)
         .{ .turn_started_ms = operation.started_at_ms }
     else
         stream;
@@ -26,7 +26,7 @@ pub fn compactionProjection(
         .preparing => "• Preparing compaction",
         .running => |stage| if (stage == .preparation) "• Preparing compaction" else "• Compacting",
         .stopping => "• Stopping compaction",
-        .terminal => |feedback| return .{ .turn_thinking = .{
+        .terminal => |feedback| return if (op.origin == .warm and feedback.outcome != .succeeded) .none else .{ .turn_thinking = .{
             .label = compactionFeedbackLabel(feedback),
             .tone = switch (feedback.outcome) {
                 .failed => .danger,
@@ -296,12 +296,12 @@ test "compaction projection preserves turn accounting and selects the origin clo
         .token_progress = .{ .input_tokens = 100, .output_tokens = 20 },
     };
     var buf: [256]u8 = undefined;
-    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow }) |origin| {
+    for ([_]compaction_activity.Origin{ .manual, .automatic, .provider_overflow, .warm }) |origin| {
         const id = state.begin(origin, 1, 3_500);
         state.running(id, .summary);
         const projection = compactionProjection(&buf, state.snapshot, stream, 4_000);
-        try std.testing.expectEqualStrings(if (origin == .manual) "• Compacting (0s)" else "• Compacting (3s)", projection.turn_thinking.label);
-        try std.testing.expectEqual(@as(?bool, origin != .manual), activityBlinkVisible(compactionClock(stream, state.snapshot.operation.?), 4_000));
+        try std.testing.expectEqualStrings(if (origin == .manual or origin == .warm) "• Compacting (0s)" else "• Compacting (3s)", projection.turn_thinking.label);
+        try std.testing.expectEqual(@as(?bool, origin != .manual and origin != .warm), activityBlinkVisible(compactionClock(stream, state.snapshot.operation.?), 4_000));
         state.stopping(id);
         try std.testing.expect(std.mem.startsWith(u8, compactionProjection(&buf, state.snapshot, stream, 4_000).turn_thinking.label, "• Stopping compaction"));
         state.settle(id, .{ .outcome = .succeeded }, 4_000);

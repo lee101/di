@@ -62,6 +62,9 @@ pub const resetTrace = trace.reset;
 pub const default_percent = settings.default_percent;
 pub const isValidPercent = settings.isValidPercent;
 pub const resolvePercent = settings.resolvePercent;
+pub const default_warm_percent = settings.default_warm_percent;
+pub const isValidWarmPercent = settings.isValidWarmPercent;
+pub const resolveWarmPercent = settings.resolveWarmPercent;
 
 // Saved checkpoints, read back when a session is loaded or shown.
 pub const modelText = checkpoint.modelText;
