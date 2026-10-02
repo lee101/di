@@ -19,18 +19,20 @@ cd "$repo_root"
 
 remote="${1:-}"
 zero=0000000000000000000000000000000000000000
-ranges=""
+ranges=()
+range_count=0
 
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [ "$local_sha" = "$zero" ] && continue
   if [ "$remote_sha" = "$zero" ]; then
-    ranges="$ranges $local_sha --not --remotes=${remote}"
+    ranges+=("$local_sha --not --remotes=${remote}")
   else
-    ranges="$ranges ${remote_sha}..${local_sha}"
+    ranges+=("${remote_sha}..${local_sha}")
   fi
+  range_count=$((range_count + 1))
 done
 
-if [ -z "$ranges" ]; then
+if [ "$range_count" -eq 0 ]; then
   echo "pre-push: nothing to push" >&2
   exit 0
 fi
@@ -46,32 +48,45 @@ find_zig() {
 }
 
 # Collect the Zig sources that the push touches.
-pushed_zig=""
-for range in $ranges; do
-  for file in $(git diff --name-only $range -- src/ | grep '\.zig$' || true); do
-    pushed_zig="$pushed_zig $file"
-  done
+pushed_zig=()
+pushed_zig_count=0
+for range in "${ranges[@]}"; do
+  read -r -a revisions <<< "$range"
+  while IFS= read -r -d '' file; do
+    case "$file" in
+      *.zig)
+        if [ -f "$file" ]; then
+          pushed_zig+=("$file")
+          pushed_zig_count=$((pushed_zig_count + 1))
+        fi
+        ;;
+    esac
+  done < <(git log --format= --name-only -z "${revisions[@]}" -- src/)
 done
 
-if [ -z "$pushed_zig" ]; then
+if [ "$pushed_zig_count" -eq 0 ]; then
   echo "pre-push: no Zig sources in this push" >&2
 else
   zig="$(find_zig || true)"
   if [ -z "$zig" ]; then
     echo "pre-push: no zig found; skipping autofmt (install Zig or set ZIG=/path/to/zig)" >&2
   else
-    formatted=""
-    for file in $pushed_zig; do
-      formatted="$formatted $("$zig" fmt "$file" || true)"
+    formatted=()
+    for file in "${pushed_zig[@]}"; do
+      output="$("$zig" fmt "$file")" || exit 1
+      [ -z "$output" ] || formatted+=("$output")
     done
-    dirty=""
-    for file in $pushed_zig; do
-      git diff --quiet -- "$file" || dirty="$dirty $file"
+    dirty=()
+    dirty_count=0
+    for file in "${pushed_zig[@]}"; do
+      if ! git diff --quiet -- "$file"; then
+        dirty+=("$file")
+        dirty_count=$((dirty_count + 1))
+      fi
     done
-    if [ -n "$dirty" ]; then
-      # shellcheck disable=SC2086
-      git add -- $dirty
-      echo "pre-push: zig fmt reformatted: $formatted" >&2
+    if [ "$dirty_count" -gt 0 ]; then
+      git add -- "${dirty[@]}"
+      echo "pre-push: zig fmt reformatted: ${formatted[*]-}" >&2
       echo "pre-push: those files are staged. Commit them and push again. Nothing was pushed." >&2
       exit 1
     fi
@@ -84,10 +99,8 @@ if ! command -v gitleaks >/dev/null 2>&1; then
 fi
 
 status=0
-# shellcheck disable=SC2086
-for range in $ranges; do
+for range in "${ranges[@]}"; do
   echo "pre-push: gitleaks scanning ${range}" >&2
-  # shellcheck disable=SC2086
   gitleaks git --log-opts="$range" --redact --no-banner . || status=1
 done
 
