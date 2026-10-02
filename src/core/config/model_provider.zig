@@ -124,7 +124,9 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "openpaths")) return .openpaths;
     // A connection named `openrouter` is a configured provider, so the name is
     // not aliased to OpenPaths here. The OpenPaths route keeps its own name.
-    if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
+    if (std.ascii.eqlIgnoreCase(value, "gateway") or
+        std.ascii.eqlIgnoreCase(value, "vercel") or
+        std.ascii.eqlIgnoreCase(value, "ai-gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     configured_provider.validate_id(value) catch return null;

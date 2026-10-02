@@ -291,7 +291,10 @@ pub fn validate_id(id: []const u8) error{ LimitExceeded, InvalidProviderId, Rese
     for (id) |byte| {
         if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return error.InvalidProviderId;
     }
-    for ([_][]const u8{ "gateway", "codex", "grok" }) |reserved| {
+    // Every name a built-in provider answers to is reserved, so a connection
+    // that the built-in would shadow is rejected instead of stored unreachable.
+    // Keep this list aligned with model_provider.parse.
+    for ([_][]const u8{ "gateway", "vercel", "ai-gateway", "codex", "grok", "openpaths" }) |reserved| {
         if (std.ascii.eqlIgnoreCase(id, reserved)) return error.ReservedProviderId;
     }
 }
@@ -488,6 +491,10 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"GATEWAY\":{}}", .err = error.ReservedProviderId },
         .{ .json = "{\"codex\":{}}", .err = error.ReservedProviderId },
         .{ .json = "{\"Grok\":{}}", .err = error.ReservedProviderId },
+        .{ .json = "{\"openpaths\":{}}", .err = error.ReservedProviderId },
+        .{ .json = "{\"vercel\":{}}", .err = error.ReservedProviderId },
+        .{ .json = "{\"ai-gateway\":{}}", .err = error.ReservedProviderId },
+        .{ .json = "{\"openrouter\":{}}", .err = error.MissingField },
         .{ .json = "{\"local\":null}", .err = error.InvalidObject },
         .{ .json = "{\"local\":{}}", .err = error.MissingField },
         .{ .json = "{\"local\":{\"protocol\":\"responses\"}}", .err = error.InvalidProtocol },

@@ -27,7 +27,6 @@ pub const entries = [_]Entry{
     .{
         .id = .openpaths,
         .slug = "openpaths",
-        .aliases = &.{"openrouter"},
         .name = "OpenPaths",
         .route_name = "OpenPaths",
         .description = "OPENPATHS_API_KEY or OPENROUTER_API_KEY",
@@ -92,4 +91,16 @@ test "auth provider catalog uses the model provider identity and explicit aliase
     try std.testing.expect(parse("unknown") == null);
     try std.testing.expect(find(.codex).subscription);
     try std.testing.expect(find(.grok).subscription);
+}
+
+test "every catalog name resolves the same way for login and for provider selection" {
+    for (&entries) |*entry| {
+        try std.testing.expectEqualStrings(entry.id.label(), model_provider.parse(entry.slug).?.label());
+        for (entry.aliases) |alias| {
+            try std.testing.expectEqualStrings(entry.id.label(), model_provider.parse(alias).?.label());
+        }
+    }
+    // A connection may claim a name no built-in answers to, so those names stay
+    // configurable; every catalog name must not be shadowed by one.
+    try std.testing.expect(model_provider.parse("openrouter").? == .configured);
 }
