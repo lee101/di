@@ -1155,9 +1155,9 @@ fn isChatModel(object: std.json.ObjectMap, id: []const u8) bool {
 /// is not a language model. Every field is optional: a catalog that omits
 /// pricing leaves this false and the id check stands alone.
 fn billedForNonChatWork(object: std.json.ObjectMap) bool {
-    if (unsignedField(object, "max_output_tokens") == 0) return true;
+    if ((unsignedField(object, "max_output_tokens") orelse 0) == 0) return true;
     const pricing = objectMapField(object, "pricing") orelse return false;
-    if (costField(pricing, "output_per_1m_tokens") == 0) return true;
+    if ((costField(pricing, "output_per_1m_tokens") orelse 0) == 0) return true;
     for ([_][]const u8{
         "per_image",
         "per_megapixel",
