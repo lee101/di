@@ -468,7 +468,7 @@ function createModelsMenuFixture() {
   const stderrPath = join(root, "stderr.log");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace, { recursive: true });
-  writeFileSync(settingsPath, "{}\n");
+  writeFileSync(settingsPath, "{\"permission_mode\":\"auto\"}\n");
   writeFileSync(stderrPath, "");
   return { home, workspace, settingsPath, tapePath, stderrPath };
 }
@@ -2897,7 +2897,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("BTab");
       await waitForModelsMenu(session, 4);
       await session.sendLiteralText("no-such-model");
-      await session.waitForText("No models found.", 5_000);
+      grid = await waitForModelsMenu(session, 1);
+      expect(grid.join("\n")).toContain("Use no-such-model");
+      expect(composerContains(grid.join("\n"), "no-such-model")).toBe(true);
       await session.sendKeys("C-u");
       await waitForModelsMenu(session, 4);
       await session.sendLiteralText("gemini");

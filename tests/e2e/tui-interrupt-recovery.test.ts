@@ -82,7 +82,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
     ]);
     const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "auto",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
     try {
@@ -1095,7 +1095,7 @@ while :; do sleep 1; done
       await Bun.sleep(1_500);
       expect(retryGateway.requests).toHaveLength(0);
       const resumedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
-      expect(resumedScrollback).toContain("fx quit unexpectedly while this response was recovering");
+      expect(resumedScrollback).toContain("di quit unexpectedly while this response was recovering");
       expect(resumedScrollback).not.toContain("continues automatically");
 
       // Quitting without choosing keeps the suppression sticky: the next
@@ -1127,7 +1127,7 @@ while :; do sleep 1; done
       await Bun.sleep(1_500);
       expect(retryGateway.requests).toHaveLength(0);
       const reaskedScrollback = (await session.captureFullScrollback()).replaceAll(/\s+/g, " ");
-      expect(reaskedScrollback).toContain("fx quit unexpectedly while this response was recovering");
+      expect(reaskedScrollback).toContain("di quit unexpectedly while this response was recovering");
 
       await session.sendText("continue");
       await session.waitForText("RECOVERY_RETRY_COMPLETE", TIMEOUT);

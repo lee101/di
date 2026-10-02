@@ -286,6 +286,31 @@ tmuxTest("pane environment does not poison a shared tmux server", async () => {
   }
 });
 
+tmuxTest("owned sessions support nonzero window and pane indexes", async () => {
+  const socketName = `fx-nonzero-index-${process.pid}-${Date.now()}`;
+  let session: TmuxSession | undefined;
+  try {
+    execFileSync("tmux", ["-L", socketName, "-f", "/dev/null", "new-session", "-d", "-s", "index-bootstrap", "sleep 60"], { stdio: "pipe" });
+    execFileSync("tmux", ["-L", socketName, "set-option", "-g", "base-index", "1"], { stdio: "pipe" });
+    execFileSync("tmux", ["-L", socketName, "set-option", "-g", "pane-base-index", "1"], { stdio: "pipe" });
+    session = await TmuxSession.create({
+      cmd: "printf NONZERO_INDEX_OK; sleep 2; exit 7",
+      socketName,
+      remainOnExit: true,
+      minimumHistoryLines: 100_000,
+      startupWaitMs: 0,
+    });
+    await session.waitForText("NONZERO_INDEX_OK", 5_000);
+    expect(session.panePid()).toBeGreaterThan(0);
+    expect(session.historyLimit()).toBe(100_000);
+    await session.waitForPane(() => session!.paneStatus().dead, 5_000);
+    expect(session.paneStatus().status).toBe(7);
+  } finally {
+    await session?.kill();
+    try { execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" }); } catch {}
+  }
+});
+
 tmuxTest("minimum history lines survive a fresh tmux server restart", async () => {
   const socketName = `fx-history-limit-${process.pid}-${Date.now()}`;
   let first: TmuxSession | undefined;

@@ -732,7 +732,7 @@ export class TmuxSession {
         "set-option",
         "-w",
         "-t",
-        `${name}:0`,
+        `=${name}:`,
         "history-limit",
         String(Math.max(serverHistoryLines!, minimumHistoryLines)),
         ";",
@@ -812,12 +812,12 @@ export class TmuxSession {
       if (remainOnExit) {
         execFileSync(
           "tmux",
-          [...tmuxPrefix, "set-option", "-w", "-t", `${name}:0`, "remain-on-exit", "on"],
+          [...tmuxPrefix, "set-option", "-w", "-t", `=${name}:`, "remain-on-exit", "on"],
           { stdio: "pipe" },
         );
         const value = execFileSync(
           "tmux",
-          [...tmuxPrefix, "show-options", "-w", "-v", "-t", `${name}:0`, "remain-on-exit"],
+          [...tmuxPrefix, "show-options", "-w", "-v", "-t", `=${name}:`, "remain-on-exit"],
           { stdio: "pipe", encoding: "utf-8" },
         ).trim();
         if (value !== "on") {
@@ -1140,7 +1140,7 @@ export class TmuxSession {
       this.tmuxArgs([
         "display-message",
         "-t",
-        `${this.name}:0.0`,
+        `=${this.name}:`,
         "-p",
         "#{pane_pid}",
       ]),
@@ -1187,7 +1187,7 @@ export class TmuxSession {
   paneStatus(): { dead: boolean; status: number | null } {
     try {
       const raw = execSync(
-        `${this.tmuxCommand()} display-message -t ${this.name}:0.0 -p "#{pane_dead}:#{pane_dead_status}"`,
+        `${this.tmuxCommand()} display-message -t =${this.name}: -p "#{pane_dead}:#{pane_dead_status}"`,
         { stdio: "pipe", encoding: "utf-8" },
       ).trim();
       const [dead, status] = raw.split(":");

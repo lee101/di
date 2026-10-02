@@ -90,6 +90,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             FX_DISABLE_KEYCHAIN: "1",
             FX_SKIP_ONBOARDING: "1",
           },
@@ -128,6 +129,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
           },
           stderrPath,
           width: 160,
@@ -198,6 +200,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             FX_DISABLE_KEYCHAIN: "1",
             FX_SKIP_ONBOARDING: "1",
           },
@@ -263,6 +266,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
           },
           stderrPath,
           width: 120,
@@ -315,7 +319,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `di v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -323,6 +327,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             FX_RECORD: tapePath,
             FX_RECORD_INPUT: "1",
             FX_DEBUG_RECORD_SILENT_BANNER: "1",
@@ -375,7 +380,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       writeFileSync(stderrPath, "");
       const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `di v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -383,6 +388,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             AI_GATEWAY_API_KEY: "new-fixture-key",
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -431,7 +437,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
       mkdirSync(home, { recursive: true });
       writeFileSync(stderrPath, "");
       const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
-      const banner = `𝒇x v${version} · Run /help for commands`;
+      const banner = `di v${version} · Run /help for commands`;
 
       try {
         session = await TmuxSession.create({
@@ -439,6 +445,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             FX_RECORD: tapePath,
             FX_RECORD_INPUT: "1",
             FX_DEBUG_RECORD_SILENT_BANNER: "1",
@@ -576,6 +583,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
           env: {
             HOME: home,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
           },
         });
         const pane = await session.waitForComposer(5_000);
@@ -772,6 +780,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
+            FX_PERMISSION_MODE: "auto",
             FX_DISABLE_KEYCHAIN: "1",
             FX_SKIP_ONBOARDING: "1",
             FX_THEME: "e2e-accent",

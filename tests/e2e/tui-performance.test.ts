@@ -490,6 +490,7 @@ test.skipIf(!tmuxAvailable())(
         cwd: fixture.workspace,
         env: {
           HOME: undefined,
+          FX_PERMISSION_MODE: "auto",
           AI_GATEWAY_API_KEY: "missing-home-key",
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: noHomeGateway.baseUrl,

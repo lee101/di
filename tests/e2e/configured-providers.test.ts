@@ -480,7 +480,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("di: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }

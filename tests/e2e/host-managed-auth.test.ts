@@ -126,6 +126,7 @@ describe("host-managed authentication", () => {
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_AUTH_MODE: "host-managed",
+      FX_PERMISSION_MODE: "auto",
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
       FX_SKIP_ONBOARDING: "1",

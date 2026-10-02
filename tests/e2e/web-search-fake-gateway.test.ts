@@ -1323,6 +1323,7 @@ describe("web_search Gateway fixture", () => {
       const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
       try {
         await startAcpCodeSession(client);
+        await client.request("session/set_mode", { modeId: "ask" }, 4);
         const messages = await runAcpPrompt(client, "Issue denied web search.");
 
         expect(gateway.requests).toHaveLength(1);

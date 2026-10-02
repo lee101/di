@@ -1152,7 +1152,7 @@ describe("MCP remote authentication lifecycle", () => {
       }
       const result = await runFx(["mcp", "auth", "fixture"], { cwd: root.workspace, env, timeoutMs: 15_000 });
       expect(result.code).not.toBe(0);
-      expect(result.stderr).toContain("Your configured Slack scopes request fewer permissions than fx requires");
+      expect(result.stderr).toContain("Your configured Slack scopes request fewer permissions than di requires");
       expect(result.stderr).toContain("Authorization was not started");
       expect(result.stderr).toContain("Remove the local scopes override only if you want to authorize the full shared scope set");
       expect(result.stdout).not.toContain("/api/slack/auth?");

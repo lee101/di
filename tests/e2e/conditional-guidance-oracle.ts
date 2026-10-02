@@ -47,10 +47,12 @@ export const AUTO_EXA_SERIALIZED_TOOL_NAMES = CANONICAL_BUILTIN_NAMES
   .map((name) => (name === "web_search" ? "exa_search" : name));
 
 // Durable-only tools are capability-gated on a writable session. Process-local
-// shell actions remain available without a session store.
+// shell actions remain available without a session store. These fixtures also
+// have no configured MCP servers or installed skills.
 export const AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES =
   AUTO_EXA_SERIALIZED_TOOL_NAMES.filter((name) =>
-    name !== "subagent"
+    name !== "subagent" && name !== "capability_search" &&
+    name !== "mcp_select_tool" && name !== "mcp_features"
   );
 
 export const WEB_SEARCH_GUIDANCE =

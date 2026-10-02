@@ -59,6 +59,7 @@ function env(fixture: Fixture, gateway: { baseUrl: string; chatUrl: string }, v2
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_PERMISSION_MODE: "auto",
     FX_AUTO_UPGRADE: "0",
     FX_SESSIONS_V2: v2 ? "1" : undefined,
   };
@@ -3077,7 +3078,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     const flipped = await appExit(fixture, gateway, ["--resume", id]);
     expect(flipped.status).toBe(1);
     expect(flipped.stderr).toContain("saved session is unreadable");
-    expect(flipped.stderr).toContain(`fx session recover`);
+    expect(flipped.stderr).toContain(`di session recover`);
     expect(readFileSync(log)).toEqual(damaged);
     writeFileSync(log, good);
 
@@ -3087,7 +3088,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     try {
       const readOnly = await appExit(fixture, gateway, ["--resume", id]);
       expect(readOnly.status).toBe(1);
-      expect(readOnly.stderr).toBe("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
+      expect(readOnly.stderr).toBe("di: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n");
     } finally {
       chmodSync(folder, 0o700);
       chmodSync(log, 0o600);
@@ -3097,7 +3098,7 @@ test.skipIf(!tmuxAvailable())("the app refuses a damaged session, a busy one and
     const owner = await startApp(fixture, gateway, ["--resume", id]);
     const busy = await appExit(fixture, gateway, ["--resume", id]);
     expect(busy.status).toBe(1);
-    expect(busy.stderr).toContain("another fx process may be using this session");
+    expect(busy.stderr).toContain("another di process may be using this session");
     await quitApp(owner);
     expect(gateway.requests.length).toBe(requests);
     expectWholeLog(fixture, id);
@@ -3621,7 +3622,7 @@ const REAL_FULL_DISK = process.platform === "darwin";
 const GRID_SAYS: Record<"damaged" | "denied" | "busy" | "full", Record<GridHost, RegExp>> = {
   damaged: { ask: /InvalidSessionFormat/, app: /saved session is unreadable/, acp: /^Session could not be loaded$/ },
   denied: { ask: /AccessDenied/, app: /cannot be opened for writing: permission denied|AccessDenied/, acp: /permission denied/ },
-  busy: { ask: /SessionBusy/, app: /another fx process may be using this session/, acp: /^Session is busy$/ },
+  busy: { ask: /SessionBusy/, app: /another di process may be using this session/, acp: /^Session is busy$/ },
   full: REAL_FULL_DISK
     ? { ask: /NoSpaceLeft/, app: /NoSpaceLeft|the disk is full/, acp: /the disk is full/ }
     : { ask: /FileTooBig/, app: /FileTooBig|a file-size limit was reached/, acp: /a file-size limit was reached/ },
@@ -3832,13 +3833,15 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
         const deadline = Date.now() + TIMEOUT;
         while (Date.now() < deadline) {
           screen = await session.captureFullScrollback();
-          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.lastIndexOf(prompt)))) break;
+          if (screen.includes(answer) || /✗ .*|could not save/.test(screen.slice(screen.indexOf(prompt)))) break;
           await Bun.sleep(100);
         }
         // The reply shows even when saving it fails, so read the turn's end.
         await session.waitForComposer(TIMEOUT);
         screen = await session.captureFullScrollback();
-        const turn = screen.slice(screen.lastIndexOf(prompt));
+        const promptOffset = screen.indexOf(prompt);
+        expect(promptOffset).toBeGreaterThanOrEqual(0);
+        const turn = screen.slice(promptOffset);
         await session.sendText("/quit");
         await exit("after /quit");
         return { entered: turn.includes(answer) && !/✗ |could not save/.test(turn), said: `${turn}\n${readFileSync(stderrPath, "utf8")}` };

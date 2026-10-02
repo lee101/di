@@ -438,9 +438,10 @@ describe("gemini_search fake Gemini fixture", () => {
         // Both new tools are advertised in the shared canonical order.
         const names = serializedToolNames(parseGatewayRequest(gateway.requests[0]!.body));
         expect(names).toEqual(AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES);
-        expect(names.slice(-4)).toEqual([
+        expect(names.slice(-5)).toEqual([
           "gemini_search",
           "think",
+          "todo",
           "read_tool_result",
           "vision",
         ]);

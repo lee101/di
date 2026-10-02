@@ -344,6 +344,7 @@ async function startFx(
       FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
       FX_E2E_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: FAKE_GATEWAY_MODEL,
+      FX_PERMISSION_MODE: "auto",
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_OAUTH_CLIENT_ID: "test-client",
@@ -4146,6 +4147,7 @@ function withoutSavedModelEnv(
 ): Record<string, string | undefined> {
   return {
     HOME: testHome,
+    FX_PERMISSION_MODE: "auto",
     AI_GATEWAY_API_KEY: undefined,
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
@@ -4201,11 +4203,11 @@ test("Codex without a model explains the fix and fx provider codex saves one", a
 
   const status = await runFx(["status"], { env, timeoutMs: TIMEOUT });
   expect(status.code).toBe(1);
-  expect(status.stderr).toBe(`fx: ${guidance}\n`);
+  expect(status.stderr).toBe(`di: ${guidance}\n`);
 
   const ask = await runFx(["ask", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
   expect(ask.code).toBe(1);
-  expect(ask.stderr).toContain(`fx ask: ${guidance}`);
+  expect(ask.stderr).toContain(`di ask: ${guidance}`);
 
   const askJson = await runFx(["ask", "--json", "--no-save", "Answer directly."], { env, timeoutMs: TIMEOUT });
   expect(askJson.code).toBe(1);
@@ -4241,7 +4243,7 @@ test("Grok runs from FX_MODEL or --model without a saved model and fx provider g
 
     const missing = await runFx(["status"], { env, timeoutMs: TIMEOUT });
     expect(missing.code).toBe(1);
-    expect(missing.stderr).toBe("fx: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
+    expect(missing.stderr).toBe("di: no Grok model is selected; run `fx provider grok` to choose one, or set a model for this run with --model or FX_MODEL\n");
 
     const status = await runFx(["status", "--json"], { env: { ...env, FX_MODEL: "grok-4.6" }, timeoutMs: TIMEOUT });
     expect(status.code, status.stderr).toBe(0);

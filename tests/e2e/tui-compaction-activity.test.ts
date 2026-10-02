@@ -861,7 +861,7 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
           stderrPath: resumedStderr, width: 110, height: 36, startupWaitMs: 0,
         });
         await resumed.waitForPane((pane) =>
-          pane.includes("fx quit unexpectedly while this response was recovering"), 15_000);
+          pane.includes("di quit unexpectedly while this response was recovering"), 15_000);
         expect(gateway.requestCount()).toBe(requestsBeforeRecovery);
         await resumed.waitForStableComposer(10_000);
         await resumed.sendText("continue");

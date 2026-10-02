@@ -6708,13 +6708,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           await tui.sendText("Continue without repeating cancelled work.");
           await tui.waitForPane((text) => hasEmptyComposer(text) && text.includes("CANCEL_RESTART_COMPLETE"), 15000);
           expect(gateway.requests).toHaveLength(6);
+          await tui.sendText("/quit");
+          await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
           const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
           expect(events.filter((event) => event.tool_call?.call_id === "cancelled-history-child")).toHaveLength(1);
           expect(events.filter((event) => event.tool_call?.call_id === "cancel-follow-up-read")).toHaveLength(1);
           expect(events.some((event) => event.assistant?.text === "CANCEL_RESTART_COMPLETE")).toBe(true);
-          await tui.sendText("/quit");
-          await tui.waitForPane(() => paneExitMatches(tui!.paneStatus(), 0), 15000);
-          expect(readFileSync(stderrPath, "utf8")).toBe("");
         } finally {
           held.dispose();
           await tui?.kill();

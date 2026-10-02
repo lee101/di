@@ -429,7 +429,7 @@ describe("fx ask presentation", () => {
       .map((message) => typeof message.content === "string" ? message.content : "")
       .join("\n");
     expect(firstPrompt).toContain(
-      "Before the first tool call in a tool-driven task, always send one brief user-visible update",
+      "Before the first tool call in a tool-driven task, send one brief user-visible update",
     );
     expect(firstPrompt).toContain("Never start the first tool silently.");
     expect(firstPrompt).toContain(

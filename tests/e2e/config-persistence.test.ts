@@ -883,6 +883,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const initialSettings = JSON.stringify({
           model: "anthropic/claude-opus-4.8-fast",
           fast_mode: false,
+          yolo_acknowledged: true,
         }) + "\n";
         writeFileSync(settingsPath, initialSettings, { mode: 0o600 });
 
@@ -1026,6 +1027,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const opusRoot = realpathSync(opusWorkspace);
         const settingsPath = join(home, ".fx", "settings.json");
         const initialSettings = JSON.stringify({
+          yolo_acknowledged: true,
           model: "anthropic/claude-opus-4.8",
           effort: "high",
           fast_mode: false,
@@ -1565,6 +1567,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           cwd: workspaceRoot,
           env: {
             ...NO_AUTH,
+            FX_PERMISSION_MODE: "auto",
             HOME: home,
           },
           stderrPath,
@@ -1678,6 +1681,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
 
       const inertOutputSettings =
         JSON.stringify({
+          yolo_acknowledged: true,
           output_level: { legacy: true },
           workspaces: {
             [workspaceRoot]: {
@@ -1934,6 +1938,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const settingsPath = join(home, ".fx", "settings.json");
         const originalSettings =
           JSON.stringify({
+            yolo_acknowledged: true,
             workspaces: {
               [workspaceRoot]: {
                 additional_directories: savedRoots,

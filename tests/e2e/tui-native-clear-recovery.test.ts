@@ -123,7 +123,7 @@ tmuxTest("native-clear recovery after a tool call keeps fx running and the tool 
 
     const history = await session.captureFullScrollback();
     expect(history).not.toContain("TOOL_TURN_DONE");
-    expect(history).toContain("𝒇x v");
+    expect(history).toContain("di v");
 
     await session.sendKeys("C-o");
     await session.waitForText("echo TOOL_BEFORE_CLEAR", 10_000);

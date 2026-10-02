@@ -137,7 +137,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await session.sendText("/permissions");
       await session.waitForText("usage: /permissions [ask|auto|full-access|reset]", 5_000);
       const scrollback = await session.captureFullScrollback();
-      const statusIndex = scrollback.search(/\* permissions: mode=(?:ask|auto)/);
+      const statusIndex = scrollback.search(/\* permissions: mode=(?:ask|auto|full access)/);
       const usageIndex = scrollback.indexOf(
         "usage: /permissions [ask|auto|full-access|reset]",
       );

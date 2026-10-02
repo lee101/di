@@ -40,7 +40,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
     const stdout = join(root, `${label}.stdout`), stderr = join(root, `${label}.stderr`);
     const input = join(root, `${label}.input`);
     if (prompt !== undefined) writeFileSync(input, prompt);
-    const child = Bun.spawn([binary, "ask", "--json", ...args], { cwd, env, stdin: prompt === undefined ? "ignore" : Bun.file(input), stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
+    const child = Bun.spawn([binary, "ask", "--auto", "--json", ...args], { cwd, env, stdin: prompt === undefined ? "ignore" : Bun.file(input), stdout: Bun.file(stdout), stderr: Bun.file(stderr) });
     const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
     try {
       expect(await child.exited).toBe(0);

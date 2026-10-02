@@ -1240,12 +1240,23 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
   });
 }
 
-async function startCodeSession(client: AcpClient) {
+async function startRuntimePermissionSession(client: AcpClient) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   const created = await client.request("session/new", { mcpServers: [] }, 2) as any;
   await client.readLine(); // consume session/update notification
-  await client.request("session/set_mode", { modeId: "code" }, 3);
   return created.result.sessionId as string;
+}
+
+async function startCodeSession(client: AcpClient) {
+  const sessionId = await startRuntimePermissionSession(client);
+  await client.request("session/set_mode", { modeId: "code" }, 3);
+  return sessionId;
+}
+
+async function startAskSession(client: AcpClient) {
+  const sessionId = await startRuntimePermissionSession(client);
+  await client.request("session/set_mode", { modeId: "ask" }, 3);
+  return sessionId;
 }
 
 async function runPrompt(client: AcpClient, text: string, timeoutMs = LIVE_TIMEOUT) {
@@ -3294,7 +3305,7 @@ describe("acp: model-independent", () => {
           );
           expect(firstSystem.indexOf("# Identity and context")).toBeLessThan(firstSystem.indexOf(marker));
           expect(firstSystem).toContain("A client application hosts this conversation");
-          expect(firstSystem).not.toContain("which fx renders in the terminal");
+          expect(firstSystem).not.toContain("which di renders in the terminal");
           expect(userText(gateway.requests[0]!.body)).not.toContain(marker);
           await client.close();
 
@@ -3314,7 +3325,7 @@ describe("acp: model-independent", () => {
           const secondSystem = systemText(gateway.requests[1]!.body);
           expect(secondSystem).toContain(`<client_instructions>\nYou are the assistant inside Mini, a macOS browser. ${marker}`);
           // This client did not opt out of the terminal prompt.
-          expect(secondSystem).toContain("which fx renders in the terminal");
+          expect(secondSystem).toContain("which di renders in the terminal");
 
           expect(client.stderr).toBe("");
           await client.close();
@@ -7258,12 +7269,13 @@ describe("acp: model-independent", () => {
             cwd: acceptedRoot.workspace,
             env: {
               ...fakeGatewayEnv(acceptedRoot, acceptedGateway),
+              FX_PERMISSION_MODE: "auto",
               AI_GATEWAY_API_KEY: undefined,
               VERCEL_OIDC_TOKEN: undefined,
               FX_DISABLE_KEYCHAIN: "1",
             },
           });
-          await startCodeSession(client);
+          await startRuntimePermissionSession(client);
           const accepted = await runPrompt(client, acceptedPrompt, TIMEOUT);
           expect(JSON.stringify(accepted)).toContain("ACP external write accepted");
           expect(JSON.stringify(accepted.messages)).not.toContain(
@@ -7305,9 +7317,9 @@ describe("acp: model-independent", () => {
         try {
           client = await AcpClient.create({
             cwd: blockedRoot.workspace,
-            env: fakeGatewayEnv(blockedRoot, blockedGateway),
+            env: { ...fakeGatewayEnv(blockedRoot, blockedGateway), FX_PERMISSION_MODE: "auto" },
           });
-          await startCodeSession(client);
+          await startRuntimePermissionSession(client);
           const blocked = await runPrompt(client, blockedPrompt, TIMEOUT);
           const serialized = JSON.stringify(blocked);
           expect(
@@ -7375,9 +7387,9 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_PERMISSION_MODE: "auto" },
         });
-        await startCodeSession(client);
+        await startRuntimePermissionSession(client);
         const result = await runPrompt(
           client,
           "Write the ACP advisory caution fixture.",
@@ -8621,7 +8633,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "code mode deterministically gates external missing-parent writes by rule",
+    "ask mode deterministically gates external missing-parent writes by rule",
     async () => {
       const deniedRoot = createIsolatedRoot("fx-acp-deterministic-denied-");
       const allowedRoot = createIsolatedRoot("fx-acp-deterministic-allowed-");
@@ -8660,7 +8672,7 @@ describe("acp: model-independent", () => {
           cwd: deniedRoot.workspace,
           env: fakeGatewayEnv(deniedRoot, deniedGateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         const denied = await runPrompt(
           client,
           "Execute the requested denied external write.",
@@ -8686,7 +8698,7 @@ describe("acp: model-independent", () => {
           cwd: allowedRoot.workspace,
           env: fakeGatewayEnv(allowedRoot, allowedGateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         const allowed = await runPrompt(
           client,
           "Execute the requested allowed external write.",
@@ -9296,7 +9308,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         client.setPermissionOption("allow_always");
 
         const first = await runPrompt(client, "Approve the first external write.", TIMEOUT);
@@ -9372,7 +9384,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         client.setPermissionOption("reject_once");
         const result = await runPrompt(client, "Attempt the rejected external write.", TIMEOUT);
         const permission = result.messages.find(
@@ -9528,7 +9540,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         client.setPermissionOption("allow_once");
         const result = await runPrompt(client, "Run the approved command.", TIMEOUT);
         const permission = result.messages.find(
@@ -9630,9 +9642,9 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: fakeGatewayEnv(root, gateway),
+          env: { ...fakeGatewayEnv(root, gateway), FX_PERMISSION_MODE: "auto" },
         });
-        await startCodeSession(client);
+        await startRuntimePermissionSession(client);
 
         sendPrompt(client, 396, "Run the held automatic review fixture.");
         await waitForCondition(
@@ -9697,7 +9709,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        await startAskSession(client);
         sendPrompt(client, 296, "Request permission and wait.");
         await waitForCondition("the permission fixture request", () => gateway.requests.length === 1);
         await Bun.sleep(50);

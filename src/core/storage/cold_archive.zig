@@ -420,14 +420,20 @@ test "encode decode round trip and tamper detection" {
     const alloc = testing.allocator;
     const data = try makeCompressible(alloc, 20000);
     defer alloc.free(data);
-    const enc = (try encode(alloc, data, .{})).?;
-    defer alloc.free(enc);
-    try testing.expect(enc.len * 3 < data.len);
-    const dec = try decode(alloc, enc);
-    defer alloc.free(dec);
-    try testing.expectEqualSlices(u8, data, dec);
-    enc[enc.len - 3] ^= 0x55;
-    try testing.expect(std.meta.isError(decode(alloc, enc)));
+    for ([_]compress.Options{ .{}, .{ .allow_zstd = false } }) |options| {
+        const enc = (try encode(alloc, data, options)).?;
+        defer alloc.free(enc);
+        try testing.expect(enc.len * 3 < data.len);
+        const dec = try decode(alloc, enc);
+        defer alloc.free(dec);
+        try testing.expectEqualSlices(u8, data, dec);
+        // Compressed payloads may contain padding; corrupt the verified digest.
+        enc[16] ^= 0x55;
+        if (decode(alloc, enc)) |unexpected| {
+            alloc.free(unexpected);
+            return error.TestUnexpectedResult;
+        } else |err| try testing.expectEqual(error.InvalidArchive, err);
+    }
     try testing.expectError(error.InvalidArchive, decode(alloc, "short"));
     try testing.expect((try encode(alloc, "tiny", .{})) == null);
 }

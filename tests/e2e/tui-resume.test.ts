@@ -355,7 +355,7 @@ test.skipIf(!tmuxAvailable())(
       }
     };
     try {
-      const seeded = await runFx(["ask", "--json", "Seed the prepared transcript without tools."], {
+      const seeded = await runFx(["ask", "--auto", "--json", "Seed the prepared transcript without tools."], {
         cwd: workspace, env, timeoutMs: TIMEOUT,
       });
       expect(seeded.code).toBe(0);
@@ -3264,7 +3264,7 @@ test.skipIf(!tmuxAvailable())(
     mkdirSync(workspace);
     writeFileSync(
       join(home, ".fx", "settings.json"),
-      JSON.stringify({ sandbox: "none", permission_mode: "auto", permission: {} }),
+      JSON.stringify({ sandbox: "none", permission_mode: "ask", permission: { bash: "allow" } }),
     );
     writeFileSync(stderrPath, "");
 
@@ -3294,7 +3294,7 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(workspace),
-        env: { ...gatewayEnv(home, gateway), FX_RECORD: tapePath },
+        env: { ...gatewayEnv(home, gateway), FX_PERMISSION_MODE: "ask", FX_RECORD: tapePath },
         stderrPath,
         width: 100,
         height: 32,
@@ -5338,6 +5338,7 @@ test.skipIf(!tmuxAvailable())(
           cwd: workspaceRoot,
           env: {
             ...gatewayEnv(home, gateway),
+            FX_PERMISSION_MODE: "auto",
             FX_RECORD: tapePath,
           },
           stderrPath,
@@ -5834,7 +5835,7 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: workspaceRoot,
-        env: gatewayEnv(home, initialGateway),
+        env: { ...gatewayEnv(home, initialGateway), FX_PERMISSION_MODE: "ask" },
         stderrPath,
         width: 100,
         height: 32,
@@ -5857,7 +5858,7 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: `${FX_BIN} --resume-last`,
         cwd: workspaceRoot,
-        env: gatewayEnv(home, flagGateway),
+        env: { ...gatewayEnv(home, flagGateway), FX_PERMISSION_MODE: "ask" },
         stderrPath,
         width: 100,
         height: 32,
@@ -5880,7 +5881,7 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: workspaceRoot,
-        env: gatewayEnv(home, pickerGateway),
+        env: { ...gatewayEnv(home, pickerGateway), FX_PERMISSION_MODE: "ask" },
         stderrPath,
         width: 100,
         height: 32,
