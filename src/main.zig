@@ -4884,6 +4884,7 @@ test {
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
+    _ = @import("core/config/prompt_cache_policy.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");

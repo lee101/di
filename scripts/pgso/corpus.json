@@ -139,6 +139,7 @@
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
     {"name": "verify-tui-slash-preferences", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-preferences.test.ts"], "test_file": "tui-slash-preferences.test.ts"},
-    {"name": "verify-settings-permissions-warning", "argv": ["bun", "test", "--max-concurrency", "1", "./settings-permissions-warning.test.ts"], "test_file": "settings-permissions-warning.test.ts"}
+    {"name": "verify-settings-permissions-warning", "argv": ["bun", "test", "--max-concurrency", "1", "./settings-permissions-warning.test.ts"], "test_file": "settings-permissions-warning.test.ts"},
+    {"name": "verify-shell-request-tolerance", "argv": ["bun", "test", "--max-concurrency", "1", "./shell-request-tolerance.test.ts"], "test_file": "shell-request-tolerance.test.ts"}
   ]
 }

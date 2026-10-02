@@ -72,7 +72,7 @@ const todo_list_entry_schema = model_tool_schema.ObjectSchema{
     .additional_properties = false,
 };
 const shell_description =
-    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking.";
+    "Run every command with shell.run. Fast commands complete in one call; commands still running after yield_time_ms return one owned session_id and remain available across turns. Use shell.interact with that exact session_id: omit chars to observe, or provide chars to send exact input and then observe. Use shell.stop only when termination is requested. output_delta is always terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output, so do not run a separate command merely to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Omit shell and profile unless the user named a shell.";
 
 const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
@@ -88,9 +88,9 @@ const shell_run_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
     .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "Shell command to execute exactly once." },
     .{ .name = "cwd", .json_type = .string, .description = "Working directory; defaults to the workspace." },
-    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Defaults to user; clean skips user startup files. Mutually exclusive with shell." },
-    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "Explicit shell for tty=true. Mutually exclusive with profile." },
-    .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
+    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Defaults to user; clean skips user startup files. Omit unless needed; never send together with shell." },
+    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "Rarely needed: omit unless the user named a specific shell. Requires tty=true and is ignored otherwise. Never send together with profile." },
+    .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false. Do not send tty=true just to choose a shell." },
     .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Initial observation window. Defaults to 30000; use 0 to return the owned running handle immediately." },
     .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
 };
@@ -1102,7 +1102,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "dc56e2530e29638739dec622e820ae62657b9808f58a0ff43f08477fe04c8bea",
+        "a20d692342fa726324ee0ed73a9e67a18062ace183f63703c7e0774f39c81848",
         &actual_hex,
     );
 }

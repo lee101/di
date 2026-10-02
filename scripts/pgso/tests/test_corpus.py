@@ -87,6 +87,7 @@ VERIFICATION_E2E_TESTS = (
     "yolo-permission-mode.test.ts",
     "tui-slash-preferences.test.ts",
     "settings-permissions-warning.test.ts",
+    "shell-request-tolerance.test.ts",
 )
 
 EXCLUDED_E2E_TESTS = (

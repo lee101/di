@@ -13,6 +13,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const prompt_cache_policy = @import("prompt_cache_policy.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -67,6 +68,7 @@ pub const Settings = struct {
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    prompt_cache_ttl: ?prompt_cache_policy.Ttl = null,
     theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -899,6 +901,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "first_call_tool_choice",
         "auto_upgrade",
         "update_channel",
+        "prompt_cache_ttl",
         "permission_mode",
         "credential_source",
         "yolo_acknowledged",
@@ -1854,6 +1857,12 @@ fn parseProfileOnlyFields(
             return error.InvalidUpdateChannelValue;
     }
 
+    if (root.object.get("prompt_cache_ttl")) |ttl_value| {
+        if (ttl_value != .string) return error.InvalidPromptCacheTtlType;
+        settings.prompt_cache_ttl = prompt_cache_policy.Ttl.parse(ttl_value.string) orelse
+            return error.InvalidPromptCacheTtlValue;
+    }
+
     if (root.object.get("theme")) |theme_value| {
         const value = theme_value;
         if (value != .string) return error.InvalidThemeType;
@@ -2063,6 +2072,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
+    if (incoming.prompt_cache_ttl) |value| target.prompt_cache_ttl = value;
     if (incoming.theme) |value| {
         if (target.theme) |old| alloc.free(old);
         target.theme = value;
@@ -4584,6 +4594,14 @@ test "update channel resolves only from the global user profile" {
     var settings = try loadMergedSettingsFromHome(alloc, home_root, workspace_root);
     defer settings.deinit(alloc);
     try std.testing.expectEqual(update_target.Channel.dev, settings.update_channel.?);
+}
+
+test "prompt cache ttl setting accepts only the supported lifetimes" {
+    var parsed = try parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":\"1h\"}");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(prompt_cache_policy.Ttl.one_hour, parsed.prompt_cache_ttl.?);
+    try std.testing.expectError(error.InvalidPromptCacheTtlValue, parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":\"2h\"}"));
+    try std.testing.expectError(error.InvalidPromptCacheTtlType, parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":3600}"));
 }
 
 test "all currently parsed read-only settings survive detailed loading" {

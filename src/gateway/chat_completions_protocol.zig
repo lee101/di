@@ -9,12 +9,15 @@ const sse = @import("sse.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
+const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    /// Provider opted in to session id, usage accounting, and cache breakpoint hints.
+    prompt_caching: bool = false,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -165,7 +168,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.reasoning != null or options.fast) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -394,6 +397,7 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
     try validate_request(input);
+    if (input.provider_options.prompt_caching and !options.prompt_caching) return error.UnsupportedProviderOption;
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -517,7 +521,22 @@ fn flush_tool_image_follow_up(
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
+    try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    if (options.prompt_caching) {
+        try writer.writeAll(",\"usage\":{\"include\":true}");
+        if (prompt_cache_policy.validSessionHeader(request.session_id)) |session_id| {
+            try writer.writeAll(",\"session_id\":");
+            try std.json.Stringify.value(session_id, .{}, writer);
+        }
+    }
+    try writer.writeAll(",\"messages\":[");
+    const cache_plan = prompt_cache_policy.plan(
+        request.model,
+        options.prompt_caching,
+        prompt_cache_policy.effectiveTtl(),
+        request.instructions,
+        request.messages,
+    );
     var count: usize = 0;
     // Images from tool results buffer across each contiguous tool-message run
     // and flush as one user message when the run ends, so tool messages stay
@@ -527,8 +546,8 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
-    for (lanes) |lane| {
-        for (lane) |message| {
+    for (lanes, 0..) |lane, lane_index| {
+        for (lane, 0..) |message, message_index| {
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
@@ -537,8 +556,11 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeAll("{\"role\":");
             try std.json.Stringify.value(@tagName(message.role), .{}, writer);
             try writer.writeAll(",\"content\":");
+            const cache_ttl = if (lane_index == 0) cache_plan.marksSystem(message_index) else cache_plan.marksMessage(message_index);
             if (message.role == .user and message.images.len != 0) {
                 try write_user_content_parts(writer, alloc, message);
+            } else if (cache_ttl) |ttl| {
+                try prompt_cache_policy.writeCachedTextContent(writer, message.content.?, ttl);
             } else {
                 try std.json.Stringify.value(message.content, .{}, writer);
             }
@@ -652,6 +674,9 @@ pub const Reducer = struct {
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
+    /// Set by transports that treat reported cost as exact billing for this provider.
+    exact_provider: ?model_provider.ProviderId = null,
+    request_model: []const u8 = "",
     usage_total: ?u64 = null,
     usage_final_fields: packed struct(u3) {
         input: bool = false,
@@ -671,7 +696,7 @@ pub const Reducer = struct {
         try validate_request(request);
         var functions = try select_functions(alloc, request.tools, request.tool_choice);
         defer functions.deinit(alloc);
-        var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
+        var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice, .request_model = request.model };
         errdefer self.deinit();
         for (functions.items) |function| {
             const name = try alloc.dupe(u8, function.name);
@@ -901,10 +926,22 @@ pub const Reducer = struct {
             .output_tokens = try token_count(fields, "completion_tokens"),
         };
         const incoming_total = try token_count(fields, "total_tokens");
-        const usage = types.Usage{
+        var usage = types.Usage{
             .input_tokens = incoming.input_tokens orelse self.usage.input_tokens,
             .output_tokens = incoming.output_tokens orelse self.usage.output_tokens,
+            .cache_read_tokens = self.usage.cache_read_tokens,
+            .cache_write_tokens = self.usage.cache_write_tokens,
+            .reasoning_tokens = self.usage.reasoning_tokens,
+            .cost = self.usage.cost,
         };
+        if (non_null(fields, "prompt_tokens_details")) |details| if (details == .object) {
+            usage.cache_read_tokens = optional_count(details.object, "cached_tokens") orelse usage.cache_read_tokens;
+            usage.cache_write_tokens = optional_count(details.object, "cache_write_tokens") orelse usage.cache_write_tokens;
+        };
+        if (non_null(fields, "completion_tokens_details")) |details| if (details == .object) {
+            usage.reasoning_tokens = optional_count(details.object, "reasoning_tokens") orelse usage.reasoning_tokens;
+        };
+        if (non_null(fields, "cost")) |cost_value| usage.cost = optional_cost(cost_value) orelse usage.cost;
         const total = incoming_total orelse self.usage_total;
         var final_fields = self.usage_final_fields;
         if (final) {
@@ -989,12 +1026,30 @@ pub const Reducer = struct {
         const generation_id = self.generation_id;
         self.generation_id = null;
         errdefer if (generation_id) |id| self.alloc.free(id);
+        var billing: ?types.ProviderBilling = null;
+        var usage_outcome: stream_provider.UsageOutcome = .{ .unavailable = .possibly_billed };
+        if (self.exact_provider) |provider| if (self.usage.cost) |cost| if (generation_id != null) {
+            const input = self.usage.input_tokens orelse 0;
+            billing = .{
+                .created_at_ms = io_mod.milliTimestamp(),
+                .model = try self.alloc.dupe(u8, self.request_model),
+                .total_cost = cost,
+                .input_tokens = input,
+                .output_tokens = self.usage.output_tokens orelse 0,
+                .cache_read_tokens = @min(self.usage.cache_read_tokens orelse 0, input),
+                .cache_write_tokens = self.usage.cache_write_tokens orelse 0,
+                .reasoning_tokens = self.usage.reasoning_tokens,
+                .billable_web_search_calls = 0,
+            };
+            usage_outcome = .{ .exact = provider };
+        };
+        errdefer if (billing) |value| self.alloc.free(@constCast(value.model));
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .billing = billing, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
-            .usage = .{ .unavailable = .possibly_billed },
+            .usage = usage_outcome,
         } };
     }
 };
@@ -1026,6 +1081,23 @@ fn index_value(value: std.json.Value) Error!usize {
     return std.math.cast(usize, try integer(value)) orelse error.InvalidChunk;
 }
 
+/// Optional accounting detail: malformed values are ignored, never fatal.
+fn optional_count(fields: std.json.ObjectMap, key: []const u8) ?u64 {
+    const value = non_null(fields, key) orelse return null;
+    return std.math.cast(u64, integer(value) catch return null);
+}
+
+fn optional_cost(value: std.json.Value) ?f64 {
+    const cost: f64 = switch (value) {
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return null,
+        else => return null,
+    };
+    if (!std.math.isFinite(cost) or cost < 0) return null;
+    return cost;
+}
+
 fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
     const value = non_null(fields, key) orelse return null;
     return std.math.cast(u64, try integer(value)) orelse error.InvalidChunk;
@@ -1042,9 +1114,16 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
 pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
+    return consume_stream_exact(alloc, source, request, limits, events, cancel_flag, null);
+}
+
+/// With `exact_provider`, a final usage chunk carrying `cost` and a generation id
+/// settles exact billing for that provider; otherwise usage stays unbilled-unknown.
+pub fn consume_stream_exact(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), exact_provider: ?model_provider.ProviderId) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
     defer reducer.deinit();
+    reducer.exact_provider = exact_provider;
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
     defer framing.deinit(alloc);
     while (true) {
@@ -2020,6 +2099,77 @@ test "chat completions serializes user message images as content parts" {
     const image_part = parts[1].object;
     try std.testing.expectEqualStrings("image_url", image_part.get("type").?.string);
     try std.testing.expect(std.mem.startsWith(u8, image_part.get("image_url").?.object.get("url").?.string, "data:image/png;base64,"));
+}
+
+test "chat completions prompt caching hints require the provider opt in" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.model = "anthropic/claude-sonnet-4.5";
+    request.session_id = "session-1";
+    request.messages = &.{.{ .role = .user, .content = "hi" }};
+    request.provider_options = .{ .prompt_caching = true };
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
+
+    const body = try build_request(alloc, request, .{ .prompt_caching = true });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"session_id\":\"session-1\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"usage\":{\"include\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"stream_options\":{\"include_usage\":true}") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"second\",\"cache_control\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"cache_control\"") != null);
+
+    request.model = "openai/gpt-5";
+    const other = try build_request(alloc, request, .{ .prompt_caching = true });
+    defer alloc.free(other);
+    try std.testing.expect(std.mem.find(u8, other, "\"session_id\":\"session-1\"") != null);
+    try std.testing.expect(std.mem.find(u8, other, "cache_control") == null);
+
+    request.provider_options = .{};
+    const plain = try build_request(alloc, request, .{});
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "session_id") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "\"usage\":{") == null);
+}
+
+test "chat completions exact billing needs the provider, a cost, and a generation id" {
+    const alloc = std.testing.allocator;
+    const final = "{\"id\":\"chat-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\"total_tokens\":1020,\"cost\":0.0123,\"prompt_tokens_details\":{\"cached_tokens\":900,\"cache_write_tokens\":50},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}";
+    const provider = model_provider.parse("router").?;
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        reducer.exact_provider = provider;
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, test_stop);
+        try test_accept(&reducer, final);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        const completed = result.completed;
+        try std.testing.expectEqual(@as(?u64, 900), completed.completion.usage.cache_read_tokens);
+        try std.testing.expectEqual(@as(?u64, 50), completed.completion.usage.cache_write_tokens);
+        try std.testing.expectEqual(@as(?u64, 5), completed.completion.usage.reasoning_tokens);
+        try std.testing.expectEqual(@as(?f64, 0.0123), completed.completion.usage.cost);
+        try std.testing.expect(completed.usage == .exact);
+        const billing = completed.completion.billing.?;
+        try std.testing.expectEqualStrings("opaque/local-model:8b", billing.model);
+        try std.testing.expectEqual(@as(u64, 900), billing.cache_read_tokens);
+        try std.testing.expectEqual(@as(u64, 1000), billing.input_tokens);
+    }
+    {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, test_stop);
+        try test_accept(&reducer, final);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expect(result.completed.completion.billing == null);
+        try std.testing.expect(result.completed.usage == .unavailable);
+        try std.testing.expectEqual(@as(?u64, 900), result.completed.completion.usage.cache_read_tokens);
+    }
 }
 
 test "chat completions rejects unsupported requests and ambiguous selection" {

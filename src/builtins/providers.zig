@@ -32,6 +32,7 @@ pub const native = provider_set.Set{
         .permission_reviewer = xai_grok_permission_reviewer.provider,
     },
     .openpaths = .{
+        .capabilities = .{ .gateway_prompt_caching = true },
         .presentation = provider_catalog.find(.openpaths),
         .fallback_model_capabilities_fn = openpathsModelCapabilities,
         .agent_stream = openpaths.agent_stream_provider,

@@ -23,6 +23,7 @@ const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const prompt_cache_policy = @import("../config/prompt_cache_policy.zig");
 const terminal_diff = @import("../../ui/render_engine/terminal_diff.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
@@ -716,6 +717,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.provider_strict = settings.provider_strict orelse false;
+    prompt_cache_policy.setConfigured(settings.prompt_cache_ttl orelse .five_minutes);
     if (settings.provider_order) |order| {
         const owned_order = try alloc.alloc([]const u8, order.len);
         var filled: usize = 0;
