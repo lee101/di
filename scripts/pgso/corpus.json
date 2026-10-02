@@ -110,9 +110,13 @@
     {"name": "e2e-capability-search", "argv": ["bun", "test", "--max-concurrency", "1", "./capability-search.test.ts"], "test_file": "capability-search.test.ts"},
     {"name": "e2e-read-tool-result", "argv": ["bun", "test", "--max-concurrency", "1", "./read-tool-result.test.ts"], "test_file": "read-tool-result.test.ts"},
     {"name": "e2e-mcp-failure-modes", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-failure-modes.test.ts"], "test_file": "mcp-failure-modes.test.ts"},
-    {"name": "e2e-context-files", "argv": ["bun", "test", "--max-concurrency", "1", "./context-files.test.ts"], "test_file": "context-files.test.ts"}
+    {"name": "e2e-context-files", "argv": ["bun", "test", "--max-concurrency", "1", "./context-files.test.ts"], "test_file": "context-files.test.ts"},
+    {"name": "e2e-warm-shell", "argv": ["bun", "test", "--max-concurrency", "1", "./warm-shell.test.ts"], "test_file": "warm-shell.test.ts", "requires_tmux": false}
   ],
   "verification_scenarios": [
+    {"name": "verify-goal-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./goal-mode.test.ts"], "test_file": "goal-mode.test.ts", "requires_tmux": false},
+    {"name": "verify-storage", "argv": ["bun", "test", "--max-concurrency", "1", "./storage.test.ts"], "test_file": "storage.test.ts", "requires_tmux": false},
+    {"name": "verify-tui-goal", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-goal.test.ts"], "test_file": "tui-goal.test.ts"},
     {"name": "verify-slack-install", "argv": ["bun", "test", "--max-concurrency", "1", "./slack-install.test.ts"], "test_file": "slack-install.test.ts", "requires_tmux": false},
     {"name": "verify-auto-mode-reliability", "argv": ["bun", "test", "--max-concurrency", "1", "./auto-mode-reliability.test.ts"], "test_file": "auto-mode-reliability.test.ts"},
     {"name": "verify-sessions-v2", "argv": ["bun", "test", "--max-concurrency", "1", "./sessions-v2.test.ts"], "test_file": "sessions-v2.test.ts"},
