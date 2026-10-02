@@ -260,7 +260,12 @@ function fixtureEnv(root: FixtureRoot, activeGateway: ReturnType<typeof startFak
   return {
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-mcp-stdio-key",
+    OPENPATHS_API_KEY: undefined,
+    OPENROUTER_API_KEY: undefined,
     VERCEL_OIDC_TOKEN: undefined,
+    FX_PROVIDER: "gateway",
+    FX_PROVIDER_STRICT: "1",
+    FX_E2E_DISABLE_DOTENV: "1",
     FX_AUTO_UPGRADE: "0",
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
@@ -392,6 +397,26 @@ async function waitForTtyAskExit(
 }
 
 describe("modern MCP stdio compatibility", () => {
+  test("gateway fixture isolates inherited live provider credentials", async () => {
+    const root = createRoot("isolated-gateway", MODERN_FIXTURE);
+    gateway = startFakeGateway([fakeGatewayFinalText("ISOLATED_GATEWAY_REPLY")], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const env = fixtureEnv(root, gateway);
+    expect(env.FX_PROVIDER).toBe("gateway");
+    expect(env.OPENPATHS_API_KEY).toBeUndefined();
+    expect(env.OPENROUTER_API_KEY).toBeUndefined();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Reply without tools."], {
+      cwd: root.workspace,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout).output).toBe("ISOLATED_GATEWAY_REPLY");
+    expect(gateway.requests).toHaveLength(1);
+  }, 30_000);
+
   for (const version of ["2025-11-25", "2025-06-18", "2024-11-05"] as const) {
     test(`default MCP v1 starts ${version} stdio without a discovery probe or process restart`, async () => {
       const root = createRoot(`default-v1-${version}`, LEGACY_FIXTURE, { legacyVersion: version });
@@ -836,7 +861,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"
       expect(menu).toContain("MCP 1");
       expect(menu).toContain("canary");
       expect(menu).toContain("Disabled");
-      expect(menu).toContain("fx mcp list");
+      expect(menu).toContain("di mcp list");
       expect(menu).toContain("MISSING_WORKSPACE_COMMAND");
       expect(menu).toContain("field command");
       expect(menu).not.toContain("secret-prefix");
