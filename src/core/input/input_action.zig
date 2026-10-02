@@ -90,6 +90,7 @@ pub const Action = union(enum) {
     clear_line,
     toggle_full_transcript,
     toggle_permission_mode,
+    edit_queued_prompt,
     open_all_sessions,
     open_model_catalog,
     insert_newline,

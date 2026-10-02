@@ -81,7 +81,10 @@ fn modifiedArrowAction(byte: u8, modifiers: u16, meta_prefixed: bool) ?InputEsca
         else => null,
     };
     if (meta_prefixed or (modifiers & alt_modifier) != 0) return switch (byte) {
-        'A' => composerMove(.paragraph_up, modifiers),
+        'A' => if ((modifiers & shift_modifier) == 0)
+            .edit_queued_prompt
+        else
+            composerMove(.paragraph_up, modifiers),
         'B' => composerMove(.paragraph_down, modifiers),
         'C' => composerMove(.word_right, modifiers),
         'D' => composerMove(.word_left, modifiers),

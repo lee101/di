@@ -1186,6 +1186,28 @@ const App = struct {
     }
 
     pub fn enqueuePromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.admitPromptWithSkillBindings(prompt, skill_tokens, false);
+    }
+
+    pub fn enqueueDeferredPromptWithSkillBindings(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
+        return self.admitPromptWithSkillBindings(prompt, skill_tokens, true);
+    }
+
+    pub fn popQueuedPromptForEdit(self: *App) !?[]u8 {
+        const text = (try self.worker.popQueuedPromptForEdit(std.heap.c_allocator)) orelse return null;
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return text;
+    }
+
+    fn admitPromptWithSkillBindings(
+        self: *App,
+        prompt: []const u8,
+        skill_tokens: []const registered_entities.SkillTokenSpan,
+        deferred: bool,
+    ) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)
         else
@@ -1205,10 +1227,11 @@ const App = struct {
                 debug_trace.preview(prompt, 120),
             },
         );
-        if (!try self.snapshotAndAdmitInteractivePromptWithSkillBindings(
-            prompt,
-            skill_tokens,
-        )) return false;
+        const admitted = if (deferred)
+            try self.snapshotAndQueuePrompt(prompt, skill_tokens, null, null, 0, false)
+        else
+            try self.snapshotAndAdmitInteractivePromptWithSkillBindings(prompt, skill_tokens);
+        if (!admitted) return false;
         WorkerAppRuntime.syncState(
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),

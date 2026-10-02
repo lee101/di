@@ -50,6 +50,7 @@
   { "file": "tui-render-live-stress.test.ts", "weight": 1 },
   { "file": "tui-render-replay.test.ts", "weight": 14 },
   { "file": "tui-render-stress.test.ts", "weight": 14 },
+  { "file": "tui-queued-prompts.test.ts", "weight": 8 },
   { "file": "tui-resize.test.ts", "weight": 187 },
   { "file": "tui-resume-brutal.test.ts", "weight": 18 },
   { "file": "tui-resume.test.ts", "weight": 289 },

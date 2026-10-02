@@ -141,6 +141,15 @@ documentation lives at `fx.sh`, the npm package is `libfx` with `fx-*`
 artifacts, the built-in themes are `fx-dark` and `fx-light`, and the Slack
 workspace app is registered as fx with its callback at `fx.sh`.
 
+### Queued prompts
+
+While a turn is running, Enter steers it. Tab or Ctrl+Q instead queues the
+composer text to run, in order, after the current turn and earlier queued
+prompts finish. Alt+Up pulls the newest queued text-only prompt back into an
+empty composer for editing; with nothing queued it keeps its paragraph-up
+movement. Slash commands are not queued, and Ctrl+Q on an idle composer
+submits normally.
+
 ## Efficiency
 
 Token spend and machine cost are design constraints here, not numbers measured
