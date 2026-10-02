@@ -13,7 +13,7 @@ closer to a Unix shell than an IDE in the terminal.
 ## Highlights
 
 - **Efficient by default:** tool output is capped, parallel tool batches stay bounded, and the whole agent is one native process, so token spend and CPU/RAM use stay predictable
-- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter
+- **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter, including [OpenPaths](https://openpaths.io)
 - **Any interface:** interactive shell, one-shot `di ask` for scripts, or embedded through libfx and ACP
 - **Shell-like output:** inline rendering that preserves your terminal scrollback
 - **Inline images:** PNG screenshots and attachments render in the transcript through Kitty graphics, with a text fallback in other terminals
