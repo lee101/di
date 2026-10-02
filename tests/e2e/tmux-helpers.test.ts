@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -308,6 +309,33 @@ tmuxTest("owned sessions support nonzero window and pane indexes", async () => {
   } finally {
     await session?.kill();
     try { execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" }); } catch {}
+  }
+});
+
+tmuxTest("a shared server with a removed launch directory honors the requested session cwd", async () => {
+  const anchor = mkdtempSync(join(tmpdir(), "fx-tmux-old-cwd-"));
+  const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-tmux-new-cwd-")));
+  const socketName = `fx-removed-cwd-${process.pid}-${Date.now()}`;
+  let session: TmuxSession | undefined;
+  try {
+    execFileSync("tmux", ["-L", socketName, "-f", "/dev/null", "new-session", "-d", "-c", anchor, "-s", "cwd-bootstrap", "sleep 60"], {
+      cwd: anchor,
+      stdio: "pipe",
+    });
+    rmSync(anchor, { recursive: true, force: true });
+    session = await TmuxSession.create({
+      cmd: "printf 'SESSION_CWD='; pwd -P; sleep 60",
+      cwd: workspace,
+      socketName,
+      startupWaitMs: 0,
+    });
+    expect(await session.waitForText("SESSION_CWD=", 5_000)).toContain(`SESSION_CWD=${workspace}`);
+    expect(session.isAlive()).toBe(true);
+  } finally {
+    await session?.kill();
+    try { execFileSync("tmux", ["-L", socketName, "kill-server"], { stdio: "pipe" }); } catch {}
+    rmSync(anchor, { recursive: true, force: true });
+    rmSync(workspace, { recursive: true, force: true });
   }
 });
 

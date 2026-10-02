@@ -2726,14 +2726,14 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     fakeGatewayFinalText("AFTER_CANCEL_ANSWER"),
     fakeGatewayFinalText("AFTER_CANCEL_RESUME"),
   ]);
+  let app: Awaited<ReturnType<typeof startApp>> | undefined;
+  let resumed: Awaited<ReturnType<typeof startApp>> | undefined;
   try {
-    const app = await startApp(fixture, gateway, []);
+    app = await startApp(fixture, gateway, []);
     await app.session.sendText("Stream a reply that I will cancel.");
     await until(() => hold.started, "the held reply");
     await app.session.waitForText("PARTIAL_BEFORE_CANCEL", TIMEOUT);
-    await app.session.sendKeys("Escape");
-    await app.session.waitForText("esc again to interrupt", TIMEOUT);
-    await app.session.sendKeys("Escape");
+    await app.session.sendInterruptEscapePair();
     await until(() => hold.cancelled, "the cancel to reach the gateway");
     await app.session.waitForComposer(TIMEOUT);
     await app.session.sendText("Confirm the next prompt still works.");
@@ -2748,7 +2748,7 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     expect(lines.filter((line) => line.kind === "turn_interrupted").map((line) => line.reason)).toEqual(["cancel"]);
     expect(lines.filter((line) => line.kind === "turn_committed")).toHaveLength(1);
 
-    const resumed = await startApp(fixture, gateway, ["-c"]);
+    resumed = await startApp(fixture, gateway, ["-c"]);
     const shown = await scrollbackContains(resumed.session, "AFTER_CANCEL_ANSWER");
     expect(shown).toContain("PARTIAL_BEFORE_CANCEL");
     await resumed.session.sendText("Continue after the resume.");
@@ -2758,6 +2758,8 @@ test.skipIf(!tmuxAvailable())("a cancelled app reply is saved as cancelled, and 
     expect(countIn(gateway.requests.at(-1)!.body, "<turn_aborted>")).toBe(1);
     expectWholeLog(fixture, id);
   } finally {
+    await resumed?.session.kill();
+    await app?.session.kill();
     hold.release?.();
     gateway.stop();
     rmSync(fixture.root, { recursive: true, force: true });
@@ -3692,9 +3694,7 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
           // stream may not draw after a large resume (F33).
           await until(() => hold.started, "the held reply");
           await waitForLog(fixture, id, "Grid second.");
-          await app.session.sendKeys("Escape");
-          await app.session.waitForText("esc again to interrupt", TIMEOUT);
-          await app.session.sendKeys("Escape");
+          await app.session.sendInterruptEscapePair();
           await until(() => hold.cancelled, "the cancel to reach the gateway");
           await app.session.waitForComposer(TIMEOUT);
           await quitApp(app);
