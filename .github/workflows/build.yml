@@ -1,0 +1,134 @@
+name: Build
+
+# Produces one production (ReleaseSafe) di binary per supported platform and
+# publishes each one as a workflow artifact. Release.yml reuses this workflow so
+# the published binaries are byte-identical to the ones CI verified.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      version:
+        description: Version string from src/main.zig, without a leading v.
+        value: ${{ jobs.meta.outputs.version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' src/main.zig)"
+          if [ -z "$version" ]; then
+            echo "::error::src/main.zig does not declare pub const version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binary:
+    name: ${{ matrix.platform.name }}
+    needs: meta
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            archive: tar
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            archive: tar
+          - name: macos-aarch64
+            runner: macos-15
+            archive: tar
+          - name: macos-x86_64
+            runner: macos-15-intel
+            archive: tar
+          - name: windows-x86_64
+            runner: windows-2022
+            archive: zip
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: build-${{ matrix.platform.name }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Smoke test the built binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f zig-out/bin/di.exe ]; then
+            binary=zig-out/bin/di.exe
+          else
+            binary=zig-out/bin/di
+          fi
+          "$binary" --version
+          # FX_BENCH exits after argument parsing and CLI dispatch, so this
+          # proves the binary starts without needing a TTY.
+          FX_BENCH=1 "$binary" help > /dev/null
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform.name }}
+          ARCHIVE: ${{ matrix.platform.archive }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          staging="dist/di-${VERSION}-${PLATFORM}"
+          mkdir -p "$staging"
+          if [ -f zig-out/bin/di.exe ]; then
+            cp zig-out/bin/di.exe "$staging/di.exe"
+          else
+            cp zig-out/bin/di "$staging/di"
+          fi
+          cp README.md LICENSE "$staging/"
+          cd dist
+          # bsdtar ships on the macOS and Windows runners and writes zip with -a;
+          # GNU tar on Linux does not, so only the zip case needs the flag.
+          asset="di-${VERSION}-${PLATFORM}"
+          if [ "$ARCHIVE" = zip ]; then
+            tar -a -cf "${asset}.zip" "$asset"
+            asset="${asset}.zip"
+          else
+            tar -czf "${asset}.tar.gz" "$asset"
+            asset="${asset}.tar.gz"
+          fi
+          sha256sum "$asset" > "SHA256SUMS.${PLATFORM}"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: di-${{ matrix.platform.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
