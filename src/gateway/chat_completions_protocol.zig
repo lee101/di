@@ -12,9 +12,111 @@ const io_mod = @import("../core/shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
+fn compact_reasoning_details(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const envelope = try std.mem.concat(scratch, u8, &.{ "[", raw, "]" });
+    const parsed = std.json.parseFromSlice(std.json.Value, scratch, envelope, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return alloc.dupe(u8, raw),
+    };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var position: usize = 0;
+    const items = parsed.value.array.items;
+    while (position < items.len) {
+        var item = items[position];
+        position += 1;
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(scratch);
+        if (reasoning_text_field(item)) |field| {
+            try text.appendSlice(scratch, item.object.get(field).?.string);
+            while (position < items.len and matching_reasoning_metadata(item, items[position], field)) : (position += 1) {
+                try text.appendSlice(scratch, items[position].object.get(field).?.string);
+            }
+            item.object.getPtr(field).?.* = .{ .string = text.items };
+        }
+        if (out.written().len != 0) out.writer.writeByte(',') catch return error.OutOfMemory;
+        std.json.Stringify.value(item, .{}, &out.writer) catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice();
+}
+
+fn reasoning_text_field(item: std.json.Value) ?[]const u8 {
+    if (item != .object or item.object.contains("signature")) return null;
+    const kind = item.object.get("type") orelse return null;
+    if (kind != .string) return null;
+    const field: []const u8 = if (std.mem.eql(u8, kind.string, "reasoning.text")) "text" else if (std.mem.eql(u8, kind.string, "reasoning.summary")) "summary" else return null;
+    const text = item.object.get(field) orelse return null;
+    if (text != .string) return null;
+    var keys = item.object.iterator();
+    while (keys.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.eql(u8, key, field) and !std.mem.eql(u8, key, "type") and !std.mem.eql(u8, key, "index") and !std.mem.eql(u8, key, "id") and !std.mem.eql(u8, key, "format")) return null;
+        if (!std.mem.eql(u8, key, field)) switch (entry.value_ptr.*) {
+            .string, .number_string, .integer, .null => {},
+            else => return null,
+        };
+    }
+    return field;
+}
+
+fn matching_reasoning_metadata(first: std.json.Value, next: std.json.Value, field: []const u8) bool {
+    const next_field = reasoning_text_field(next) orelse return false;
+    if (!std.mem.eql(u8, field, next_field) or first.object.count() != next.object.count()) return false;
+    var keys = first.object.iterator();
+    while (keys.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, field)) continue;
+        const value = next.object.get(entry.key_ptr.*) orelse return false;
+        if (std.meta.activeTag(entry.value_ptr.*) != std.meta.activeTag(value)) return false;
+        switch (value) {
+            .string => |s| if (!std.mem.eql(u8, entry.value_ptr.string, s)) return false,
+            .number_string => |s| if (!std.mem.eql(u8, entry.value_ptr.number_string, s)) return false,
+            .integer => |n| if (entry.value_ptr.integer != n) return false,
+            .null => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "chat completions replay compacts unsigned fragments without crossing metadata boundaries" {
+    const alloc = std.testing.allocator;
+    const fragment = "{\"type\":\"reasoning.text\",\"text\":\"x\",\"format\":\"unknown\",\"index\":0}";
+    const raw = (fragment ++ ",") ** 999 ++ fragment;
+    const compacted = try compact_reasoning_details(alloc, raw);
+    defer alloc.free(compacted);
+    try std.testing.expect(compacted.len < 1100);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, compacted, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("x" ** 1000, parsed.value.object.get("text").?.string);
+
+    const protected = fragment ++ "," ++
+        "{\"type\":\"reasoning.text\",\"text\":\"y\",\"format\":\"unknown\",\"index\":1}," ++
+        "{\"type\":\"reasoning.text\",\"text\":\"signed\",\"signature\":\"opaque\"}," ++
+        "{\"type\":\"reasoning.encrypted\",\"data\":\"opaque\"}," ++
+        "{\"type\":\"reasoning.text\",\"text\":\"future\",\"extra\":0.12345678901234567890}";
+    const unchanged = try compact_reasoning_details(alloc, protected);
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(protected, unchanged);
+}
+
+test "chat completions replay compaction cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator) !void {
+            const result = try compact_reasoning_details(alloc, "{\"type\":\"reasoning.summary\",\"summary\":\"a\"},{\"type\":\"reasoning.summary\",\"summary\":\"b\"}");
+            defer alloc.free(result);
+            try std.testing.expectEqualStrings("{\"type\":\"reasoning.summary\",\"summary\":\"ab\"}", result);
+        }
+    }.run, .{});
+}
+
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    reasoning_format: configured_provider.ReasoningFormat = .omit,
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -165,7 +267,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -394,6 +496,12 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
     try validate_request(input);
+    if (input.provider_options.reasoning) |effort| {
+        if (options.reasoning_format == .omit or effort == .auto) return error.UnsupportedProviderOption;
+        for (options.reasoning_efforts) |allowed| {
+            if (allowed.eql(effort)) break;
+        } else return error.UnsupportedProviderOption;
+    }
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -602,6 +710,11 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
+    if (request.provider_options.reasoning) |effort| {
+        try writer.writeAll(if (options.reasoning_format == .openrouter) ",\"reasoning\":{\"effort\":" else ",\"reasoning_effort\":");
+        try std.json.Stringify.value(effort.label(), .{}, writer);
+        if (options.reasoning_format == .openrouter) try writer.writeByte('}');
+    }
     try writer.writeByte('}');
 }
 
@@ -833,7 +946,9 @@ pub const Reducer = struct {
                 try out.writer.writeAll("null");
             } else {
                 try out.writer.writeByte('[');
-                try out.writer.writeAll(details.bytes.items);
+                const compacted = try compact_reasoning_details(self.alloc, details.bytes.items);
+                defer self.alloc.free(compacted);
+                try out.writer.writeAll(compacted);
                 try out.writer.writeByte(']');
             }
             try out.writer.writeByte(',');

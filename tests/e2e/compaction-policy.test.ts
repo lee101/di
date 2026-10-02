@@ -1,12 +1,96 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 process.env.FX_E2E_DISABLE_DOTENV = "1";
-const { fakeGatewayFinalText, startDynamicFakeGateway } = await import("./tmux-helpers");
+const { fakeGatewayFinalText, fakeShellRun, startDynamicFakeGateway } = await import("./tmux-helpers");
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const checkpointMarker = "fx-compactor-v1\n";
+
+test("model-managed context edits the next request without rewriting history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "fx-clm-"));
+  const home = join(root, "home"), cwd = join(root, "workspace");
+  mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+  mkdirSync(cwd, { mode: 0o700 });
+  const model = "openrouter/space-bunny-alpha";
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({ model, auto_upgrade: false }), { mode: 0o600 });
+  const original = "STALE_CLM_OUTPUT " + "old investigation details ".repeat(100);
+  const requests: string[] = [];
+  let phase = "seed", edited = false;
+  function strings(value: unknown): string[] {
+    if (typeof value === "string") return [value];
+    if (value && typeof value === "object") return Object.values(value).flatMap(strings);
+    return [];
+  }
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const gateway = startDynamicFakeGateway((body: string) => {
+    requests.push(body);
+    if (phase === "seed") return fakeGatewayFinalText(original);
+    if (!edited) {
+      const guidance = strings(JSON.parse(body)).find(text => text.startsWith("Model-managed context:"));
+      if (!guidance) return fakeGatewayFinalText("MIRROR_MISSING");
+      const match = guidance.match(/^Model-managed context: ("(?:[^"\\]|\\.)*") mirrors/);
+      if (!match) return fakeGatewayFinalText("MIRROR_PATH_MISSING");
+      const path = JSON.parse(match[1]!);
+      const script = "import json,sys; p=sys.argv[1]; d=json.load(open(p)); " +
+        "i=next(m['index'] for m in d['messages'] if 'STALE_CLM_OUTPUT' in (m['content'] or '')); " +
+        "d['edits']=[{'start':i,'end':i+1,'notes':'RETAINED_CLM_FACT: verify parser edge case'}]; " +
+        "json.dump(d,open(p,'w')); print('context edit written')";
+      edited = true;
+      return fakeShellRun("edit-clm-mirror", `python3 -c ${quote(script)} ${quote(path)}`);
+    }
+    return fakeGatewayFinalText("CLM_CONTINUED");
+  }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: 128000, max_tokens: 8192 }] });
+  const env = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+    AI_GATEWAY_API_KEY: "synthetic-clm", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_PERMISSION_MODE: "ask",
+    FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+  };
+  async function ask(label: string, args: string[]) {
+    const out = join(root, `${label}.out`), err = join(root, `${label}.err`);
+    const child = Bun.spawn([binary, "ask", "--json", "--quiet", "--auto", ...args], {
+      cwd, env, stdin: "ignore", stdout: Bun.file(out), stderr: Bun.file(err),
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    try {
+      expect(await child.exited).toBe(0);
+      const stderr = readFileSync(err, "utf8");
+      if (label === "continue") expect(stderr).toMatch(/^Running python3 -c [^\n]*\ncontext edit written\n$/);
+      else expect(stderr).toBe("");
+      return JSON.parse(readFileSync(out, "utf8"));
+    } finally { clearTimeout(timer); }
+  }
+  let passed = false;
+  try {
+    const seed = await ask("seed", ["Keep the original objective and verify the parser."]);
+    const log = join(home, ".fx/sessions", seed.session_id, "events.jsonl");
+    const before = readFileSync(log);
+    phase = "continue";
+    const result = await ask("continue", ["--resume-id", seed.session_id, "Condense stale output and continue the check."]);
+    expect(result.output).toBe("CLM_CONTINUED");
+    expect(edited).toBe(true);
+    expect(requests.at(-1)).toContain("RETAINED_CLM_FACT");
+    expect(requests.at(-1)).not.toContain("old investigation details");
+    expect(requests.at(-1)).toContain("Keep the original objective and verify the parser.");
+    expect(requests.at(-1)).toContain("Condense stale output and continue the check.");
+    expect(readFileSync(log).subarray(0, before.length).equals(before)).toBe(true);
+    expect(readFileSync(log, "utf8")).toContain("STALE_CLM_OUTPUT");
+    const mirror = join(home, ".fx/sessions", seed.session_id, "tool-results/live-context.json");
+    expect(statSync(mirror).mode & 0o777).toBe(0o600);
+    const reopened = await ask("reopen", ["--resume-id", seed.session_id, "Continue after restarting the process."]);
+    expect(reopened.output).toBe("CLM_CONTINUED");
+    expect(requests.at(-1)).toContain("RETAINED_CLM_FACT");
+    expect(requests.at(-1)).not.toContain("old investigation details");
+    passed = true;
+  } finally {
+    gateway.stop();
+    if (passed) rmSync(root, { recursive: true, force: true });
+    else { writeFileSync(join(root, "requests.json"), JSON.stringify(requests, null, 2)); console.error(`CLM evidence retained: ${root}`); }
+  }
+}, 90_000);
 
 for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? "clips a user message too large for the room, whole in its saved turn" : "keeps user messages exact and clips only a reply too large for the room"}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "fx-policy-")), home = join(root, "home"), cwd = join(root, "workspace");
@@ -32,7 +116,7 @@ for (const userHeavy of [false, true]) test(`automatic compaction ${userHeavy ? 
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     AI_GATEWAY_API_KEY: "synthetic-compaction-policy", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model,
+    FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: model, FX_PERMISSION_MODE: "ask",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };

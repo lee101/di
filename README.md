@@ -52,13 +52,18 @@ export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
 di
 ```
 
-The default model is `xiaomi/mimo-v2.6-pro` for an OpenPaths key and
-`stealth/space-bunny-alpha` for an OpenRouter key. Model lists are fetched
+The compatible-provider default is `stealth/space-bunny-alpha`, which requires
+an OpenRouter key. With an OpenPaths key, choose an available model explicitly.
+When both keys are available, automatic credential selection prefers
+OpenRouter; an explicit `credential_source` keeps its selected source.
+Model lists are fetched
 live from OpenPaths or OpenRouter and cached on disk, so new models such as
 `xiaomi/mimo-v2.6-flash` show up in `/model` without an update; when a listing
 is unavailable, any model id can be typed directly. OpenRouter may retire a
-stealth model without notice, so both stealth routes circuit-break to
-`xiaomi/mimo-v2.6-pro` for the rest of the turn and show a recovered banner.
+stealth model without notice. With an OpenRouter key, a failed stealth route
+circuit-breaks to `openrouter/free` for the rest of the turn and shows a
+recovered banner. This fallback does not switch to a paid model or reuse an
+OpenPaths or Gateway credential on OpenRouter.
 
 OpenRouter `:free` variants and the `openrouter/free` router still require an
 `OPENROUTER_API_KEY`; “free” describes inference price, not anonymous API
@@ -111,6 +116,10 @@ Or make a one-shot request:
 ```bash
 di ask "explain the changes in this repository"
 ```
+
+Repeated invalid shell calls stop the tool loop with a nonzero exit status.
+The rejected commands do not execute; valid neighboring tool results remain
+in the saved session.
 
 The status line keeps session spend honest: cumulative cost, token totals,
 context usage against the model window, and the current Git branch, backed by
@@ -306,6 +315,10 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 di ask "review this change"
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
 
+Custom connections retain provider reasoning across tool calls and saved-session resumes. Adjacent unsigned text or summary fragments with identical metadata are combined to reduce replay size; signed, encrypted, and unfamiliar blocks stay separate. Automatic permission review retries temporary provider failures once without executing the pending action before approval.
+
+To enable `--effort` for a custom connection, set its `reasoning_format` to `openrouter` for `reasoning.effort`, or `effort` for `reasoning_effort`. Declare the supported names in each model's `model_metadata.reasoning_efforts` array, such as `["low", "medium", "high"]`. Reasoning controls stay disabled when the format is omitted or no efforts are declared; di does not infer support from the endpoint hostname.
+
 ## Ultrafast mode
 
 Ultrafast mode is off by default. It requests OpenAI's higher-cost Gateway service tier with `openai.serviceTier: "ultrafast"` for models whose Gateway metadata advertises Ultra eligibility. `ultrafast_requested` in `di status --json` and `/status` reports the request, not a guarantee that a provider served the tier.
@@ -360,6 +373,8 @@ di ships with `fx-dark` and `fx-light` and follows your terminal's light or dark
 
 ## Context compaction
 
+Saved sessions with local file storage enable model-managed context by default. Before each request, di writes a private `tool-results/live-context.json` mirror with indexed messages and an editable `edits` array. The model can use ordinary permission-checked file or shell tools to replace stale message ranges with concise notes. Your messages stay pinned, tool-call groups stay intact, and the original session history is unchanged. Accepted edits survive restart while their source prefix still matches; stale or malformed edits fall back to the canonical conversation. System text is excluded from the mirror, and model-authored notes never become permission authority. Unsaved sessions and blob-backed sessions retain the existing compaction path. Automatic compaction also remains available as an overflow fallback for local mirrors.
+
 When a conversation fills the model's context, di compacts it so the work can continue. The newest few turns stay unchanged. Every compacted turn keeps your messages and the assistant's final reply word for word. The conversation's own model adds a short note on what the assistant did in between, and a line for each tool call: di writes what the call was from the call itself, like `shell zig build test (failed, exit 1, 3120 bytes)`, and the model adds why it was used and what it showed. The model also keeps numbered entries for your rules, quoted word for word, and for facts, decisions, status and open questions, plus a list of the skills and MCP tools used. Entries are never rewritten: a later entry can say it replaces an earlier one. At the next compaction, the one before it is saved whole with an ID like `L2`, and in its place the agent sees a short summary the model writes of all earlier compactions, plus their rules, status and open entries still in force, word for word. The turns of earlier compactions leave the agent's view however many compactions a session has; only those kept entries grow with it. In a session that is not saved, nothing can be stored, so earlier compactions stay in view. di checks every new note and entry, and marks without removing one that names no source, quotes words you did not write, states a path, number, version or quoted text found in none of the compacted turns and tool calls, names an ID that does not exist, or calls a failed tool call a success; turns the model skipped, or a missing summary of earlier compactions, are asked for once more. Only when the compacted conversation would leave too little room to continue are its longest texts shortened to their start and end, each naming the saved turn that keeps it whole. Every compacted turn is saved word for word with an ID like `M3`, every tool call with its input and output as the model saw them, plus the handle of any full output saved separately, with an ID like `T12`, and every earlier compaction with an ID like `L2`. The agent can search them by text or open one by ID with `read_tool_result`; a search also says how many saved records hold all of its words, and which came first and last.
 
 Automatic compaction asks the model right after the conversation, exactly as the agent was about to send it and with the same settings, so the provider can reuse what it has cached. When that request does not fit or fails, and when you run `/compact` to compact now, di writes the turns out in a separate request at the model's lowest reasoning; turns too large for one such request go oldest first, in as many requests as it takes. If a separate request fails or comes back empty on AI Gateway, di retries it once with a model from another provider.
@@ -370,6 +385,12 @@ Automatic compaction starts when a request reaches 80 percent of the model's usa
 // ~/.fx/settings.json
 { "auto_compact_percent": 60 }
 ```
+
+## Live task benchmarks
+
+The [game-making benchmarks](games/README.md) run bounded Three.js tasks
+through the built binary with Space Bunny. They retain traces, verification
+results, binary fingerprints, and sampled disk-I/O counters in private runs.
 
 ## Embed di
 

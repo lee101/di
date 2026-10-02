@@ -256,12 +256,33 @@ fn storeLargeResultAtHandle(
         .writable,
     );
     defer capability.deinit();
+    if (try storedContentMatches(alloc, &capability, handle, text)) return;
     return storeLargeResultAtHandleManaged(
         alloc,
         &capability,
         handle,
         text,
     );
+}
+
+fn storedContentMatches(alloc: Allocator, capability: *session_child_store.SessionChildCapability, handle: []const u8, text: []const u8) Allocator.Error!bool {
+    var file = capability.openFileReadOnly(alloc, .tool_results, handle) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return false,
+    };
+    defer file.deinit();
+    const before = file.stat() catch return false;
+    if (before.size != text.len) return false;
+    var buffer: [8192]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const count = @min(buffer.len, text.len - offset);
+        const read = file.readRangeInto(offset, buffer[0..count]) catch return false;
+        if (read != count or !std.mem.eql(u8, buffer[0..count], text[offset..][0..count])) return false;
+        offset += count;
+    }
+    const after = file.stat() catch return false;
+    return before.size == after.size and before.modified_at_ns == after.modified_at_ns;
 }
 
 pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.SessionChildCapability, call_id: []const u8, tool_name: []const u8, images: []const types.ToolImage) ![]u8 {
@@ -1059,6 +1080,34 @@ test "a v2 session's compactor records are blobs, replaced and listed by name (D
     defer read_only.deinit();
     try std.testing.expectEqualStrings("T1 shell", try compactorStore(&read_only).read(arena, "compacted-T1.txt", 8));
     try std.testing.expectError(error.StoreFailed, compactorStore(&read_only).write(alloc, "compacted-T2.txt", "x"));
+}
+
+test "diff content packs reuse identical artifacts and repair tampering" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(dir);
+    const handle = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
+    defer alloc.free(handle);
+    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
+    defer capability.deinit();
+    const before = try capability.stat(.tool_results, handle);
+    for (0..32) |_| {
+        const repeated = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
+        defer alloc.free(repeated);
+        try std.testing.expectEqualStrings(handle, repeated);
+    }
+    const after = try capability.stat(.tool_results, handle);
+    try std.testing.expectEqual(before.modified_at_ns, after.modified_at_ns);
+    var damaged = try capability.atomicReplace(alloc, .tool_results, handle, "corrupted");
+    damaged.deinit(alloc);
+    const repaired = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
+    defer alloc.free(repaired);
+    var pack = try loadDiffContentManaged(alloc, &capability, "call", repaired);
+    defer pack.deinit(alloc);
+    try std.testing.expectEqualStrings("before" ** 3000, pack.previous_content.?);
+    try std.testing.expectEqualStrings("after" ** 3000, pack.after_content.?);
 }
 
 test "diff content packs round trip, bound, and reject tampering" {

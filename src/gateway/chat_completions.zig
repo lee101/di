@@ -48,7 +48,13 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    const metadata = definition.model(request.model);
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .provider = &identity,
+        .reasoning_format = definition.reasoning_format,
+        .reasoning_efforts = if (metadata) |model| model.reasoning_efforts.slice() else &.{},
+    });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -202,7 +208,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
-fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+fn metadata_entry(metadata: *const definitions.ModelMetadata, format: definitions.ReasoningFormat) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
@@ -214,12 +220,14 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
+        .has_reasoning = format != .omit and metadata.reasoning_efforts.len > 0,
+        .reasoning_efforts = .fromOwnedSlice(if (format != .omit) @constCast(metadata.reasoning_efforts.slice()) else &.{}),
     };
 }
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata, definition_at(raw).reasoning_format)));
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -227,12 +235,14 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
-    for (definition.model_metadata) |metadata| {
-        var entry = metadata_entry(metadata);
+    for (definition.model_metadata) |*metadata| {
+        var entry = metadata_entry(metadata, definition.reasoning_format);
         entry.id = try alloc.dupe(u8, entry.id);
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .fromOwnedSlice(try alloc.dupe(types.ReasoningEffort, entry.reasoning_efforts.items));
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -286,10 +296,16 @@ fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, r
 }
 fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const u8, instructions: []const types.ChatMessage, messages: []const types.ChatMessage, target_id: []const u8, deadline: std.Io.Clock.Timestamp, cancel: *std.atomic.Value(bool)) ![]u8 {
     const state: *Review = @ptrCast(@alignCast(raw));
-    const expanded = try review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel);
+    const expanded = review_messages.expandPendingToolReviewMessages(alloc, messages, target_id, deadline, cancel) catch |err| {
+        debug_trace.logf("permission", "configured_review_build_failed phase=expand error={s}", .{@errorName(err)});
+        return err;
+    };
     defer alloc.free(expanded);
     const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = expanded, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit }) catch |err| {
+        debug_trace.logf("permission", "configured_review_build_failed phase=serialize error={s}", .{@errorName(err)});
+        return err;
+    };
 }
 fn ignore_event(_: *anyopaque, _: streams.Event) void {}
 fn free_result(raw: *anyopaque, alloc: Allocator) void {
@@ -323,14 +339,59 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,
         error.RequiredToolMissing => return .{ .completion = .{ .completion = .{} } },
-        else => return .permanent_failure,
+        else => {
+            debug_trace.logf("permission", "configured_review_send_failed error={s}", .{@errorName(err)});
+            return if (client_mod.networkFailureEvidence(err, delivery.load()) != null) .transient_failure else .permanent_failure;
+        },
     };
     errdefer result.deinit(alloc);
     if (result == .failed) {
+        debug_trace.logf("permission", "configured_review_provider_failed kind={s}", .{@tagName(result.failed.kind)});
+        const outcome = reviewFailureOutcome(result.failed.kind);
         result.deinit(alloc);
-        return .permanent_failure;
+        return outcome;
     }
     const owned = try alloc.create(streams.Result);
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+}
+
+fn reviewFailureOutcome(kind: streams.FailureKind) classifier.TransportOutcome {
+    return switch (kind) {
+        .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,
+        .invalid_request, .unauthorized, .forbidden, .request_too_large, .provider_error => .permanent_failure,
+    };
+}
+
+test "configured reviewer retries temporary provider failures only" {
+    inline for (std.meta.tags(streams.FailureKind)) |kind| {
+        const expected: classifier.TransportOutcome = switch (kind) {
+            .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => .transient_failure,
+            else => .permanent_failure,
+        };
+        try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(reviewFailureOutcome(kind)));
+    }
+}
+
+test "configured reviewer builds pending tool evidence for chat completions" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"fixture":{"protocol":"openai-chat-completions","base_url":"https://example.test/v1","auth":{"type":"none"},"tool_choice_mode":"send","reviewer_model":"stealth/space-bunny-alpha"}}
+    );
+    defer registry.deinit(alloc);
+    var state = Review{ .definition = registry.get("fixture").?, .input = .{} };
+    var cancel = std.atomic.Value(bool).init(false);
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the exact action." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Build a game." },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "pending", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"ls -la\"}}" }} },
+    };
+    const payload = try build_review(&state, alloc, "stealth/space-bunny-alpha", "", &instructions, &messages, "pending", phase_deadline(30_000, null), &cancel);
+    defer alloc.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("required", object.get("tool_choice").?.string);
+    try std.testing.expectEqualStrings(classifier.tool_name, object.get("tools").?.array.items[0].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings("tool", object.get("messages").?.array.items[3].object.get("role").?.string);
 }

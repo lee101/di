@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("../shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -30,6 +31,31 @@ pub const ParseError = Allocator.Error || error{
 
 pub const Protocol = enum { @"openai-chat-completions" };
 pub const ToolChoiceMode = enum { omit, send };
+pub const ReasoningFormat = enum { omit, effort, openrouter };
+pub const ReasoningEfforts = struct {
+    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = @splat(.auto),
+    len: u8 = 0,
+
+    pub fn slice(self: *const ReasoningEfforts) []const types.ReasoningEffort {
+        return self.values[0..self.len];
+    }
+};
+
+test "configured reasoning metadata is bounded explicit and preserves named efforts" {
+    const alloc = std.testing.allocator;
+    const prefix = "{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost/v1\",\"auth\":{\"type\":\"none\"},\"reasoning_format\":\"openrouter\",\"model_metadata\":{\"model\":{\"reasoning_efforts\":";
+    const suffix = "}}}}";
+    var registry = try Registry.parse_json(alloc, prefix ++ "[\"low\",\"future-tier\"]" ++ suffix);
+    defer registry.deinit(alloc);
+    const definition = registry.get("local").?;
+    try std.testing.expectEqual(ReasoningFormat.openrouter, definition.reasoning_format);
+    try std.testing.expectEqualStrings("future-tier", definition.model("model").?.reasoning_efforts.values[1].label());
+    for ([_][]const u8{ "[\"auto\"]", "[\"low\",\"low\"]", "[1]", "[\"bad name\"]", "null" }) |bad| {
+        const raw = try std.mem.concat(alloc, u8, &.{ prefix, bad, suffix });
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidModelMetadata, Registry.parse_json(alloc, raw));
+    }
+}
 
 /// Describes a credential slot, never a credential value. Resolution belongs at
 /// the effectful edge; `none` must omit Authorization rather than supply a token.
@@ -44,6 +70,7 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    reasoning_efforts: ReasoningEfforts = .{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -54,6 +81,7 @@ pub const Definition = struct {
     base_url: []const u8,
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
+    reasoning_format: ReasoningFormat = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
 
@@ -163,13 +191,17 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reasoning_format", "reviewer_model", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
     if (url != .string) return error.InvalidBaseUrl;
     const normalized = try validate_url(url.string);
     const auth = try parse_auth(try required(value, "auth"));
+    const reasoning_format: ReasoningFormat = if (value.object.get("reasoning_format")) |format| blk: {
+        if (format != .string) return error.InvalidModelMetadata;
+        break :blk std.meta.stringToEnum(ReasoningFormat, format.string) orelse return error.InvalidModelMetadata;
+    } else .omit;
     var mode: ToolChoiceMode = .omit;
     if (value.object.get("tool_choice_mode")) |choice| {
         if (choice != .string) return error.InvalidToolChoiceMode;
@@ -202,6 +234,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .base_url = owned_url,
         .auth = owned_auth,
         .tool_choice_mode = mode,
+        .reasoning_format = reasoning_format,
         .reviewer_model = owned_reviewer,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
@@ -239,18 +272,31 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        var efforts: ReasoningEfforts = .{};
+        if (metadata.object.get("reasoning_efforts")) |effort_values| {
+            if (effort_values != .array or effort_values.array.items.len > types.ReasoningEffort.max_options) return error.InvalidModelMetadata;
+            for (effort_values.array.items) |effort_value| {
+                if (effort_value != .string) return error.InvalidModelMetadata;
+                const effort = types.ReasoningEffort.parse(effort_value.string) orelse return error.InvalidModelMetadata;
+                if (effort == .auto) return error.InvalidModelMetadata;
+                for (efforts.slice()) |existing| if (existing.eql(effort)) return error.InvalidModelMetadata;
+                efforts.values[efforts.len] = effort;
+                efforts.len += 1;
+            }
+        }
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
