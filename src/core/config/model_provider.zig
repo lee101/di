@@ -102,8 +102,10 @@ pub const NameKey = struct {
 };
 
 /// Default model served when the OpenPaths provider is active and the user has
-/// not chosen one and only an OpenRouter key is present. OpenRouter alone
-/// serves the stealth route.
+/// not chosen one. The stealth route is only served to a caller that
+/// authenticated with `OPENROUTER_API_KEY`; an OpenPaths key resolves to a
+/// catalog without this id, so the route is chosen by the credential rather
+/// than by the provider name.
 pub const openpaths_default_model = "stealth/space-bunny-alpha";
 
 /// The stealth route can be retired or replaced without notice, so
@@ -129,8 +131,11 @@ pub const ProviderSelection = struct {
 
 pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "openpaths")) return .openpaths;
-    if (std.ascii.eqlIgnoreCase(value, "openrouter")) return .openpaths;
-    if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
+    // A connection named `openrouter` is a configured provider, so the name is
+    // not aliased to OpenPaths here. The OpenPaths route keeps its own name.
+    if (std.ascii.eqlIgnoreCase(value, "gateway") or
+        std.ascii.eqlIgnoreCase(value, "vercel") or
+        std.ascii.eqlIgnoreCase(value, "ai-gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
     configured_provider.validate_id(value) catch return null;

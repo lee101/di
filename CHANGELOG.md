@@ -9,6 +9,7 @@
 ### Breaking Changes
 
 - libfx now uses `LIBFX_MODEL_UNSUPPORTED_EFFORT` and `LIBFX_MODEL_UNSUPPORTED_FAST` for unsupported model settings. Callers checking the old error codes must update.
+- **Provider names:** `openrouter` now selects a configured connection named `openrouter` instead of the OpenPaths route. Rename it to `openpaths` in `FX_PROVIDER`, `--provider`, and the `"provider"` setting, or add a matching entry under `"providers"` in profile settings.
 
 ### New Features
 
@@ -36,6 +37,11 @@
 - `fx pr --create` and `fx issue --create` now publish the final response instead of earlier progress text.
 - Messages sent after interrupting a response now wait for the previous turn to close.
 - Malformed tool arguments no longer break the next model request.
+- A one-shot run with an unsupported `--ultrafast` request now warns and continues instead of failing the whole turn.
+- A profile naming a connection that cannot be bound now reports a settings diagnostic and falls back to the default route instead of exiting with an internal error tag.
+- The `/model` picker now opens its speed column for a model that supports Ultra without Fast, so Enter matches Tab and Space.
+- Model catalogs no longer offer entries that lack an output-token limit or an output price.
+- `di logout` now accepts only the providers its usage line lists, so `di logout openpaths` no longer signs you out of Vercel.
 
 ### Security
 

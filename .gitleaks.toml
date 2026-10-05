@@ -2,15 +2,20 @@
 useDefault = true
 
 [allowlist]
-description = "Build output and unit-test fixture tokens"
+description = "Build output, local tool state, and unit-test fixture tokens"
 paths = [
   '''^\.zig-cache/''',
+  '''^zig-cache/''',
   '''^zig-out/''',
+  '''^\.claude/''',
 ]
 regexTarget = "line"
+# Each entry names one complete fixture token, so it can only ever suppress the
+# line that carries it. A bare fragment such as `abcdefghijklmnop` also matched
+# ordinary base64url alphabet strings in production code and suppressed every
+# other rule on those lines.
 regexes = [
-  '''abcdefghijklmnop''',
+  '''PROBE_TOKEN=0123456789abcdef[0-9a-f]*''',
+  '''TOOL_DATA_TOKEN=0123456789abcdef[0-9a-f]*''',
   '''invalid-utf8-proof-key''',
-  '''PROBE_TOKEN=0123456789abcdef''',
-  '''TOOL_DATA_TOKEN=0123456789abcdef01234567''',
 ]

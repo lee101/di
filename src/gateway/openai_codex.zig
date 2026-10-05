@@ -612,6 +612,38 @@ test "OpenAI Codex standard requests omit the priority service tier" {
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
 }
 
+test "OpenAI Codex sends the session id as prompt_cache_key and omits it without one" {
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
+    const with_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+        .session_id = "session_abc",
+    });
+    defer std.testing.allocator.free(with_id);
+    try std.testing.expect(std.mem.find(u8, with_id, "\"prompt_cache_key\":\"session_abc\"") != null);
+
+    const empty_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+        .session_id = "",
+    });
+    defer std.testing.allocator.free(empty_id);
+    try std.testing.expect(std.mem.find(u8, empty_id, "prompt_cache_key") == null);
+
+    const without_id = try buildRequest(std.testing.allocator, .{
+        .model = "gpt-5.6-sol",
+        .messages = &messages,
+        .tool_choice = .none,
+        .provider_options = .{},
+    });
+    defer std.testing.allocator.free(without_id);
+    try std.testing.expect(std.mem.find(u8, without_id, "prompt_cache_key") == null);
+}
+
 test "OpenAI Codex serializes each verified image directly once" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Describe it." }};
     const images = [_]image_attachments.VerifiedSnapshot{.{

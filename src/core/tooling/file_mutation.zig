@@ -1440,28 +1440,31 @@ fn derivePostimage(
                 .present => |present| present.content,
             };
             const occurrence_count = countOccurrences(before, edit.old_string);
-            if (occurrence_count == 0) {
-                break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." };
+            var match_start: usize = undefined;
+            var match_end: usize = undefined;
+            var replacement: []const u8 = edit.new_string;
+            if (occurrence_count == 1) {
+                match_start = std.mem.find(u8, before, edit.old_string).?;
+                match_end = match_start + edit.old_string.len;
+            } else if (occurrence_count > 1) {
+                break :blk .{ .semantic_failure = try ambiguousMessage(alloc, occurrence_count) };
+            } else switch (fuzzyLocate(before, edit.old_string)) {
+                .none => break :blk .{ .semantic_failure = "edit_file failed: old_string not found in file. Re-read the file to see its current contents; if the change is already applied, do not retry this edit." },
+                .ambiguous => |count| break :blk .{ .semantic_failure = try ambiguousMessage(alloc, count) },
+                .found => |found| {
+                    match_start = found.start;
+                    match_end = found.end;
+                    if (found.crlf) replacement = try toCrlf(alloc, edit.new_string);
+                },
             }
-            if (occurrence_count > 1) {
-                break :blk .{ .semantic_failure = try std.fmt.allocPrint(
-                    alloc,
-                    "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
-                    .{occurrence_count},
-                ) };
-            }
+            defer if (replacement.ptr != edit.new_string.ptr) alloc.free(replacement);
 
-            const match_start = std.mem.find(
-                u8,
-                before,
-                edit.old_string,
-            ).?;
             const prefix_len = match_start;
-            const suffix_start = match_start + edit.old_string.len;
+            const suffix_start = match_end;
             var after_len = std.math.add(
                 usize,
                 prefix_len,
-                edit.new_string.len,
+                replacement.len,
             ) catch break :blk .{ .semantic_failure = "edit_file failed: postimage exceeds the 4 MiB preparation limit" };
             after_len = std.math.add(
                 usize,
@@ -1474,12 +1477,181 @@ fn derivePostimage(
 
             const after = try alloc.alloc(u8, after_len);
             @memcpy(after[0..prefix_len], before[0..prefix_len]);
-            const replacement_end = prefix_len + edit.new_string.len;
-            @memcpy(after[prefix_len..replacement_end], edit.new_string);
+            const replacement_end = prefix_len + replacement.len;
+            @memcpy(after[prefix_len..replacement_end], replacement);
             @memcpy(after[replacement_end..], before[suffix_start..]);
             break :blk .{ .content = after };
         },
     };
+}
+
+fn ambiguousMessage(alloc: Allocator, count: usize) error{OutOfMemory}![]const u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
+        .{count},
+    );
+}
+
+const FuzzyMatch = union(enum) {
+    none,
+    ambiguous: usize,
+    found: struct { start: usize, end: usize, crlf: bool },
+};
+
+const Line = struct {
+    start: usize,
+    text_end: usize,
+    end: usize,
+    next: usize,
+
+    fn text(self: Line, buf: []const u8) []const u8 {
+        return buf[self.start..self.text_end];
+    }
+};
+
+fn lineAt(buf: []const u8, pos: usize) ?Line {
+    if (pos >= buf.len) return null;
+    const end = std.mem.findScalarPos(u8, buf, pos, '\n') orelse buf.len;
+    var text_end = end;
+    if (text_end > pos and buf[text_end - 1] == '\r') text_end -= 1;
+    return .{ .start = pos, .text_end = text_end, .end = end, .next = @min(end + 1, buf.len) };
+}
+
+fn isAsciiSpace(c: u8) bool {
+    return c == ' ' or (c >= '\t' and c <= '\r');
+}
+
+fn isUnicodeSpace(c: u21) bool {
+    return switch (c) {
+        0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
+}
+
+const Decoded = struct { c: u21, len: usize };
+
+fn decodeAt(s: []const u8, i: usize) Decoded {
+    const raw: Decoded = .{ .c = s[i], .len = 1 };
+    if (s[i] < 0x80) return raw;
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return raw;
+    if (i + len > s.len) return raw;
+    const c = std.unicode.utf8Decode(s[i .. i + len]) catch return raw;
+    return .{ .c = c, .len = len };
+}
+
+fn normalizeChar(c: u21) u21 {
+    return switch (c) {
+        0x2010...0x2015, 0x2212 => '-',
+        0x2018...0x201B => '\'',
+        0x201C...0x201F => '"',
+        0xA0, 0x2002...0x200A, 0x202F, 0x205F, 0x3000 => ' ',
+        else => c,
+    };
+}
+
+fn trimUnicode(s: []const u8) []const u8 {
+    var i: usize = 0;
+    var first: ?usize = null;
+    var last_end: usize = 0;
+    while (i < s.len) {
+        const d = decodeAt(s, i);
+        const space = if (d.len == 1 and d.c < 0x80) isAsciiSpace(@intCast(d.c)) else isUnicodeSpace(d.c);
+        if (!space) {
+            if (first == null) first = i;
+            last_end = i + d.len;
+        }
+        i += d.len;
+    }
+    return s[(first orelse return s[0..0])..last_end];
+}
+
+fn normalizedEql(a: []const u8, b: []const u8) bool {
+    const ta = trimUnicode(a);
+    const tb = trimUnicode(b);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < ta.len and j < tb.len) {
+        const da = decodeAt(ta, i);
+        const db = decodeAt(tb, j);
+        if (normalizeChar(da.c) != normalizeChar(db.c)) return false;
+        i += da.len;
+        j += db.len;
+    }
+    return i == ta.len and j == tb.len;
+}
+
+fn fuzzyLineEql(pass: u2, a: []const u8, b: []const u8) bool {
+    const ws = " \t\x0b\x0c";
+    return switch (pass) {
+        0 => std.mem.eql(u8, std.mem.trimEnd(u8, a, ws), std.mem.trimEnd(u8, b, ws)),
+        1 => std.mem.eql(u8, std.mem.trim(u8, a, ws), std.mem.trim(u8, b, ws)),
+        else => normalizedEql(a, b),
+    };
+}
+
+const FuzzyRange = struct { first: Line, last: Line };
+
+fn fuzzyMatchAt(before: []const u8, start: usize, old: []const u8, pass: u2) ?FuzzyRange {
+    var file_pos = start;
+    var old_pos: usize = 0;
+    var first: ?Line = null;
+    var last: Line = undefined;
+    while (lineAt(old, old_pos)) |old_line| {
+        const file_line = lineAt(before, file_pos) orelse return null;
+        if (!fuzzyLineEql(pass, file_line.text(before), old_line.text(old))) return null;
+        if (first == null) first = file_line;
+        last = file_line;
+        file_pos = file_line.next;
+        old_pos = old_line.next;
+    }
+    return .{ .first = first orelse return null, .last = last };
+}
+
+fn fuzzyLocate(before: []const u8, old: []const u8) FuzzyMatch {
+    if (old.len == 0) return .none;
+    const trailing_newline = old[old.len - 1] == '\n';
+    var pass: u2 = 0;
+    while (pass < 3) : (pass += 1) {
+        var count: usize = 0;
+        var found: FuzzyMatch = .none;
+        var pos: usize = 0;
+        while (lineAt(before, pos)) |line| : (pos = line.next) {
+            const matched = fuzzyMatchAt(before, line.start, old, pass) orelse continue;
+            count += 1;
+            if (count > 1) continue;
+            const crlf = if (matched.first.next > matched.first.end)
+                matched.first.end > matched.first.text_end
+            else if (lineAt(before, 0)) |head| head.end > head.text_end else false;
+            found = .{ .found = .{
+                .start = matched.first.start,
+                .end = if (trailing_newline) matched.last.next else matched.last.end,
+                .crlf = crlf,
+            } };
+        }
+        if (count == 1) return found;
+        if (count > 1) return .{ .ambiguous = count };
+    }
+    return .none;
+}
+
+fn toCrlf(alloc: Allocator, text: []const u8) error{OutOfMemory}![]const u8 {
+    var extra: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '\n' and (i == 0 or text[i - 1] != '\r')) extra += 1;
+    }
+    if (extra == 0) return text;
+    const out = try alloc.alloc(u8, text.len + extra);
+    var j: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '\n' and (i == 0 or text[i - 1] != '\r')) {
+            out[j] = '\r';
+            j += 1;
+        }
+        out[j] = c;
+        j += 1;
+    }
+    return out;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -1897,6 +2069,74 @@ test "prepare derives an existing write from the exact reviewed preimage" {
     defer file.close(std.testing.io);
     const unchanged = try io_mod.readFileToEnd(arena, &file, 64);
     try std.testing.expectEqualStrings("old\n", unchanged);
+}
+
+fn testEdit(arena: Allocator, before: []const u8, old: []const u8, new: []const u8) !PostimageResult {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(before);
+    return derivePostimage(arena, .{ .edit = .{
+        .path = try arena.dupe(u8, "f"),
+        .old_string = try arena.dupe(u8, old),
+        .new_string = try arena.dupe(u8, new),
+    } }, .{ .present = .{ .content = before, .content_hash = hasher.finalResult() } });
+}
+
+test "edit falls back to trailing-whitespace-insensitive match" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try testEdit(arena_state.allocator(), "a\nfoo  \t\nbar\nc\n", "foo\nbar", "X\nY");
+    try std.testing.expectEqualStrings("a\nX\nY\nc\n", result.content);
+}
+
+test "edit falls back to whitespace-trimmed match" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try testEdit(arena_state.allocator(), "fn f() {\n    x = 1;\n    y = 2;\n}\n", "x = 1;\ny = 2;\n", "z = 3;\n");
+    try std.testing.expectEqualStrings("fn f() {\nz = 3;\n}\n", result.content);
+}
+
+test "edit falls back to unicode punctuation normalization" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try testEdit(
+        arena_state.allocator(),
+        "keep\n\xe2\x80\x9chi\xe2\x80\x9d \xe2\x80\x94 it\xe2\x80\x99s\xc2\xa0ok\nkeep\n",
+        "\"hi\" - it's ok",
+        "bye",
+    );
+    try std.testing.expectEqualStrings("keep\nbye\nkeep\n", result.content);
+}
+
+test "edit fuzzy ambiguity and misses fail" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ambiguous = try testEdit(arena, "foo \nbar\nfoo\t\n", "foo\n", "x\n");
+    try std.testing.expectEqualStrings(
+        "edit_file failed: old_string is not unique (found 2 occurrences), provide more context",
+        ambiguous.semantic_failure,
+    );
+    const missing = try testEdit(arena, "foo \nbar\n", "baz", "x");
+    try std.testing.expect(std.mem.startsWith(u8, missing.semantic_failure, "edit_file failed: old_string not found"));
+    const empty = try testEdit(arena, "foo\n", "", "x");
+    try std.testing.expect(std.mem.startsWith(u8, empty.semantic_failure, "edit_file failed: old_string not found"));
+}
+
+test "edit exact match path is unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const result = try testEdit(arena_state.allocator(), "a  b\n  foo\n", "foo", "bar");
+    try std.testing.expectEqualStrings("a  b\n  bar\n", result.content);
+}
+
+test "edit fuzzy match preserves CRLF line endings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const result = try testEdit(arena, "a\r\n  foo \r\n  bar\r\nc\r\n", "foo\nbar\n", "X\nY\n");
+    try std.testing.expectEqualStrings("a\r\nX\r\nY\r\nc\r\n", result.content);
+    const lf = try testEdit(arena, "a\n  foo \nc\n", "foo\n", "X\n");
+    try std.testing.expectEqualStrings("a\nX\nc\n", lf.content);
 }
 
 test "prepare computes one exact edit occurrence" {

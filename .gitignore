@@ -11,6 +11,7 @@ zig-cache/
 zig-out/
 zig-pkg/
 sdk/dist/
+dist/
 
 # Workspace-local runtime state
 /skills/

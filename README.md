@@ -225,6 +225,13 @@ exact-command approval modes retain their original command. No extra model
 round trip is required. See [the op comparison](docs/op-parity.md) for coverage
 and remaining gaps.
 
+The `shell` tool tolerates common request-shape mistakes. `shell` is ignored
+unless `tty` is true, and when `profile` and `shell` are both sent with
+`tty: true` the explicit `shell` wins; the result carries a `note` saying what
+was ignored. An unusable `shell.path` (relative, not bash or zsh, or missing)
+returns a recoverable error with the corrected call, and terminal start
+failures include a `hint` with the retry shape.
+
 ## di infinity
 
 di infinity is the infinite run harness: one `di ask` invocation that keeps working across turns until you interrupt it. After every completed turn, the saved session receives a generated follow-up prompt built from the latest work summary, so progress compounds instead of stopping at the first answer.
@@ -375,6 +382,18 @@ FX_PROVIDER_ORDER=vertex FX_PROVIDER_STRICT=1 di
 
 Slugs are the gateway's provider identifiers (letters, digits, dashes, for example `anthropic`, `bedrock`, `vertexAnthropic`), listed on the [models page](https://vercel.com/ai-gateway/models). An empty `provider_order` in a higher-precedence layer clears a list set by a lower one. Routing applies to gateway requests only; custom model connections ignore it.
 
+## Prompt caching on OpenAI-compatible routes
+
+Requests on the OpenPaths route and on custom connections that opt in carry cache hints:
+
+- A `session_id` body field and an `x-session-id` header, so the provider can route a session to the same backend.
+- `stream_options.include_usage` and `usage: {include: true}`, so every response reports cached tokens, cache writes, and cost. Per-request cache hits show in the full transcript network record as `cache-hit N%`, and exact cost settles session usage instead of staying incomplete.
+- For Anthropic-family models (`anthropic/*` or any id containing `claude`), `cache_control: {type: "ephemeral"}` breakpoints on the last system message and the last two user or tool messages. The breakpoint on the system message also covers the tool definitions. Other model families rely on the provider's implicit prefix caching.
+
+Opt a custom connection in with `"prompt_caching": true` in its `~/.fx/settings.json` entry; without it the connection never receives these fields. Breakpoints expire after five minutes by default. Set `prompt_cache_ttl` to `"1h"` in `~/.fx/settings.json`, or `FX_PROMPT_CACHE_TTL=1h` for one launch, to request the one hour lifetime (priced higher by Anthropic).
+
+Per-step runtime context (current directory, UTC date, branch, worktree state) is sent after the conversation history rather than in the system prompt, so the cached prefix stays byte-stable between steps.
+
 ## Themes
 
 di ships with `fx-dark` and `fx-light` and follows your terminal's light or dark mode. Pin a variant with `FX_THEME=light` or `FX_THEME=dark`, or drop a VS Code format theme at `~/.fx/themes/<name>.json` and select it with the `theme` setting or `FX_THEME=<name>` per launch. Without an explicitly selected theme, diff markers and edit counts stay monochrome; selecting any theme adds its diff marker colors. See [Configuration](https://fx.sh/docs/configure-fx/configuration) for all environment variables.
@@ -390,6 +409,13 @@ Automatic compaction starts when a request reaches 80 percent of the model's usa
 ```jsonc
 // ~/.fx/settings.json
 { "auto_compact_percent": 60 }
+```
+
+Warm compaction runs after a turn instead of inside the next one. When a turn finishes with its last request at 60 percent of the model's usable input or more, di compacts right away while the provider still has that request cached, so the next turn starts small. The summary request is that last request exactly as sent, followed by the final reply and the compaction instruction, and the turn that just finished stays unchanged. Set `auto_compact_warm_percent` in `~/.fx/settings.json` to `0` to turn it off or to a value from 10 to 79, or `FX_AUTO_COMPACT_WARM_PERCENT` for a single launch. The value must stay below `auto_compact_percent`; one at or above it turns warm compaction off, and when you set only `auto_compact_percent` the default drops to three quarters of it if that is below 60. A prompt you submit while it runs waits behind it, and one that has waited 8 seconds cancels it and runs with the usual compaction at `auto_compact_percent`. Warm compaction runs only in the interactive terminal, never for subagents, a cancelled or failed turn, or a turn that already compacted, and a failed or cancelled attempt is silent. `/trace` lists each decision as `warm_decision` and `warm_committed`.
+
+```jsonc
+// ~/.fx/settings.json
+{ "auto_compact_warm_percent": 50 }
 ```
 
 ## Embed di
@@ -481,6 +507,8 @@ live message test.
 ## Security
 
 Report security vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
+
+On Linux, di marks itself non-dumpable (`PR_SET_DUMPABLE=0`) and sets `RLIMIT_CORE` to 0 at startup, so same-user processes cannot ptrace it or read its memory, and crashes do not write core files. Child processes inherit the zero core limit. Set `FX_ALLOW_DEBUG=1` to skip this hardening when attaching gdb or running under valgrind.
 
 ## License
 

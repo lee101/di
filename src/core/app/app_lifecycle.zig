@@ -23,6 +23,7 @@ const ui_render = @import("../../ui/render.zig");
 const transcript_presentation = @import("../output/transcript_presentation.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const ui_terminal = @import("../../ui/terminal/terminal.zig");
+const prompt_cache_policy = @import("../config/prompt_cache_policy.zig");
 const terminal_diff = @import("../../ui/render_engine/terminal_diff.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
@@ -138,6 +139,7 @@ pub const StartupState = struct {
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
+    auto_compact_warm_percent: u8 = compactor.default_warm_percent,
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
@@ -688,6 +690,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
+    state.auto_compact_warm_percent = compactor.resolveWarmPercent(settings.auto_compact_warm_percent, io_mod.getenv("FX_AUTO_COMPACT_WARM_PERCENT"), state.auto_compact_percent);
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(
@@ -714,6 +717,7 @@ fn loadStartupStateFromOwnedWorkspace(
     state.review_model = try alloc.dupe(u8, settings.review_model orelse "");
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
     state.provider_strict = settings.provider_strict orelse false;
+    prompt_cache_policy.setConfigured(settings.prompt_cache_ttl orelse .five_minutes);
     if (settings.provider_order) |order| {
         const owned_order = try alloc.alloc([]const u8, order.len);
         var filled: usize = 0;
@@ -2401,7 +2405,10 @@ test "ultrafast startup separates profile preferences from process overrides" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    // The settings store reads the profile only when these directories are
+    // private, so the fixture creates them with the mode it requires.
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-off");
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-on");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");

@@ -13,6 +13,7 @@ const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const prompt_cache_policy = @import("prompt_cache_policy.zig");
 pub const context_limits = @import("context_limits.zig");
 
 const Allocator = std.mem.Allocator;
@@ -50,6 +51,9 @@ pub const Settings = struct {
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
+    /// Share of usable input at which a finished turn is compacted while the
+    /// provider cache is warm; 0 turns it off. Profile-only.
+    auto_compact_warm_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
@@ -64,6 +68,7 @@ pub const Settings = struct {
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    prompt_cache_ttl: ?prompt_cache_policy.Ttl = null,
     theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
@@ -355,11 +360,35 @@ pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     };
 }
 
-fn resolve_provider_selection(settings: *Settings) !void {
+fn resolve_provider_selection(
+    alloc: Allocator,
+    settings: *Settings,
+    diagnostics: ?*std.ArrayList(ConfigDiagnostic),
+) !void {
     if (providerEnvOverride()) |raw| {
         settings.provider = model_provider.parse(raw) orelse return error.InvalidProviderValue;
     }
-    if (settings.provider) |provider| settings.provider = try provider.bind(settings.providers orelse .{});
+    const provider = settings.provider orelse return;
+    settings.provider = provider.bind(settings.providers orelse .{}) catch |err| switch (err) {
+        // A profile naming a connection this build cannot bind is a settings
+        // defect, not a reason to refuse to start. Fall back to the default
+        // route and report it the way every other bad key is reported.
+        error.UnknownConfiguredProvider, error.ConfiguredProviderChanged => blk: {
+            debug_trace.logf(
+                "config",
+                "provider={s} cannot bind: {s}",
+                .{ provider.label(), @errorName(err) },
+            );
+            if (diagnostics) |list| {
+                try list.append(alloc, .{
+                    .layer = .user,
+                    .cause = .malformed_settings,
+                    .setting_key = try alloc.dupe(u8, "provider"),
+                });
+            }
+            break :blk null;
+        },
+    };
 }
 
 /// Reads only profile-global connection definitions. Caller owns the registry.
@@ -647,7 +676,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings, &diagnostics);
     if (providerEnvOverride() != null) sources.provider = .process_override;
     if (modelEnvOverride() != null) {
         const override_provider = model_provider.NameKey.fromProvider(model_provider.effectiveProvider(settings.provider));
@@ -875,6 +904,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "first_call_tool_choice",
         "auto_upgrade",
         "update_channel",
+        "prompt_cache_ttl",
         "permission_mode",
         "credential_source",
         "yolo_acknowledged",
@@ -1347,12 +1377,12 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         try mergeSettings(&settings, &user_settings, alloc);
 
         try mergeWorkspaceOverridesFromValue(&settings, alloc, parsed.value, paths.workspace_root);
-        try resolve_provider_selection(&settings);
+        try resolve_provider_selection(alloc, &settings, null);
         return settings;
     }
 
     try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
-    try resolve_provider_selection(&settings);
+    try resolve_provider_selection(alloc, &settings, null);
     return settings;
 }
 
@@ -1695,6 +1725,11 @@ fn parseProfileOnlyFields(
         if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
         settings.auto_compact_percent = @intCast(value.integer);
     }
+    if (root.object.get("auto_compact_warm_percent")) |value| {
+        if (value != .integer) return error.InvalidAutoCompactWarmPercentType;
+        if (value.integer < 0 or !compactor.isValidWarmPercent(@intCast(value.integer))) return error.InvalidAutoCompactWarmPercentValue;
+        settings.auto_compact_warm_percent = @intCast(value.integer);
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -1823,6 +1858,12 @@ fn parseProfileOnlyFields(
         if (value != .string) return error.InvalidUpdateChannelType;
         settings.update_channel = update_target.Channel.parse(value.string) orelse
             return error.InvalidUpdateChannelValue;
+    }
+
+    if (root.object.get("prompt_cache_ttl")) |ttl_value| {
+        if (ttl_value != .string) return error.InvalidPromptCacheTtlType;
+        settings.prompt_cache_ttl = prompt_cache_policy.Ttl.parse(ttl_value.string) orelse
+            return error.InvalidPromptCacheTtlValue;
     }
 
     if (root.object.get("theme")) |theme_value| {
@@ -2013,6 +2054,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
+    if (incoming.auto_compact_warm_percent) |value| target.auto_compact_warm_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
@@ -2033,6 +2075,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
+    if (incoming.prompt_cache_ttl) |value| target.prompt_cache_ttl = value;
     if (incoming.theme) |value| {
         if (target.theme) |old| alloc.free(old);
         target.theme = value;
@@ -4556,6 +4599,14 @@ test "update channel resolves only from the global user profile" {
     try std.testing.expectEqual(update_target.Channel.dev, settings.update_channel.?);
 }
 
+test "prompt cache ttl setting accepts only the supported lifetimes" {
+    var parsed = try parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":\"1h\"}");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(prompt_cache_policy.Ttl.one_hour, parsed.prompt_cache_ttl.?);
+    try std.testing.expectError(error.InvalidPromptCacheTtlValue, parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":\"2h\"}"));
+    try std.testing.expectError(error.InvalidPromptCacheTtlType, parseSettingsJson(std.testing.allocator, "{\"prompt_cache_ttl\":3600}"));
+}
+
 test "all currently parsed read-only settings survive detailed loading" {
     var parsed = try parseSettingsJson(
         std.testing.allocator,
@@ -4727,6 +4778,21 @@ test "theme setting rejects non-string values" {
     try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
 }
 
+test "warm compaction percent is a profile setting that is zero or between 10 and 79" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":45}");
+    defer global.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 45), global.auto_compact_warm_percent);
+    var off = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":0}");
+    defer off.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 0), off.auto_compact_warm_percent);
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":80}"));
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":5}"));
+    try std.testing.expectError(error.InvalidAutoCompactWarmPercentType, parseSettingsJson(std.testing.allocator, "{\"auto_compact_warm_percent\":\"50\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_warm_percent\":50}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, null), project.auto_compact_warm_percent);
+}
+
 test "auto compaction percent is a profile setting between 10 and 80" {
     var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":50}");
     defer global.deinit(std.testing.allocator);
@@ -4842,7 +4908,10 @@ test "modelNotSelectedMessage names the provider and both ways to recover" {
 test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    // The settings store reads the profile only when these directories are
+    // private, so the fixture creates them with the mode it requires.
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -4877,4 +4946,31 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+test "a provider that cannot bind degrades to a diagnostic instead of refusing to start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"openrouter\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var detailed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer detailed.deinit(std.testing.allocator);
+
+    // No `providers` entry binds that name, so the run falls back to the
+    // default route instead of exiting with an internal error tag.
+    try std.testing.expect(detailed.settings.provider == null);
+    var reported = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .malformed_settings) reported = true;
+    }
+    try std.testing.expect(reported);
 }

@@ -16,12 +16,14 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
+        .capabilities = .{ .gateway_prompt_caching = definition.prompt_caching },
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
         .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) },
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
@@ -48,7 +50,7 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .prompt_caching = definition.prompt_caching, .provider = &identity });
 }
 
 fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -133,13 +135,20 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
+    var extra_headers_buf: [2]std.http.Header = undefined;
+    extra_headers_buf[0] = .{ .name = "accept", .value = "text/event-stream" };
+    var extra_header_count: usize = 1;
+    if (definition.prompt_caching) if (prompt_cache_policy.validSessionHeader(request.session_id)) |session_id| {
+        extra_headers_buf[1] = .{ .name = "x-session-id", .value = session_id };
+        extra_header_count = 2;
+    };
     var uri = try std.Uri.parse(url);
     uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
     var operation = client_mod.PostOperation{
         .client = &client,
         .uri = uri,
         .authorization = authorization,
-        .extra_headers = &.{.{ .name = "accept", .value = "text/event-stream" }},
+        .extra_headers = extra_headers_buf[0..extra_header_count],
     };
     try request.admission.admit();
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
@@ -198,7 +207,8 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     }
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+    const exact_provider: ?model_provider.ProviderId = if (definition.prompt_caching) bound_identity(definition) else null;
+    return codec.consume_stream_exact(alloc, reader, request.data(), limits, request.events, request.cancel_flag, exact_provider);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.

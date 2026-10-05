@@ -328,6 +328,7 @@ pub fn Bindings(comptime App: type) type {
                 .publish_committed_file_handoff = agentPublishCommittedFileHandoff,
                 .propagate_history_turn = agentPropagateHistoryTurn,
                 .commit_context_compaction = .{ .commit = agentCommitContextCompaction },
+                .prompt_waiting = if (comptime !runtime_profile.allows(App, .cooperative_agent) and @hasDecl(@TypeOf(app.worker), "queuedPromptCount")) agentPromptWaiting else null,
                 .compaction_activity = if (comptime @hasDecl(@TypeOf(app.worker), "beginCompactionActivity")) .{
                     .begin = beginCompactionActivity,
                     .running = runCompactionActivity,
@@ -1171,6 +1172,11 @@ pub fn Bindings(comptime App: type) type {
         fn agentPropagateHistoryTurn(ctx: *anyopaque, turn: HistoryTurn) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_worker_runtime.Runtime(App).propagateHistoryTurn(app, turn, app.session.max_history_turns);
+        }
+
+        fn agentPromptWaiting(ctx: *anyopaque) bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.worker.queuedPromptCount() > 0;
         }
 
         fn beginCompactionActivity(ctx: *anyopaque, origin: compaction_activity.Origin, turn_id: ?u64) compaction_activity.OperationId {

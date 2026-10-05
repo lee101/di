@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Git pre-push hook for this repository. Enable it with:
+#   git config core.hooksPath "$(git rev-parse --show-toplevel)/scripts/git-hooks"
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/dev-pre-push.sh" "$@"

@@ -46,6 +46,9 @@ pub const Config = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     /// Share of the model's usable input at which automatic compaction starts.
     auto_compact_percent: u8 = compactor.default_percent,
+    /// Share of the usable input at which a finished turn is compacted while
+    /// the provider cache is warm. 0 turns it off.
+    auto_compact_warm_percent: u8 = compactor.default_warm_percent,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
     review_enabled: bool = false,

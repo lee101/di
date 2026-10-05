@@ -1274,6 +1274,7 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
+                .auto_compact_warm_percent = job.agent_settings.auto_compact_warm_percent,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,

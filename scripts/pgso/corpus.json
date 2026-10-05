@@ -126,6 +126,7 @@
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-compaction-activity", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-compaction-activity.test.ts"], "test_file": "tui-compaction-activity.test.ts"},
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},
+    {"name": "verify-tui-warm-compaction", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-warm-compaction.test.ts"], "test_file": "tui-warm-compaction.test.ts"},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
     {"name": "verify-tui-cost", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-cost.test.ts"], "test_file": "tui-cost.test.ts"},
     {"name": "verify-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
@@ -142,6 +143,7 @@
     {"name": "verify-web-search-permission-progress", "argv": ["bun", "test", "--max-concurrency", "1", "./web-search-permission-progress.test.ts"], "test_file": "web-search-permission-progress.test.ts", "requires_tmux": false},
     {"name": "verify-yolo-permission-mode", "argv": ["bun", "test", "--max-concurrency", "1", "./yolo-permission-mode.test.ts"], "test_file": "yolo-permission-mode.test.ts"},
     {"name": "verify-tui-slash-preferences", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-preferences.test.ts"], "test_file": "tui-slash-preferences.test.ts"},
-    {"name": "verify-settings-permissions-warning", "argv": ["bun", "test", "--max-concurrency", "1", "./settings-permissions-warning.test.ts"], "test_file": "settings-permissions-warning.test.ts"}
+    {"name": "verify-settings-permissions-warning", "argv": ["bun", "test", "--max-concurrency", "1", "./settings-permissions-warning.test.ts"], "test_file": "settings-permissions-warning.test.ts"},
+    {"name": "verify-shell-request-tolerance", "argv": ["bun", "test", "--max-concurrency", "1", "./shell-request-tolerance.test.ts"], "test_file": "shell-request-tolerance.test.ts"}
   ]
 }

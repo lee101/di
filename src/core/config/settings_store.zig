@@ -1956,6 +1956,11 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
+    if (object.get("auto_compact_warm_percent")) |value| {
+        if (value != .integer or value.integer < 0 or !compactor.isValidWarmPercent(@intCast(value.integer))) {
+            return error.InvalidSettingsFormat;
+        }
+    }
     if (object.get("skill_match_fuzzy")) |value| {
         if (value != .bool) return error.InvalidSettingsFormat;
     }
@@ -1979,6 +1984,11 @@ fn validateKnownSettingsObject(
     inline for (&.{ "context", "fast_mode", "ultrafast_mode", "auto_upgrade", "slash_menu_categories", "startup_scrollback", "yolo_acknowledged", "provider_strict" }) |key| {
         if (object.get(key)) |value| {
             if (value != .bool) return error.InvalidSettingsFormat;
+        }
+    }
+    if (object.get("prompt_cache_ttl")) |value| {
+        if (value != .string or !(std.mem.eql(u8, value.string, "5m") or std.mem.eql(u8, value.string, "1h"))) {
+            return error.InvalidSettingsFormat;
         }
     }
     if (object.get("update_channel")) |value| {
