@@ -185,7 +185,6 @@ pub const RequestData = struct {
     budget: ?BuildBudget = null,
     verified_images: ?[]const image_attachments.VerifiedSnapshot = null,
     response_format: ?StructuredResponseFormat = null,
-    session_id: ?[]const u8 = null,
 
     pub fn validatePrompt(self: RequestData) error{InvalidProviderPrompt}!void {
         try validate_prompt_lanes(self.instructions, self.messages);
@@ -263,7 +262,6 @@ pub const ModelRequest = struct {
             .budget = self.budget,
             .verified_images = self.verified_images,
             .response_format = self.response_format,
-            .session_id = self.session_id,
         };
     }
 };
