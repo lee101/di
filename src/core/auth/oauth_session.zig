@@ -826,7 +826,7 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
     if (io_mod.permissionsMode(initial_stat.permissions) & 0o200 == 0) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    dir.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch {
+    io_mod.setDirPermissions(dir, io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());

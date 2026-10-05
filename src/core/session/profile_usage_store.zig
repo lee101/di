@@ -566,7 +566,8 @@ pub const Store = struct {
                 else => return error.DurableLayoutFailed,
             };
         }
-        self.durable_home.?.dir.setPermissions(
+        io_mod.setDirPermissions(
+            self.durable_home.?.dir,
             io_mod.getIo(),
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;

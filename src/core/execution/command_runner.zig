@@ -1597,7 +1597,6 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
     return std.fs.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
 }
 
-
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
     return if (finished_ms > started_ms) @intCast(finished_ms - started_ms) else 0;
 }

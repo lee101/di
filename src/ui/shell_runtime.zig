@@ -62,7 +62,7 @@ pub const AlternateScreenOwner = enum {
 };
 
 pub const TerminalState = struct {
-    stdin_fd: std.Io.File.Handle = io_mod.stdinHandle(),
+    stdin_fd: std.Io.File.Handle = io_mod.stdin_handle_default,
     original_termios: if (builtin.os.tag == .windows) void else std.posix.termios = undefined,
     /// The console input mode to restore. Only Windows ever reads it, so it
     /// stays null everywhere else rather than carrying a dead platform field.
@@ -93,14 +93,18 @@ pub const TerminalState = struct {
         if (!io_mod.stdinIsTty() or !io_mod.stdoutIsTty()) return error.NotATerminal;
     }
 
+    fn input(self: *const TerminalState) std.Io.File.Handle {
+        return io_mod.resolveStdin(self.stdin_fd);
+    }
+
     pub fn captureOriginalTermios(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) return;
         if (comptime builtin.os.tag == .windows) {
             const windows = io_mod.windowsSys();
-            self.original_console_mode = windows.consoleMode(self.stdin_fd) orelse 0;
+            self.original_console_mode = windows.consoleMode(self.input()) orelse 0;
             return;
         }
-        self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
+        self.original_termios = try std.posix.tcgetattr(self.input());
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
@@ -112,7 +116,7 @@ pub const TerminalState = struct {
             // The renderer emits ANSI escapes, so the console must translate
             // key events into VT input and stop echoing and line buffering.
             const windows = io_mod.windowsSys();
-            self.original_console_mode = try windows.enterRawInputMode(self.stdin_fd);
+            self.original_console_mode = try windows.enterRawInputMode(self.input());
             self.raw_enabled = true;
             return;
         }
@@ -141,7 +145,7 @@ pub const TerminalState = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(self.stdin_fd, .NOW, raw);
+        try std.posix.tcsetattr(self.input(), .NOW, raw);
         self.raw_enabled = true;
     }
 
@@ -149,10 +153,10 @@ pub const TerminalState = struct {
         if (!self.raw_enabled) return;
         if (comptime builtin.os.tag == .windows) {
             if (self.original_console_mode) |mode| {
-                io_mod.windowsSys().restoreConsoleMode(self.stdin_fd, mode);
+                io_mod.windowsSys().restoreConsoleMode(self.input(), mode);
             }
         } else if (comptime builtin.os.tag != .wasi) {
-            std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
+            std.posix.tcsetattr(self.input(), .FLUSH, self.original_termios) catch {};
         }
         self.raw_enabled = false;
     }
@@ -184,7 +188,7 @@ pub const TerminalState = struct {
         return if (comptime builtin.os.tag == .wasi)
             wasm_terminal.queryLayout(footer_rows)
         else
-            ui_terminal.queryLayout(self.stdin_fd, footer_rows);
+            ui_terminal.queryLayout(self.input(), footer_rows);
     }
 
     pub fn queryCursorPosition(self: TerminalState) !CursorPosition {
@@ -263,7 +267,7 @@ pub const TerminalState = struct {
         if (comptime builtin.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
-        return io_mod.readHandle(self.stdin_fd, out);
+        return io_mod.readHandle(self.input(), out);
     }
 
     pub fn pollInput(self: TerminalState, timeout_ms: i32) !PollResult {
@@ -277,10 +281,10 @@ pub const TerminalState = struct {
         if (comptime builtin.os.tag == .windows) {
             // A console handle signals input through an event object and never
             // hangs up, so readiness alone carries the whole result.
-            return .{ .readable = try io_mod.waitReadable(self.stdin_fd, timeout_ms) };
+            return .{ .readable = try io_mod.waitReadable(self.input(), timeout_ms) };
         }
         var fds = [_]std.posix.pollfd{.{
-            .fd = self.stdin_fd,
+            .fd = self.input(),
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};

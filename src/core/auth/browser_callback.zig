@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -171,6 +172,11 @@ fn listenerReady(
     cancel_flag: Cancellation,
 ) !bool {
     if (cancel_flag.cancelled()) return error.Cancelled;
+    if (comptime builtin.os.tag == .windows) {
+        const ready = try io_mod.waitSocketReadable(listener.socket.handle, poll_ms);
+        if (cancel_flag.cancelled()) return error.Cancelled;
+        return ready;
+    }
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
@@ -186,7 +192,7 @@ fn listenerReady(
 }
 
 fn requestReadable(
-    socket: std.posix.socket_t,
+    socket: std.Io.net.Socket.Handle,
     cancel_flag: Cancellation,
     deadline_ms: i64,
 ) !bool {
@@ -197,6 +203,13 @@ fn requestReadable(
             0
         else
             @intCast(@min(remaining_ms, poll_ms));
+        if (comptime builtin.os.tag == .windows) {
+            const ready = try io_mod.waitSocketReadable(socket, wait_ms);
+            if (cancel_flag.cancelled()) return error.Cancelled;
+            if (ready) return true;
+            if (remaining_ms <= 0) return false;
+            continue;
+        }
         var fds = [_]std.posix.pollfd{.{
             .fd = socket,
             .events = std.posix.POLL.IN,

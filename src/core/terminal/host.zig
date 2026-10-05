@@ -200,6 +200,8 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
+        // The host speaks over a Unix socket owned by a POSIX user id.
+        if (comptime builtin.os.tag == .windows) return error.TerminalHostUnsupported;
         if (!isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,

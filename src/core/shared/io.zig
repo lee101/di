@@ -20,7 +20,11 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    return switch (os_tag) {
+        .macos => darwin_process_spawn.wrap(zio),
+        .windows => @import("windows_io.zig").wrap(zio),
+        else => zio,
+    };
 }
 
 pub fn getIo() std.Io {
@@ -530,7 +534,7 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);
     if (maybe_existing_permissions) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (permissionsMode(existing_permissions) & 0o222 == 0) return error.AccessDenied;
     }
     const permissions = maybe_existing_permissions orelse .default_file;
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ path, nanoTimestamp() });
@@ -603,6 +607,41 @@ pub const private_file_permissions = permissionsFromMode(0o600);
 pub fn permissionsMode(permissions: std.Io.File.Permissions) std.posix.mode_t {
     if (comptime builtin.os.tag == .windows) return if (permissionsAreReadOnly(permissions)) 0o444 else 0o600;
     return permissions.toMode();
+}
+
+/// Windows keeps its standard handles in the process environment block, which
+/// is only readable at run time, so a struct field cannot default to one. This
+/// placeholder stands in until `resolveStdin` or `resolveStdout` swaps in the
+/// live handle. It matches no real handle or pseudo-handle.
+const std_placeholder: std.Io.File.Handle = if (builtin.os.tag == .windows)
+    @ptrFromInt(std.math.maxInt(usize) - 99)
+else
+    -1;
+
+/// Comptime-known default for a standard input field.
+pub const stdin_handle_default: std.Io.File.Handle = if (builtin.os.tag == .windows)
+    std_placeholder
+else
+    std.posix.STDIN_FILENO;
+
+/// Comptime-known default for a standard output field.
+pub const stdout_file_default: std.Io.File = if (builtin.os.tag == .windows)
+    .{ .handle = std_placeholder, .flags = .{ .nonblocking = false } }
+else
+    std.Io.File.stdout();
+
+pub fn resolveStdin(handle: std.Io.File.Handle) std.Io.File.Handle {
+    if (comptime builtin.os.tag == .windows) {
+        if (handle == std_placeholder) return stdinHandle();
+    }
+    return handle;
+}
+
+pub fn resolveStdout(file: std.Io.File) std.Io.File {
+    if (comptime builtin.os.tag == .windows) {
+        if (file.handle == std_placeholder) return std.Io.File.stdout();
+    }
+    return file;
 }
 
 /// Standard-stream handle for the running platform. On POSIX this is the
@@ -690,6 +729,23 @@ pub fn waitReadable(handle: std.Io.File.Handle, timeout_ms: i32) !bool {
     const ready = try std.posix.poll(&fds, timeout_ms);
     if (ready == 0) return false;
     return (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0;
+}
+
+/// Waits up to `timeout_ms` (negative waits forever) for a socket opened by
+/// `std.Io.net` to have input or a pending connection. A closed peer also
+/// reports readable so the caller observes the end of stream.
+pub fn waitSocketReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) !bool {
+    if (comptime builtin.os.tag == .windows) {
+        return @import("windows_sys.zig").waitSocketReadable(handle, timeout_ms);
+    }
+    var fds = [_]std.posix.pollfd{.{
+        .fd = handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, timeout_ms);
+    if (ready == 0) return false;
+    return (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
 }
 
 /// Reports whether `data` can be consumed from a console, pipe, or file
@@ -800,7 +856,6 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
-
 /// Windows has no directory fsync, so every platform reports the same names
 /// and callers already handle `OperationUnsupported`.
 pub const SyncVerifiedDirError = error{
@@ -814,7 +869,10 @@ pub const SyncVerifiedDirError = error{
     Unexpected,
 };
 pub fn syncVerifiedDir(dir: std.Io.Dir) SyncVerifiedDirError!void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+    // NTFS journals directory entry changes as metadata, and Windows has no
+    // directory flush to call, so a created or renamed entry is as durable as
+    // it will get once the call that made it returns.
+    if (comptime builtin.os.tag == .windows) return;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -827,6 +885,14 @@ pub fn syncVerifiedDir(dir: std.Io.Dir) SyncVerifiedDirError!void {
             else => return error.DirectorySyncFailed,
         }
     }
+}
+
+/// Sets a directory's permissions. Windows expresses directory privacy through
+/// the profile's ACLs rather than a mode, and the standard library has no
+/// directory permission call there, so this is a no-op on Windows.
+pub fn setDirPermissions(dir: std.Io.Dir, io: std.Io, permissions: std.Io.File.Permissions) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    return dir.setPermissions(io, permissions);
 }
 
 fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !VerifiedDir {
@@ -855,7 +921,7 @@ fn openOrCreateVerifiedPrivateChild(parent: std.Io.Dir, name: []const u8) !Verif
     };
     errdefer dir.close(zio);
 
-    dir.setPermissions(zio, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
+    setDirPermissions(dir, zio, private_dir_permissions) catch return error.PrivateStatePermissionsUnsupported;
     try verifyPrivateDirectory(dir);
     if (created) try syncVerifiedDir(parent);
     return .{ .dir = dir };
@@ -1186,12 +1252,7 @@ fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
         const written = windows.GetFinalPathNameByHandleW(handle, buf.ptr, required + 1, windows.VOLUME_NAME_DOS);
         if (written == 0 or written > required) return error.HandlePathUnavailable;
         const resolved = try std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..written]);
-        if (std.mem.startsWith(u8, resolved, "\\\\?\\")) {
-            const trimmed = resolved[4..];
-            @memcpy(resolved[0..trimmed.len], trimmed);
-            return resolved[0..trimmed.len];
-        }
-        return resolved;
+        return stripWin32NamespacePrefix(alloc, resolved);
     }
     if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
         // F_GETPATH (macOS fcntl command 50): resolve filesystem path for an fd.
@@ -1254,14 +1315,38 @@ fn realpathAllocWindows(alloc: std.mem.Allocator, path: []const u8) RealpathErro
         error.OutOfMemory => return error.OutOfMemory,
         error.DanglingSurrogateHalf, error.ExpectedSecondSurrogateHalf, error.UnexpectedSecondSurrogateHalf => return error.BadPathName,
     };
-    // `\\?\` is a Win32 namespace prefix, not part of the path the rest of the
-    // product compares against.
-    if (std.mem.startsWith(u8, resolved, "\\\\?\\")) {
-        const trimmed = resolved[4..];
-        @memcpy(resolved[0..trimmed.len], trimmed);
-        return resolved[0..trimmed.len];
+    return stripWin32NamespacePrefix(alloc, resolved);
+}
+
+/// `\\?\` is a Win32 namespace prefix, not part of the path the rest of the
+/// product compares against, and `\\?\UNC\server\share` is `\\server\share`.
+/// Takes ownership of `path`; a trimmed result is a fresh allocation so the
+/// caller frees exactly what it got.
+fn stripWin32NamespacePrefix(alloc: std.mem.Allocator, path: []u8) ![]u8 {
+    const unc_prefix = "\\\\?\\UNC\\";
+    const namespace_prefix = "\\\\?\\";
+    if (std.mem.startsWith(u8, path, unc_prefix)) {
+        defer alloc.free(path);
+        return std.mem.concat(alloc, u8, &.{ "\\\\", path[unc_prefix.len..] });
     }
-    return resolved;
+    if (std.mem.startsWith(u8, path, namespace_prefix)) {
+        defer alloc.free(path);
+        return alloc.dupe(u8, path[namespace_prefix.len..]);
+    }
+    return path;
+}
+
+test "stripWin32NamespacePrefix trims drive and UNC namespace prefixes" {
+    const alloc = std.testing.allocator;
+    const drive = try stripWin32NamespacePrefix(alloc, try alloc.dupe(u8, "\\\\?\\C:\\work"));
+    defer alloc.free(drive);
+    try std.testing.expectEqualStrings("C:\\work", drive);
+    const unc = try stripWin32NamespacePrefix(alloc, try alloc.dupe(u8, "\\\\?\\UNC\\host\\share\\x"));
+    defer alloc.free(unc);
+    try std.testing.expectEqualStrings("\\\\host\\share\\x", unc);
+    const plain = try stripWin32NamespacePrefix(alloc, try alloc.dupe(u8, "/tmp/x"));
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("/tmp/x", plain);
 }
 
 fn windowsPathError(code: u32) RealpathError {

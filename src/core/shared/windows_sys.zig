@@ -199,3 +199,74 @@ pub fn restoreConsoleMode(handle: HANDLE, mode: DWORD) void {
 }
 
 pub extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) DWORD;
+pub extern "kernel32" fn CreateEventW(
+    attributes: ?*const anyopaque,
+    manual_reset: BOOL,
+    initial_state: BOOL,
+    name: ?[*:0]const u16,
+) callconv(.winapi) HANDLE;
+
+const AFD_POLL_RECEIVE: u32 = 0x0001;
+const AFD_POLL_DISCONNECT: u32 = 0x0008;
+const AFD_POLL_ABORT: u32 = 0x0010;
+const AFD_POLL_LOCAL_CLOSE: u32 = 0x0020;
+const AFD_POLL_ACCEPT: u32 = 0x0080;
+
+const AfdPollHandleInfo = extern struct {
+    handle: HANDLE,
+    events: u32,
+    status: i32,
+};
+
+const AfdPollInfo = extern struct {
+    /// Negative for a timeout relative to now, in 100ns units.
+    timeout: i64,
+    count: u32,
+    exclusive: u32,
+    handles: [1]AfdPollHandleInfo,
+};
+
+/// Waits up to `timeout_ms` (negative waits forever) for a socket opened by
+/// `std.Io.net` to have input, a pending connection, or a closed peer.
+///
+/// Zig's Windows networking drives the AFD driver directly rather than going
+/// through WinSock, so `WSAPoll` does not recognize these handles. The AFD
+/// poll request is what WinSock itself uses underneath.
+pub fn waitSocketReadable(handle: *anyopaque, timeout_ms: i32) !bool {
+    const nt = std.os.windows;
+    var info: AfdPollInfo = .{
+        .timeout = if (timeout_ms < 0) std.math.maxInt(i64) else -@as(i64, timeout_ms) * 10_000,
+        .count = 1,
+        .exclusive = 0,
+        .handles = .{.{
+            .handle = handle,
+            .events = AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT |
+                AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE,
+            .status = 0,
+        }},
+    };
+    const event = CreateEventW(null, 1, 0, null) orelse return error.SystemResources;
+    defer _ = CloseHandle(event);
+    var io_status: nt.IO_STATUS_BLOCK = undefined;
+    var status = nt.ntdll.NtDeviceIoControlFile(
+        handle,
+        event,
+        null,
+        null,
+        &io_status,
+        nt.IOCTL.AFD.POLL,
+        &info,
+        @sizeOf(AfdPollInfo),
+        &info,
+        @sizeOf(AfdPollInfo),
+    );
+    if (status == .PENDING) {
+        if (WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0) return error.Unexpected;
+        status = io_status.u.Status;
+    }
+    return switch (status) {
+        .SUCCESS => info.count > 0 and info.handles[0].events != 0,
+        .TIMEOUT => false,
+        else => error.Unexpected,
+    };
+}

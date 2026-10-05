@@ -19,6 +19,8 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) process_provider.ProviderError!process_identity.ProcessInstanceToken {
+    // Only Linux and macOS can read a process start identity.
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.ProcessIdentityUnsupported;
     const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     return switch (builtin.os.tag) {

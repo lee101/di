@@ -46,8 +46,10 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
-pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+/// Release archives are published only for macOS and Linux on x86_64 and
+/// aarch64. Other hosts build from source and never self-upgrade.
+pub const platform_supported = platformFromTarget() != null;
+pub const platform = platformFromTarget() orelse "unsupported";
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {

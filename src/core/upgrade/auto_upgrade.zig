@@ -89,6 +89,7 @@ pub const AutoUpgrade = struct {
         current: update_target.CurrentBuild,
     ) void {
         self.setPreviousRevision(current.revision);
+        if (comptime !helpers.platform_supported) return;
         self.thread = std.Thread.spawn(.{}, runLoop, .{ self, alloc, current }) catch return;
     }
 

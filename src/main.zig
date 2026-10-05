@@ -3513,9 +3513,10 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 /// The C runtime hands `main` its arguments in the ANSI code page, which
-/// mangles any path outside it. mingw exports the wide originals alongside
-/// them, so Windows rebuilds the UTF-8 vectors the rest of the product speaks
-/// from those and then enters through the same path as every other platform.
+/// mangles any path outside it. Windows keeps the wide originals in the
+/// command line and environment block, so this rebuilds the UTF-8 vectors the
+/// rest of the product speaks from those and then enters through the same
+/// path as every other platform.
 fn mainWindowsFromWide() !void {
     const gpa = processAllocator();
     var owned: std.ArrayList([]u8) = .empty;
@@ -3526,26 +3527,28 @@ fn mainWindowsFromWide() !void {
 
     var args: std.ArrayList([*:0]u8) = .empty;
     defer args.deinit(gpa);
-    var arg_index: usize = 0;
-    while (true) {
-        const wide = mingw.__wargv[arg_index] orelse break;
+    var wide_count: c_int = 0;
+    const wide_args = win32.CommandLineToArgvW(win32.GetCommandLineW(), &wide_count) orelse
+        return error.ArgumentsUnavailable;
+    defer _ = win32.LocalFree(@ptrCast(wide_args));
+    for (wide_args[0..@intCast(wide_count)]) |wide| {
         const bytes = try utf16ToOwnedUtf8(gpa, &owned, wide);
         try args.append(gpa, bytes.ptr);
-        arg_index += 1;
     }
 
     var env: std.ArrayList([*:0]u8) = .empty;
     defer env.deinit(gpa);
-    var env_index: usize = 0;
-    while (true) {
-        const wide = mingw.__wenviron[env_index] orelse break;
-        if (wide[0] == '=') { // The drive-current directory pseudo-variable.
-            env_index += 1;
-            continue;
-        }
-        const bytes = try utf16ToOwnedUtf8(gpa, &owned, wide);
+    // The block is a run of NUL-terminated `NAME=value` strings ending in an
+    // empty one.
+    const block = win32.GetEnvironmentStringsW() orelse return error.EnvironmentUnavailable;
+    defer _ = win32.FreeEnvironmentStringsW(block);
+    var cursor: [*:0]const u16 = block;
+    while (cursor[0] != 0) {
+        const entry_len = std.mem.len(cursor);
+        defer cursor += entry_len + 1;
+        if (cursor[0] == '=') continue; // A drive-current directory pseudo-variable.
+        const bytes = try utf16ToOwnedUtf8(gpa, &owned, cursor);
         try env.append(gpa, bytes.ptr);
-        env_index += 1;
     }
 
     const argv = try gpa.alloc([*:0]c_char, args.items.len);
@@ -3570,9 +3573,12 @@ fn utf16ToOwnedUtf8(
     return bytes;
 }
 
-const mingw = struct {
-    extern "c" var __wargv: [*c]?[*:0]u16;
-    extern "c" var __wenviron: [*c]?[*:0]u16;
+const win32 = struct {
+    extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
+    extern "shell32" fn CommandLineToArgvW(command_line: [*:0]const u16, count: *c_int) callconv(.winapi) ?[*][*:0]u16;
+    extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetEnvironmentStringsW() callconv(.winapi) ?[*:0]u16;
+    extern "kernel32" fn FreeEnvironmentStringsW(block: [*:0]u16) callconv(.winapi) i32;
 };
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
@@ -3852,15 +3858,15 @@ fn parseColumnCount(value: []const u8) ?usize {
 
 fn cliArgsFromRaw(raw_args: []const [*:0]const u8, stack_buf: [][:0]const u8) ![]const [:0]const u8 {
     @setRuntimeSafety(false);
-    if (comptime hasPosixArgVector()) {
+    if (comptime hasRawArgVector()) {
         if (raw_args.len <= 1) return &.{};
         const cli_len = raw_args.len - 1;
-        if (cli_len <= stack_buf.len) {
-            for (raw_args[1..], 0..) |arg, i| {
-                stack_buf[i] = std.mem.sliceTo(arg, 0);
-            }
-            return stack_buf[0..cli_len];
-        }
+        const out = if (cli_len <= stack_buf.len)
+            stack_buf[0..cli_len]
+        else
+            try processAllocator().alloc([:0]const u8, cli_len);
+        for (raw_args[1..], out) |arg, *slot| slot.* = std.mem.sliceTo(arg, 0);
+        return out;
     }
 
     const args = try argsFromRaw(raw_args).toSlice(processAllocator());
@@ -3912,9 +3918,11 @@ fn exitFast(code: u8) noreturn {
     std.process.exit(code);
 }
 
-fn hasPosixArgVector() bool {
+/// Whether `main` receives a UTF-8 argument vector. Windows rebuilds one from
+/// the wide command line in `mainWindowsFromWide`.
+fn hasRawArgVector() bool {
     return switch (builtin.os.tag) {
-        .windows, .freestanding, .other => false,
+        .freestanding, .other => false,
         .wasi => builtin.link_libc,
         else => true,
     };
@@ -4221,7 +4229,7 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm or builtin.os.tag == .windows)
     handleSigWinchWeb
 else
     handleSigWinchNative;

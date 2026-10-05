@@ -484,7 +484,8 @@ fn normalizeAndVerifyPrivateDir(dir: std.Io.Dir) !void {
     if (io_mod.permissionsMode(initial.permissions) & 0o200 == 0) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    try dir.setPermissions(
+    try io_mod.setDirPermissions(
+        dir,
         io_mod.getIo(),
         io_mod.permissionsFromMode(0o700),
     );

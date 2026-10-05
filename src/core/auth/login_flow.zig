@@ -1146,14 +1146,9 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
-    var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
     const timeout: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
-    const ready = std.posix.poll(&fds, timeout) catch return false;
-    if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) return false;
+    const ready = io_mod.waitReadable(io_mod.stdinHandle(), timeout) catch return false;
+    if (!ready) return false;
     discardStdinLine();
     return true;
 }
@@ -1161,7 +1156,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 fn discardStdinLine() void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = io_mod.readHandle(io_mod.stdinHandle(), &buf) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1328,8 +1323,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 }
 
 fn canUseInteractiveTeamPicker() bool {
-    const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
-    return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
+    return io_mod.stdinIsTty() and io_mod.stdoutIsTty();
 }
 
 fn renderTeamPicker(
@@ -1363,22 +1357,17 @@ const TeamPickerKey = union(enum) {
 };
 
 fn readTeamPickerKey() !TeamPickerKey {
+    const stdin = io_mod.stdinHandle();
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
+    const first_read = try io_mod.readHandle(stdin, buf[0..1]);
     if (first_read == 0) return .ignored;
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            if (!try io_mod.waitReadable(stdin, 25)) break;
+            const n = try io_mod.readHandle(stdin, buf[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }
@@ -1416,12 +1405,32 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
     return .cancel;
 }
 
-const TeamPickerRawMode = struct {
+const TeamPickerRawMode = if (builtin.os.tag == .windows) struct {
+    original_mode: u32 = 0,
+    active: bool = false,
+
+    fn enable() !TeamPickerRawMode {
+        if (!io_mod.stdinIsTty() or !io_mod.stdoutIsTty()) {
+            return error.NotATerminal;
+        }
+        io_mod.enableAnsiOutput(io_mod.stdoutHandle());
+        return .{
+            .original_mode = try io_mod.windowsSys().enterRawInputMode(io_mod.stdinHandle()),
+            .active = true,
+        };
+    }
+
+    fn disable(self: *TeamPickerRawMode) void {
+        if (!self.active) return;
+        io_mod.windowsSys().restoreConsoleMode(io_mod.stdinHandle(), self.original_mode);
+        self.active = false;
+    }
+} else struct {
     original: std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
+        if (!io_mod.stdinIsTty() or !io_mod.stdoutIsTty()) {
             return error.NotATerminal;
         }
 

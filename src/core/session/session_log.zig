@@ -3159,7 +3159,7 @@ pub const WritableSessionDir = struct {
             break :blk false;
         };
         const body = std.fmt.allocPrint(alloc, "{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
-            std.c.getpid(),
+            io_mod.currentProcessId(),
             io_mod.milliTimestamp(),
         }) catch |err| {
             debug_trace.logf("session", "owner liveness mark allocation failed id={s} err={s}", .{ self.session_id, @errorName(err) });

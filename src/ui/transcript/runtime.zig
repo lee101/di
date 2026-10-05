@@ -4255,7 +4255,7 @@ test "render diagnostic commit skips unchanged same-row paints" {
 }
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    stdout_file: std.Io.File = io_mod.stdout_file_default,
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
@@ -4449,6 +4449,7 @@ pub const TranscriptRuntime = struct {
             entry.* = null;
         }
         result.compact_transcript_source_cache.next_replacement = 0;
+        result.stdout_file = io_mod.resolveStdout(result.stdout_file);
         return result;
     }
 
