@@ -2096,8 +2096,7 @@ fn runPasteSetup(
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
-    return std.c.isatty(std.posix.STDIN_FILENO) != 0 and
-        std.c.isatty(std.posix.STDERR_FILENO) != 0;
+    return io_mod.stdinIsTty() and io_mod.stderrIsTty();
 }
 
 fn readMaskedKeyDefault(
@@ -2116,7 +2115,7 @@ fn readMaskedKeyDefault(
 
     while (input.items.len < 8 * 1024) {
         var byte: [1]u8 = undefined;
-        if (try std.posix.read(std.posix.STDIN_FILENO, &byte) == 0) return error.SetupCancelled;
+        if (try io_mod.readHandle(io_mod.stdinHandle(), &byte) == 0) return error.SetupCancelled;
         switch (byte[0]) {
             '\r', '\n' => {
                 if (input.items.len == 0) continue;
@@ -2144,18 +2143,22 @@ fn readMaskedKeyDefault(
 }
 
 const MaskedKeyRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (builtin.os.tag == .windows) void else std.posix.termios = undefined,
+    /// The console input mode to restore. Only Windows ever reads it.
+    original_console_mode: ?u32 = null,
     active: bool = false,
 
     fn enable() !MaskedKeyRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or
-            std.c.isatty(std.posix.STDERR_FILENO) == 0)
-        {
-            return error.NotATerminal;
-        }
+        if (!io_mod.stdinIsTty() or !io_mod.stderrIsTty()) return error.NotATerminal;
 
         var self: MaskedKeyRawMode = .{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        if (comptime builtin.os.tag == .windows) {
+            const windows = io_mod.windowsSys();
+            self.original_console_mode = try windows.enterRawInputMode(io_mod.stdinHandle());
+            self.active = true;
+            return self;
+        }
+        self.original = try std.posix.tcgetattr(io_mod.stdinHandle());
         var raw = self.original;
         raw.iflag.BRKINT = false;
         raw.iflag.ICRNL = false;
@@ -2180,14 +2183,20 @@ const MaskedKeyRawMode = struct {
             raw.cc[vmin_idx] = 1;
             raw.cc[vtime_idx] = 0;
         }
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try std.posix.tcsetattr(io_mod.stdinHandle(), .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *MaskedKeyRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        if (comptime builtin.os.tag == .windows) {
+            if (self.original_console_mode) |mode| {
+                io_mod.windowsSys().restoreConsoleMode(io_mod.stdinHandle(), mode);
+            }
+        } else {
+            std.posix.tcsetattr(io_mod.stdinHandle(), .FLUSH, self.original) catch {};
+        }
         self.active = false;
     }
 };

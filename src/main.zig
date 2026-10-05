@@ -3504,9 +3504,76 @@ pub fn runWasmTerminal(init: std.process.Init) !void {
 }
 
 pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) callconv(.c) c_int {
+    if (comptime builtin.os.tag == .windows) {
+        mainWindowsFromWide() catch return 1;
+        return 0;
+    }
     mainC(c_argc, c_argv, c_envp) catch return 1;
     return 0;
 }
+
+/// The C runtime hands `main` its arguments in the ANSI code page, which
+/// mangles any path outside it. mingw exports the wide originals alongside
+/// them, so Windows rebuilds the UTF-8 vectors the rest of the product speaks
+/// from those and then enters through the same path as every other platform.
+fn mainWindowsFromWide() !void {
+    const gpa = processAllocator();
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |bytes| gpa.free(bytes);
+        owned.deinit(gpa);
+    }
+
+    var args: std.ArrayList([*:0]u8) = .empty;
+    defer args.deinit(gpa);
+    var arg_index: usize = 0;
+    while (true) {
+        const wide = mingw.__wargv[arg_index] orelse break;
+        const bytes = try utf16ToOwnedUtf8(gpa, &owned, wide);
+        try args.append(gpa, bytes.ptr);
+        arg_index += 1;
+    }
+
+    var env: std.ArrayList([*:0]u8) = .empty;
+    defer env.deinit(gpa);
+    var env_index: usize = 0;
+    while (true) {
+        const wide = mingw.__wenviron[env_index] orelse break;
+        if (wide[0] == '=') { // The drive-current directory pseudo-variable.
+            env_index += 1;
+            continue;
+        }
+        const bytes = try utf16ToOwnedUtf8(gpa, &owned, wide);
+        try env.append(gpa, bytes.ptr);
+        env_index += 1;
+    }
+
+    const argv = try gpa.alloc([*:0]c_char, args.items.len);
+    defer gpa.free(argv);
+    for (args.items, 0..) |arg, index| argv[index] = @ptrCast(arg);
+
+    const envp = try gpa.alloc(?[*:0]c_char, env.items.len + 1);
+    defer gpa.free(envp);
+    for (env.items, 0..) |entry, index| envp[index] = @ptrCast(entry);
+    envp[env.items.len] = null;
+
+    try mainC(@intCast(args.items.len), argv.ptr, @ptrCast(envp.ptr));
+}
+
+fn utf16ToOwnedUtf8(
+    gpa: std.mem.Allocator,
+    owned: *std.ArrayList([]u8),
+    wide: [*:0]const u16,
+) ![:0]u8 {
+    const bytes = try std.unicode.utf16LeToUtf8AllocZ(gpa, std.mem.sliceTo(wide, 0));
+    try owned.append(gpa, bytes);
+    return bytes;
+}
+
+const mingw = struct {
+    extern "c" var __wargv: [*c]?[*:0]u16;
+    extern "c" var __wenviron: [*c]?[*:0]u16;
+};
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
@@ -3693,10 +3760,20 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) {
+        // argv0 only steers `processExecutablePath` on OpenBSD and Haiku;
+        // Windows resolves the executable from the process image itself.
+        return .{ .vector = &.{} };
+    }
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) {
+        // The Windows environment block is owned by the PEB and can move when
+        // a variable changes, so the global block is the only stable handle.
+        return .global;
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };

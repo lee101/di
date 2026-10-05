@@ -222,6 +222,10 @@ fn signalProcess(
     pid_text: []const u8,
     expected: process_identity.ProcessInstanceToken,
 ) process_provider.ProviderError!void {
+    // Windows has neither POSIX process groups nor POSIX signals. The
+    // capability table already reports this host as having no process
+    // control, so the runtime check below never gets past that on Windows.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.Unsupported;
     switch (matchToken(context, alloc, pid_text, expected)) {
         .matched => {},
         .missing, .mismatched => return error.ProcessIdentityMismatch,

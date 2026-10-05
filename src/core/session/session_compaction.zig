@@ -65,7 +65,7 @@ const copy_buffer_bytes: usize = 64 * 1024;
 /// watermark deliberately accepts.
 const tail_pin_bytes: u64 = 64 * 1024;
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 
 pub const Outcome = enum {
     compacted,

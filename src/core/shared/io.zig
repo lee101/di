@@ -199,11 +199,21 @@ const RegularFileOpenPolicy = struct {
     hardlinks: HardlinkPolicy,
 };
 
+/// One error set for every platform. The Windows open path cannot fail the way
+/// the POSIX descriptor dance can, but callers already translate these names,
+/// so every platform reports the same set.
+pub const OpenExistingRegularFileError = std.Io.Dir.StatFileError ||
+    std.Io.File.OpenError || error{
+    FileControlFailed,
+    DurablePathUnsafe,
+    Unexpected,
+};
+
 fn openExistingRegularFileWithPolicy(
     dir: std.Io.Dir,
     sub_path: []const u8,
     policy: RegularFileOpenPolicy,
-) !std.Io.File {
+) OpenExistingRegularFileError!std.Io.File {
     const initial = try dir.statFile(getIo(), sub_path, .{
         .follow_symlinks = policy.final_symlink == .follow,
     });
@@ -540,8 +550,179 @@ pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const
     cleanup_temp = false;
 }
 
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+/// File permission intent, expressed once for every platform. POSIX encodes
+/// privacy as mode bits. Windows has no mode bits at all: `std.Io.File.Permissions`
+/// models only the read-only attribute, and access is governed by the ACLs the
+/// profile directory already carries. Call sites therefore assert intent
+/// through these predicates instead of decoding a foreign encoding.
+pub fn permissionsFromMode(mode: u32) std.Io.File.Permissions {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = @import("windows_sys.zig");
+        if (mode & 0o222 == 0) return @enumFromInt(windows.FILE_ATTRIBUTE_READONLY);
+        return @enumFromInt(0);
+    }
+    return std.Io.File.Permissions.fromMode(@intCast(mode));
+}
+
+fn permissionsAreReadOnly(permissions: std.Io.File.Permissions) bool {
+    const windows = @import("windows_sys.zig");
+    return @as(u32, @intCast(@intFromEnum(permissions))) & windows.FILE_ATTRIBUTE_READONLY != 0;
+}
+
+/// True for a `0o700` directory on POSIX, and for any usable directory on
+/// Windows, where nothing narrows access to the owner.
+pub fn permissionsArePrivateDir(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return !permissionsAreReadOnly(permissions);
+    return permissions.toMode() & 0o777 == 0o700;
+}
+
+/// True for a `0o600` file on POSIX, and for any writable file on Windows.
+pub fn permissionsArePrivateFile(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return !permissionsAreReadOnly(permissions);
+    return permissions.toMode() & 0o777 == 0o600;
+}
+
+pub fn permissionsAreWritable(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return !permissionsAreReadOnly(permissions);
+    return permissions.toMode() & 0o222 != 0;
+}
+
+/// True only when POSIX mode bits grant access to group or other. Windows
+/// exposes no equivalent bit, so nothing can be asserted there.
+pub fn permissionsAreExposedToOthers(permissions: std.Io.File.Permissions) bool {
+    if (comptime builtin.os.tag == .windows) return false;
+    return permissions.toMode() & 0o077 != 0;
+}
+
+pub const private_dir_permissions = permissionsFromMode(0o700);
+pub const private_file_permissions = permissionsFromMode(0o600);
+
+/// Canonical mode for platforms that carry no mode bits. Windows reports
+/// `0o444` for a read-only entry and `0o600` otherwise, which is the closest
+/// honest answer rather than inventing owner bits the platform cannot enforce.
+pub fn permissionsMode(permissions: std.Io.File.Permissions) std.posix.mode_t {
+    if (comptime builtin.os.tag == .windows) return if (permissionsAreReadOnly(permissions)) 0o444 else 0o600;
+    return permissions.toMode();
+}
+
+/// Standard-stream handle for the running platform. On POSIX this is the
+/// process descriptor; on Windows it is the console or redirected-file handle
+/// behind the standard stream.
+pub fn stdinHandle() std.Io.File.Handle {
+    if (comptime builtin.os.tag == .windows) return std.Io.File.stdin().handle;
+    return std.posix.STDIN_FILENO;
+}
+
+pub fn stdoutHandle() std.Io.File.Handle {
+    if (comptime builtin.os.tag == .windows) return std.Io.File.stdout().handle;
+    return std.posix.STDOUT_FILENO;
+}
+
+pub fn stderrHandle() std.Io.File.Handle {
+    if (comptime builtin.os.tag == .windows) return std.Io.File.stderr().handle;
+    return std.posix.STDERR_FILENO;
+}
+
+pub fn stdinIsTty() bool {
+    return std.Io.File.stdin().isTty(getIo()) catch false;
+}
+
+pub fn stdoutIsTty() bool {
+    return std.Io.File.stdout().isTty(getIo()) catch false;
+}
+
+pub fn stderrIsTty() bool {
+    return std.Io.File.stderr().isTty(getIo()) catch false;
+}
+
+/// Win32 bindings, reachable only from call sites already guarded by a
+/// `comptime` platform check.
+pub fn windowsSys() type {
+    return @import("windows_sys.zig");
+}
+
+/// Enables ANSI escape processing on a console output stream. Windows
+/// terminals only interpret the renderer's escapes once this mode is set.
+pub fn enableAnsiOutput(handle: std.Io.File.Handle) void {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = @import("windows_sys.zig");
+        const mode = windows.consoleMode(handle) orelse return;
+        if (mode & windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0) return;
+        _ = windows.SetConsoleMode(handle, mode | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+}
+
+/// Reads from a console, pipe, or redirected file. Windows has no
+/// `read(2)` over these handles, so the `std.Io` backend is used instead.
+pub fn readHandle(handle: std.Io.File.Handle, destination: []u8) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        return file.readStreaming(getIo(), &.{destination});
+    }
+    return std.posix.read(handle, destination);
+}
+
+/// Waits up to `timeout_ms` for a console or pipe handle to have input. A
+/// regular-file handle always reports readable because reading it cannot
+/// block. Sockets are not handled here; their readiness is owned by the
+/// transport that opened them.
+pub fn waitReadable(handle: std.Io.File.Handle, timeout_ms: i32) !bool {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = @import("windows_sys.zig");
+        if (windows.isConsoleHandle(handle)) {
+            const timeout: u32 = if (timeout_ms < 0) windows.INFINITE else @intCast(timeout_ms);
+            return switch (windows.WaitForSingleObject(handle, timeout)) {
+                windows.WAIT_OBJECT_0 => true,
+                windows.WAIT_TIMEOUT => false,
+                else => false,
+            };
+        }
+        var available: u32 = 0;
+        if (windows.PeekNamedPipe(handle, null, 0, null, &available, null) == 0) return true;
+        return available > 0;
+    }
+    if (builtin.os.tag == .wasi) return true;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&fds, timeout_ms);
+    if (ready == 0) return false;
+    return (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0;
+}
+
+/// Reports whether `data` can be consumed from a console, pipe, or file
+/// without blocking. Used to drain pending terminal input during teardown.
+pub fn hasPendingInput(handle: std.Io.File.Handle) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = @import("windows_sys.zig");
+        if (windows.isConsoleHandle(handle)) {
+            var read: u32 = 0;
+            if (windows.GetNumberOfConsoleInputEvents(handle, &read) == 0) return false;
+            return read > 0;
+        }
+        var available: u32 = 0;
+        if (windows.PeekNamedPipe(handle, null, 0, null, &available, null) == 0) return false;
+        return available > 0;
+    }
+    var fds = [_]std.posix.pollfd{.{
+        .fd = handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    _ = std.posix.poll(&fds, 0) catch return false;
+    return (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0;
+}
+
+/// The running process identifier. Windows has no `getpid(2)`, so the PID
+/// comes from the kernel interface instead.
+pub fn currentProcessId() u64 {
+    if (comptime builtin.os.tag == .windows) {
+        return @import("windows_sys.zig").GetCurrentProcessId();
+    }
+    return @intCast(std.c.getpid());
+}
 
 pub const VerifiedDir = struct {
     dir: std.Io.Dir,
@@ -608,18 +789,31 @@ fn validateRelativeLeaf(name: []const u8) !void {
 fn verifyPrivateRegularFile(file: std.Io.File) !void {
     const stat = try file.stat(getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsArePrivateFile(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) return error.PrivateStatePermissionsUnsupported;
+    if (!permissionsArePrivateDir(stat.permissions)) return error.PrivateStatePermissionsUnsupported;
 }
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
-pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
+
+/// Windows has no directory fsync, so every platform reports the same names
+/// and callers already handle `OperationUnsupported`.
+pub const SyncVerifiedDirError = error{
+    OperationUnsupported,
+    InputOutput,
+    AccessDenied,
+    NoSpaceLeft,
+    DiskQuota,
+    ReadOnlyFileSystem,
+    DirectorySyncFailed,
+    Unexpected,
+};
+pub fn syncVerifiedDir(dir: std.Io.Dir) SyncVerifiedDirError!void {
     if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
     while (true) {
         const rc = std.c.fsync(dir.handle);
@@ -700,7 +894,7 @@ fn validateReplaceTarget(dir: std.Io.Dir, name: []const u8) !void {
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+    if (!permissionsAreWritable(stat.permissions)) return error.AccessDenied;
 }
 
 fn cleanupVerifiedTemp(dir: std.Io.Dir, name: []const u8) void {
@@ -770,7 +964,7 @@ pub fn durableReplaceVerifiedWithOps(
         return error.DurableReplacePostRenameFailed;
     };
     if (final_stat.kind != .file or final_stat.nlink != 1 or
-        final_stat.permissions.toMode() & 0o777 != 0o600)
+        !permissionsArePrivateFile(final_stat.permissions))
     {
         return error.DurableReplacePostRenameFailed;
     }
@@ -903,7 +1097,7 @@ pub fn copyFileAtomic(alloc: std.mem.Allocator, source_path: []const u8, dest_pa
     const stat = try source.stat(zio);
     if (stat.kind != .file) return error.NotRegularFile;
     if (existingFilePermissions(dest_path)) |existing_permissions| {
-        if (existing_permissions.toMode() & 0o222 == 0) return error.AccessDenied;
+        if (!permissionsAreWritable(existing_permissions)) return error.AccessDenied;
     }
 
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp.{d}", .{ dest_path, nanoTimestamp() });
@@ -959,7 +1153,8 @@ pub fn makeDirRecursive(path: []const u8) !void {
     }
 }
 
-pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) RealpathError![]u8 {
+    if (comptime builtin.os.tag == .windows) return realpathAllocWindows(alloc, path);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -982,6 +1177,22 @@ pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = @import("windows_sys.zig");
+        const required = windows.GetFinalPathNameByHandleW(handle, null, 0, windows.VOLUME_NAME_DOS);
+        if (required == 0) return error.HandlePathUnavailable;
+        const buf = try alloc.alloc(u16, required + 1);
+        defer alloc.free(buf);
+        const written = windows.GetFinalPathNameByHandleW(handle, buf.ptr, required + 1, windows.VOLUME_NAME_DOS);
+        if (written == 0 or written > required) return error.HandlePathUnavailable;
+        const resolved = try std.unicode.utf16LeToUtf8Alloc(alloc, buf[0..written]);
+        if (std.mem.startsWith(u8, resolved, "\\\\?\\")) {
+            const trimmed = resolved[4..];
+            @memcpy(resolved[0..trimmed.len], trimmed);
+            return resolved[0..trimmed.len];
+        }
+        return resolved;
+    }
     if (comptime builtin.os.tag == .macos or builtin.os.tag == .ios) {
         // F_GETPATH (macOS fcntl command 50): resolve filesystem path for an fd.
         var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
@@ -999,6 +1210,88 @@ fn handlePathAlloc(alloc: std.mem.Allocator, handle: std.Io.File.Handle) ![]u8 {
         return error.HandlePathUnavailable;
     }
 }
+
+/// `GetFullPathNameW` makes the path absolute and lexical-normalized, then the
+/// handle round trip resolves reparse points so a junction is reported by its
+/// target the way `realpath` resolves a symlink on POSIX.
+fn realpathAllocWindows(alloc: std.mem.Allocator, path: []const u8) RealpathError![]u8 {
+    const windows = @import("windows_sys.zig");
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidUtf8 => return error.BadPathName,
+    };
+    defer alloc.free(wide);
+
+    const required = windows.GetFullPathNameW(wide.ptr, 0, null, null);
+    if (required == 0) return windowsPathError(windows.GetLastError());
+    if (required >= windows.MAX_PATH_CHARS) return error.NameTooLong;
+
+    const wide_buf = try alloc.allocSentinel(u16, required + 1, 0);
+    defer alloc.free(wide_buf);
+    const written = windows.GetFullPathNameW(wide.ptr, required + 1, wide_buf.ptr, null);
+    if (written == 0 or written >= required + 1) return windowsPathError(windows.GetLastError());
+
+    const handle = windows.CreateFileW(
+        wide_buf.ptr,
+        windows.GENERIC_READ,
+        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
+        null,
+        windows.OPEN_EXISTING,
+        windows.FILE_FLAG_BACKUP_SEMANTICS,
+        null,
+    );
+    if (handle == windows.INVALID_HANDLE_VALUE) return windowsPathError(windows.GetLastError());
+    defer _ = windows.CloseHandle(handle);
+
+    const final_required = windows.GetFinalPathNameByHandleW(handle, null, 0, windows.VOLUME_NAME_DOS);
+    if (final_required == 0) return windowsPathError(windows.GetLastError());
+    const final_buf = try alloc.alloc(u16, final_required + 1);
+    defer alloc.free(final_buf);
+    const final_written = windows.GetFinalPathNameByHandleW(handle, final_buf.ptr, final_required + 1, windows.VOLUME_NAME_DOS);
+    if (final_written == 0 or final_written > final_required) return windowsPathError(windows.GetLastError());
+
+    const resolved = std.unicode.utf16LeToUtf8Alloc(alloc, final_buf[0..final_written]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.DanglingSurrogateHalf, error.ExpectedSecondSurrogateHalf, error.UnexpectedSecondSurrogateHalf => return error.BadPathName,
+    };
+    // `\\?\` is a Win32 namespace prefix, not part of the path the rest of the
+    // product compares against.
+    if (std.mem.startsWith(u8, resolved, "\\\\?\\")) {
+        const trimmed = resolved[4..];
+        @memcpy(resolved[0..trimmed.len], trimmed);
+        return resolved[0..trimmed.len];
+    }
+    return resolved;
+}
+
+fn windowsPathError(code: u32) RealpathError {
+    return switch (code) {
+        1 => error.PermissionDenied,
+        2 => error.FileNotFound,
+        3 => error.NotDir,
+        5 => error.AccessDenied,
+        206 => error.NameTooLong,
+        123 => error.BadPathName,
+        1117 => error.InputOutput,
+        14 => error.OutOfMemory,
+        else => error.Unexpected,
+    };
+}
+
+/// One error set for every platform, so callers of `realpathAlloc` see the
+/// same failures whichever host they were built for.
+pub const RealpathError = error{
+    FileNotFound,
+    NotDir,
+    AccessDenied,
+    PermissionDenied,
+    NameTooLong,
+    BadPathName,
+    SymLinkLoop,
+    InputOutput,
+    OutOfMemory,
+    Unexpected,
+};
 
 /// Returns absolute path evidence reported by an already-open regular file
 /// handle. The caller owns the returned path. Deleted or otherwise
@@ -1039,6 +1332,16 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
     } else if (comptime builtin.os.tag == .wasi) {
         if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
         return std.fs.path.resolve(alloc, &.{sub_path});
+    } else if (comptime builtin.os.tag == .windows) {
+        const dir_path = handlePathAlloc(alloc, dir.handle) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.FileNotFound,
+        };
+        if (sub_path.len == 0) return dir_path;
+        defer alloc.free(dir_path);
+        const joined = try std.fs.path.join(alloc, &.{ dir_path, sub_path });
+        defer alloc.free(joined);
+        return realpathAlloc(alloc, joined);
     } else {
         @compileError("dirRealpathAlloc not implemented for this OS");
     }

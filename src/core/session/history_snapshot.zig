@@ -33,7 +33,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 
 pub const file_name = "history-cache.bin";
 
@@ -614,7 +614,7 @@ fn openCacheFile(dir: *io_mod.VerifiedDir, mode: std.Io.Dir.OpenFileOptions.Mode
     errdefer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.HistoryCacheUnsafe;
-    if (mode == .read_write and stat.permissions.toMode() & 0o777 != 0o600)
+    if (mode == .read_write and !io_mod.permissionsArePrivateFile(stat.permissions))
         return error.HistoryCachePermissionsUnsupported;
     return file;
 }
@@ -631,7 +631,7 @@ fn createCacheFile(dir: *io_mod.VerifiedDir) !std.Io.File {
     file.setPermissions(io_mod.getIo(), private_file_permissions) catch return error.HistoryCachePermissionsUnsupported;
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.HistoryCacheUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o600) return error.HistoryCachePermissionsUnsupported;
+    if (!io_mod.permissionsArePrivateFile(stat.permissions)) return error.HistoryCachePermissionsUnsupported;
     return file;
 }
 

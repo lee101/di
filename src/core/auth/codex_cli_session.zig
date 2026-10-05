@@ -61,7 +61,7 @@ pub fn load(alloc: Allocator) !?chatgpt_session.Session {
         debug_trace.logf("auth", "Codex CLI session load failed step=stat err={s}", .{@errorName(err)});
         return null;
     };
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.permissionsAreExposedToOthers(stat.permissions)) {
         debug_trace.logf("auth", "Codex CLI session load failed step=permissions err=InsecureAuthFile", .{});
         return null;
     }

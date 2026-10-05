@@ -2141,14 +2141,6 @@ pub fn Handlers(comptime App: type) type {
 
 const trace_transcript_max_line_bytes: usize = 300;
 
-fn traceFilePermissions() std.Io.File.Permissions {
-    const builtin = @import("builtin");
-    return switch (builtin.os.tag) {
-        .windows => .default_file,
-        else => std.Io.File.Permissions.fromMode(0o600),
-    };
-}
-
 fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
     const tmp_dir = io_mod.getenv("TMPDIR") orelse "/tmp";
     const trimmed = std.mem.trimEnd(u8, tmp_dir, "/");
@@ -2178,7 +2170,7 @@ fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
         var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{
             .truncate = false,
             .exclusive = true,
-            .permissions = traceFilePermissions(),
+            .permissions = io_mod.permissionsFromMode(0o600),
         }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -4748,9 +4740,7 @@ test "trace report file uses private randomized markdown path" {
     defer file.close(std.testing.io);
     const stat = try file.stat(std.testing.io);
     try std.testing.expectEqual(@as(u64, 6), stat.size);
-    if (@import("builtin").os.tag != .windows) {
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
-    }
+    try std.testing.expect(!io_mod.permissionsAreExposedToOthers(stat.permissions));
 }
 
 test "trace auth summary preserves missing and loaded status text" {

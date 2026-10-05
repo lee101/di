@@ -1128,7 +1128,7 @@ test "session inspection separates the caller's session from a new one" {
     );
 }
 
-fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) anyerror!ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => try captureLinuxSnapshot(alloc, pid),
         .macos => try captureMacOSSnapshot(pid),

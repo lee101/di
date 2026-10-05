@@ -209,7 +209,7 @@ pub fn capture(
         return .{ .invalid = @errorName(err) };
     };
     if (initial.kind != .file or initial.nlink != 1 or
-        initial.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.permissionsArePrivateFile(initial.permissions))
     {
         return .{ .invalid = "unsafe_initial_shape" };
     }
@@ -230,7 +230,7 @@ pub fn capture(
     const verified = file.stat(io_mod.getIo()) catch |err|
         return .{ .invalid = @errorName(err) };
     if (verified.kind != .file or verified.nlink != 1 or
-        verified.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.permissionsArePrivateFile(verified.permissions))
     {
         return .{ .invalid = "unsafe_verified_shape" };
     }
@@ -472,7 +472,7 @@ test "recovery copy classifies accounting without changing normal resume" {
     try std.testing.expectError(error.UnsupportedUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
     const file = try dir.dir.openFile(std.testing.io, sidecar_file, .{ .mode = .read_write });
     defer file.close(std.testing.io);
-    try file.setPermissions(std.testing.io, .fromMode(0o644));
+    try file.setPermissions(std.testing.io, io_mod.permissionsFromMode(0o644));
     try std.testing.expectError(error.InvalidUsageSidecar, has_recoverable_corruption(alloc, &dir, "session"));
 }
 
@@ -482,10 +482,10 @@ test "conversation accounting recovery refuses unsafe storage" {
     defer temp.cleanup();
     var verified = try openTestVerifiedDir(temp.dir);
     defer verified.close();
-    try temp.dir.createDir(std.testing.io, sidecar_file, .fromMode(0o700));
+    try temp.dir.createDir(std.testing.io, sidecar_file, io_mod.permissionsFromMode(0o700));
     try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
     try temp.dir.deleteDir(std.testing.io, sidecar_file);
-    var file = try temp.dir.createFile(std.testing.io, sidecar_file, .{ .permissions = .fromMode(0o644) });
+    var file = try temp.dir.createFile(std.testing.io, sidecar_file, .{ .permissions = io_mod.permissionsFromMode(0o644) });
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, "{corrupt but not private");
     try std.testing.expectError(error.InvalidUsageSidecar, loadConversation(alloc, &verified, "session", 10));
