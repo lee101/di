@@ -70,7 +70,7 @@ describe("warm user shell", () => {
     expect(r.stderr).toContain("hello-alias func:1 from-profile path");
     expect(r.stderr).toContain("hello-aliasfunc:2");
     expect(readFileSync(join(f.home, "profile-runs"), "utf8")).toBe("x");
-    expect(existsSync(join(f.home, ".fx", "cache", "shell-snapshot"))).toBe(true);
+    expect(existsSync(join(f.home, ".fx", "cache", "shell-snapshot"))).toBe(false);
   }, TIMEOUT);
 
   test("FX_SHELL_SNAPSHOT=0 keeps the per-command login shell", async () => {
@@ -82,7 +82,7 @@ describe("warm user shell", () => {
     expect(existsSync(join(f.home, ".fx", "cache", "shell-snapshot"))).toBe(false);
   }, TIMEOUT);
 
-  test("a second process reuses the cached snapshot without running the profile", async () => {
+  test("a second process captures its own startup state without a disk cache", async () => {
     const f = fixture();
     await runFx(["ask", "--yolo", "--no-color", "one"], { cwd: f.workspace, env: f.env, timeoutMs: TIMEOUT });
     expect(readFileSync(join(f.home, "profile-runs"), "utf8")).toBe("x");
@@ -97,6 +97,7 @@ describe("warm user shell", () => {
     };
     const r = await runFx(["ask", "--yolo", "--no-color", "two"], { cwd: f.workspace, env, timeoutMs: TIMEOUT });
     expect(r.stderr).toContain("hello-alias");
-    expect(readFileSync(join(f.home, "profile-runs"), "utf8")).toBe("x");
+    expect(readFileSync(join(f.home, "profile-runs"), "utf8")).toBe("xx");
+    expect(existsSync(join(f.home, ".fx", "cache", "shell-snapshot"))).toBe(false);
   }, TIMEOUT);
 });

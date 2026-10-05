@@ -42,7 +42,10 @@ async function runShape(request: Record<string, unknown>) {
     cwd: f.workspace,
     env: {
       HOME: f.home,
+      FX_PROVIDER: "gateway",
       AI_GATEWAY_API_KEY: "fake-shape-key",
+      OPENPATHS_API_KEY: undefined,
+      OPENROUTER_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: fake.baseUrl,

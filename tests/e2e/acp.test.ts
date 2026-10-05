@@ -61,7 +61,6 @@ import {
 
 const TIMEOUT = 30_000;
 const LIVE_TIMEOUT = 120_000;
-const TERMINAL_HOST_EXIT_TIMEOUT_MS = 20_000;
 const SEEDED_GATEWAY_TOKEN = "seeded-access-token";
 const TERMINAL_FIXTURE_SHELL = terminalFixtureShell();
 const MCP_STDIO_FIXTURE = join(
@@ -1041,16 +1040,6 @@ function createShortIsolatedRoot(prefix: string) {
     workspace: realpathSync(workspace),
     external: realpathSync(external),
   };
-}
-
-async function waitForTerminalHostExit(root: string): Promise<void> {
-  const identityPath = join(root, "home", ".fx", "terminal-host-v7", "host.json");
-  const deadline = Date.now() + TERMINAL_HOST_EXIT_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (!existsSync(identityPath)) return;
-    await Bun.sleep(25);
-  }
-  throw new Error(`terminal host did not exit for ${root}`);
 }
 
 function writeProjectOmissionFixture(root: ReturnType<typeof createIsolatedRoot>) {
@@ -2534,10 +2523,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: {
-            ...fakeGatewayEnv(root, gateway),
-            FX_TERMINAL_HOST_IDLE_MS: "200",
-          },
+          env: fakeGatewayEnv(root, gateway),
         });
         client.setPermissionOption("allow_once");
         await startCodeSession(client);
@@ -2560,10 +2546,68 @@ describe("acp: model-independent", () => {
         expect(toolResult).not.toContain("owner_authority");
         expect(toolResult).not.toContain("proof");
         expect(client.stderr).toBe("");
+        await client.close();
+        // The ACP process owned the terminal itself: no host daemon state.
+        expect(existsSync(join(root.root, "home", ".fx", "terminal-host-v7"))).toBe(false);
       } finally {
         await client?.close();
         gateway.stop();
-        await waitForTerminalHostExit(root.root);
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "ACP reports a shell snapshot fallback once on the triggering shell call",
+    async () => {
+      const root = createShortIsolatedRoot("fx-acp-snapshot-");
+      // A 9 MB alias exceeds the 8 MiB capture limit, while full startup still
+      // works. Both login shells read these files.
+      const startup =
+        "alias fxbig=\"$(head -c 9000000 /dev/zero | tr '\\0' x)\"\n" +
+        "alias fxsmall='printf ACP_FULL_STARTUP_ALIAS'\n";
+      writeFileSync(join(root.home, ".zshrc"), startup);
+      writeFileSync(join(root.home, ".bash_profile"), startup);
+      const run = (id: string) => fakeGatewayToolCall(id, "shell", {
+        request: { action: "run", cwd: root.workspace, command: "fxsmall", yield_time_ms: 30_000 },
+      });
+      const gateway = startFakeGateway([
+        run("acp_snapshot_1"),
+        run("acp_snapshot_2"),
+        finalText("ACP snapshot fallback complete"),
+      ]);
+      const notice = "shell snapshot unavailable (the captured state exceeded 8 MiB)";
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        client.setPermissionOption("allow_once");
+        await startCodeSession(client);
+        const result = await runPrompt(client, "Run the alias twice.", TIMEOUT);
+
+        expect(result.promptResult.result.stopReason).toBe("end_turn");
+        const updates = result.messages
+          .filter((message: any) => message.method === "session/update")
+          .map((message: any) => message.params.update);
+        const noticeUpdates = updates.filter((update: any) => JSON.stringify(update).includes(notice));
+        expect(noticeUpdates).toHaveLength(1);
+        expect(noticeUpdates[0].sessionUpdate).toBe("tool_call_update");
+        expect(noticeUpdates[0].toolCallId).toBe("acp_snapshot_1");
+        expect(
+          updates.some((update: any) =>
+            update.sessionUpdate === "agent_message_chunk" && JSON.stringify(update).includes(notice)
+          ),
+        ).toBe(false);
+        expect(acpToolResultText(gateway.requests[1]!.body, "acp_snapshot_1")).toContain(notice);
+        const second = acpToolResultText(gateway.requests[2]!.body, "acp_snapshot_2");
+        expect(second).toContain("ACP_FULL_STARTUP_ALIAS");
+        expect(second).not.toContain(notice);
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     },
@@ -6821,7 +6865,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "image prompts over both the byte and pixel limits are downscaled",
+    "ACP retains an oversized image and gives the model recovery guidance",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-oversized-");
       const image = paddedPng(solidPng(3420, 2224), 6_000_000);
@@ -6840,7 +6884,7 @@ describe("acp: model-independent", () => {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),
         });
-        await startCodeSession(client);
+        const sessionId = await startCodeSession(client);
         const prompted = await runPromptBlocks(
           client,
           [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }],
@@ -6848,12 +6892,18 @@ describe("acp: model-independent", () => {
         );
         expect(prompted.promptResult.result.stopReason).toBe("end_turn");
         expect(gateway.requests).toHaveLength(1);
-        const files = acpGatewayRequest(gateway.requests[0]!.body).prompt
+        const body = gateway.requests[0]!.body;
+        const files = acpGatewayRequest(body).prompt
           .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
           .filter((part) => part.type === "file");
-        expect(files).toHaveLength(1);
-        expect(files[0]!.mediaType).toBe("image/png");
-        expect(pngPixelSize(Buffer.from(files[0]!.data.data, "base64"))).toEqual({ width: 2000, height: 1301 });
+        expect(files).toHaveLength(0);
+        expect(body).toContain("3420x2224 pixels");
+        expect(body).toContain("5 MiB encoded per image");
+        expect(body).toContain("The original is saved at ");
+        const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
+        const snapshots = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshots).toHaveLength(1);
+        expect(readFileSync(join(imageDir, snapshots[0]!))).toEqual(image);
       } finally {
         await client?.close();
         gateway.stop();
@@ -6939,7 +6989,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "inline image above the portable encoded limit fails before effects",
+    "inline image above the encoded limit is withheld and ACP stays usable",
     async () => {
       const root = createIsolatedRoot("fx-acp-inline-image-limit-");
       const maxEncodedImageBytes = 5 * 1024 * 1024;
@@ -6949,7 +6999,7 @@ describe("acp: model-independent", () => {
       const imageData = oversized.toString("base64");
       expect(Buffer.byteLength(imageData)).toBe(maxEncodedImageBytes + 4);
       const gateway = startFakeGateway(
-        [finalText("ACP image size recovery complete")],
+        [finalText("ACP image deferred"), finalText("ACP image size recovery complete")],
         {
           models: [{
             id: FAKE_GATEWAY_MODEL,
@@ -6977,22 +7027,28 @@ describe("acp: model-independent", () => {
           },
         });
 
-        const rejected = await readResponse(client, 99, LIVE_TIMEOUT);
-        expect(rejected.error).toEqual({
-          code: -32602,
-          message: "Image prompt exceeds size limit",
-        });
-        expect(gateway.requests).toHaveLength(0);
+        const prompted = await readResponse(client, 99, LIVE_TIMEOUT);
+        expect(prompted.result?.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const body = gateway.requests[0]!.body;
+        expect(body).toContain("dimensions could not be verified");
+        expect(body).toContain("The original is saved at ");
+        const files = acpGatewayRequest(body).prompt
+          .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
+          .filter((part) => part.type === "file");
+        expect(files).toHaveLength(0);
         const imageDir = join(root.home, ".fx", "sessions", sessionId, "images");
-        if (existsSync(imageDir)) expect(readdirSync(imageDir)).toEqual([]);
+        const snapshots = readdirSync(imageDir).filter((name) => name.endsWith(".bin"));
+        expect(snapshots).toHaveLength(1);
+        expect(readFileSync(join(imageDir, snapshots[0]!))).toEqual(oversized);
 
         const recovered = await runPrompt(
           client,
-          "Confirm the ACP connection remains usable after image size rejection.",
+          "Confirm the ACP connection remains usable after image deferral.",
           TIMEOUT,
         );
         expect(recovered.promptResult.result.stopReason).toBe("end_turn");
-        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests).toHaveLength(2);
         expect(client.stderr).toBe("");
       } finally {
         await client?.close();

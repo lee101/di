@@ -41,7 +41,6 @@ TRAINING_E2E_TESTS = (
     "mcp-stdio.test.ts",
     "mcp-auth.test.ts",
     "session-recovery.test.ts",
-    "terminal-host.test.ts",
     "tui-startup.test.ts",
     "permission-errors.test.ts",
     "tui-resize.test.ts",
@@ -57,9 +56,13 @@ TRAINING_E2E_TESTS = (
     "read-tool-result.test.ts",
     "mcp-failure-modes.test.ts",
     "context-files.test.ts",
+    "warm-shell.test.ts",
 )
 
 VERIFICATION_E2E_TESTS = (
+    "goal-mode.test.ts",
+    "storage.test.ts",
+    "tui-goal.test.ts",
     "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
     "sessions-v2.test.ts",
@@ -384,7 +387,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(42, len(corpus.scenarios))
-        self.assertEqual(70, len(corpus.candidate_scenarios))
+        self.assertEqual(73, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,

@@ -72,6 +72,7 @@ pub const SlashKind = enum {
     notifications,
     workspace,
     goal,
+    shell,
     version,
 };
 

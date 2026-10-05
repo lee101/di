@@ -5527,7 +5527,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_E2E_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
-        FX_TRACE_SCOPES: "tool",
+        FX_TRACE_SCOPES: "tool,core",
       };
       session = await TmuxSession.create({
         cwd: workspace,
@@ -5588,6 +5588,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(trace).toContain(
         `event=execution_start turn_id=1 step_id=1 call_id=${supportedCallId} name=shell`,
       );
+      // The startup-file snapshot must capture while fx owns the terminal;
+      // a capture that shares the terminal stops on job control.
+      expect(trace).toContain("shell snapshot ready");
       expect(existsSync(tapePath)).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 

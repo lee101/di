@@ -113,13 +113,14 @@ Shipped:
 
 1. Command output batching in `di ask` (`cli_ask.zig`): chunks are coalesced up to 16 KB or 50 ms
    and flushed before any other stderr write and at tool completion.
-2. Warm user shell (`src/core/terminal/login_snapshot.zig`, hooked in `command_runner.zig`): the
-   `bash --login` result (aliases, functions, shopt, exported-environment delta with PATH edits
-   applied around the caller's PATH) is captured once and cached in `~/.fx/cache/shell-snapshot`
-   (key: shell, HOME/USER/LANG, startup file mtimes; 12 h TTL; reused across processes). Later
-   commands run `env ... BASH_ENV=<snapshot> bash --noprofile -O expand_aliases -c`. Any failure
-   falls back to the login shell; `FX_SHELL_SNAPSHOT=0` disables it; zsh is unchanged. Not captured:
-   non-exported shell variables and `set -o` options.
+2. User shell startup snapshots now use `src/core/terminal/shell_snapshot.zig`, called from
+   `command_runner.zig`. Bash and zsh state stays in memory for one process, rather than in
+   `~/.fx/cache/shell-snapshot`. Startup-file edits and `/shell reload` refresh the snapshot
+   and invalidate remembered shell approvals. Failed captures fall back to full startup;
+   `FX_SHELL_SNAPSHOT=0` requests full startup for each command.
+
+The following measurements describe the earlier persisted Bash snapshot implementation,
+not the per-process implementation merged from upstream on 2026-10-05.
 
 Results (30 calls per run unless noted):
 
