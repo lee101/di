@@ -1655,9 +1655,7 @@ fn executeRawInvocation(
     cwd: []const u8,
     invocation: *const shell_resolver.Invocation,
 ) !command_contract.RunCommandResult {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.InvalidCommandEnvironment;
-    }
+    if (builtin.os.tag == .wasi) return error.InvalidCommandEnvironment;
     const result = try executeProcessWithScript(
         scratch,
         cfg,

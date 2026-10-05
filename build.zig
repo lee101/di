@@ -72,9 +72,9 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            .omit_frame_pointer = false, // TMPDEBUG
-            .unwind_tables = null, // TMPDEBUG
-            .error_tracing = true, // TMPDEBUG
+            .omit_frame_pointer = true,
+            .unwind_tables = .none,
+            .error_tracing = false,
             .strip = optimize != .Debug,
         }),
     });

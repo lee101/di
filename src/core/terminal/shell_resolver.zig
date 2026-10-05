@@ -17,7 +17,11 @@ pub const Environment = command_environment.Environment;
 const ShellKind = enum { bash, zsh };
 
 fn shellKind(path: []const u8) ?ShellKind {
-    const basename = std.fs.path.basename(path);
+    const full_basename = std.fs.path.basename(path);
+    const basename = if (builtin.os.tag == .windows and std.ascii.endsWithIgnoreCase(full_basename, ".exe"))
+        full_basename[0 .. full_basename.len - ".exe".len]
+    else
+        full_basename;
     if (std.mem.eql(u8, basename, "bash")) return .bash;
     if (std.mem.eql(u8, basename, "zsh")) return .zsh;
     return null;
@@ -103,7 +107,8 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .windows) return windowsLoginShellInto(buffer);
+    if (comptime !builtin.link_libc or builtin.os.tag == .wasi) {
         return null;
     }
     var entry: std.c.passwd = undefined;
@@ -122,6 +127,47 @@ pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
     if (shell.len == 0 or shell.len > buffer.len) return null;
     @memcpy(buffer[0..shell.len], shell);
     return buffer[0..shell.len];
+}
+
+/// Windows has no login shell record, so the shell is Git for Windows' bash:
+/// `DI_SHELL` when it names one, then the standard install locations, then
+/// `bash.exe` on `PATH`. The `bash.exe` in System32 and WindowsApps launches
+/// WSL rather than a Windows shell, so it is never chosen.
+fn windowsLoginShellInto(buffer: []u8) ?[]const u8 {
+    const io_mod = @import("../shared/io.zig");
+    if (io_mod.getenv("DI_SHELL")) |configured| {
+        if (std.fs.path.isAbsolute(configured) and shellKind(configured) != null) {
+            if (copyIfExists(buffer, &.{configured})) |path| return path;
+        }
+    }
+    const install_roots = [_][]const u8{ "ProgramW6432", "ProgramFiles", "LOCALAPPDATA" };
+    for (install_roots) |name| {
+        const root = io_mod.getenv(name) orelse continue;
+        const program_dir: []const u8 = if (std.mem.eql(u8, name, "LOCALAPPDATA")) "\\Programs\\Git\\bin\\bash.exe" else "\\Git\\bin\\bash.exe";
+        if (copyIfExists(buffer, &.{ root, program_dir })) |path| return path;
+    }
+    const search_path = io_mod.getenv("PATH") orelse return null;
+    var dirs = std.mem.tokenizeScalar(u8, search_path, ';');
+    while (dirs.next()) |dir| {
+        if (std.ascii.indexOfIgnoreCase(dir, "\\System32") != null) continue;
+        if (std.ascii.indexOfIgnoreCase(dir, "\\WindowsApps") != null) continue;
+        if (copyIfExists(buffer, &.{ std.mem.trimEnd(u8, dir, "\\"), "\\bash.exe" })) |path| return path;
+    }
+    return null;
+}
+
+fn copyIfExists(buffer: []u8, parts: []const []const u8) ?[]const u8 {
+    const io_mod = @import("../shared/io.zig");
+    var len: usize = 0;
+    for (parts) |part| {
+        if (len + part.len > buffer.len) return null;
+        @memcpy(buffer[len..][0..part.len], part);
+        len += part.len;
+    }
+    const path = buffer[0..len];
+    if (!std.fs.path.isAbsolute(path)) return null;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return null;
+    return path;
 }
 
 pub fn environment(
@@ -202,7 +248,7 @@ pub fn capturedInvocation(
         },
         .user => |path| {
             var invocation = try resolve(path, .user_login);
-            if (std.mem.eql(u8, std.fs.path.basename(path), "bash")) {
+            if (shellKind(path) == .bash) {
                 removeInteractiveFlag(&invocation);
                 invocation.append("-O");
                 invocation.append("expand_aliases");

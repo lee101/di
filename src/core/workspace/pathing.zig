@@ -498,17 +498,17 @@ fn traverseBoundedAbsoluteFileTarget(
     }
 
     const absolute = pending_scratch[0..pending_path_len];
-    path_scratch[0] = std.fs.path.sep;
-    var path_len: usize = 1;
+    var path_len = try writeAbsoluteRoot(path_scratch, absolute);
+    const root = path_scratch[0..path_len];
     var component_count: usize = 0;
     const workspace_target = pathInside(workspace_root, absolute);
-    var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, "/"))
-        1
+    var workspace_anchor_end: ?usize = if (workspace_target and std.mem.eql(u8, workspace_root, root))
+        path_len
     else
         null;
 
     const zio = io_mod.getIo();
-    var current_dir = std.Io.Dir.openDirAbsolute(zio, "/", .{ .follow_symlinks = false }) catch |err| {
+    var current_dir = std.Io.Dir.openDirAbsolute(zio, root, .{ .follow_symlinks = false }) catch |err| {
         return mapDirOpenError(err);
     };
     defer current_dir.close(zio);
@@ -643,14 +643,14 @@ fn resolveBoundedIntermediateSymlink(
     if (link_len == 0) return error.InvalidPath;
 
     const link_target = pending_scratch[0..link_len];
-    var resolved_len: usize = if (std.fs.path.isAbsolute(link_target)) absolute: {
-        if (output_scratch.len == 0) return error.InvalidPath;
-        output_scratch[0] = std.fs.path.sep;
-        break :absolute 1;
-    } else parent_path_end;
+    const link_root_len = absoluteRootLen(link_target);
+    var resolved_len: usize = if (link_root_len > 0)
+        try writeAbsoluteRoot(output_scratch, link_target)
+    else
+        parent_path_end;
 
     if (resolved_len > output_scratch.len) return error.InvalidPath;
-    try normalizeRelativePathPartInto(output_scratch, &resolved_len, link_target);
+    try normalizeRelativePathPartInto(output_scratch, &resolved_len, link_target[link_root_len..]);
     try normalizeRelativePathPartInto(
         output_scratch,
         &resolved_len,
@@ -666,18 +666,18 @@ const PathComponentIterator = struct {
     fn init(path: []const u8) PathComponentIterator {
         return .{
             .path = path,
-            .index = if (path.len > 0 and path[0] == std.fs.path.sep) 1 else 0,
+            .index = absoluteRootLen(path),
         };
     }
 
     fn next(self: *PathComponentIterator) ?[]const u8 {
-        while (self.index < self.path.len and self.path[self.index] == std.fs.path.sep) {
+        while (self.index < self.path.len and isPathSep(self.path[self.index])) {
             self.index += 1;
         }
         if (self.index >= self.path.len) return null;
 
         const start = self.index;
-        while (self.index < self.path.len and self.path[self.index] != std.fs.path.sep) {
+        while (self.index < self.path.len and !isPathSep(self.path[self.index])) {
             self.index += 1;
         }
         const end = self.index;
@@ -705,13 +705,55 @@ fn boundedResolution(
     };
 }
 
+const is_windows = builtin_mod.os.tag == .windows;
+
+fn isPathSep(byte: u8) bool {
+    return byte == std.fs.path.sep or (is_windows and byte == '/');
+}
+
+/// Length of the filesystem root that begins an absolute path: `/` on POSIX;
+/// `C:\` or `\\server\share\` on Windows. Zero when `path` has none. A UNC
+/// root without a trailing separator is the whole path.
+fn absoluteRootLen(path: []const u8) usize {
+    if (!is_windows) return if (path.len > 0 and path[0] == '/') 1 else 0;
+    if (path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and isPathSep(path[2])) return 3;
+    if (path.len < 2 or !isPathSep(path[0]) or !isPathSep(path[1])) return 0;
+    var index: usize = 2;
+    for (0..2) |_| {
+        const start = index;
+        while (index < path.len and !isPathSep(path[index])) index += 1;
+        if (index == start) return 0;
+        if (index < path.len) index += 1;
+    }
+    return index;
+}
+
+/// Writes the canonical root of absolute `raw_path` into `scratch`: `/` on
+/// POSIX; an upper-case drive or a `\\server\share\` prefix with native
+/// separators on Windows. Returns the root length.
+fn writeAbsoluteRoot(scratch: []u8, raw_path: []const u8) FileTargetResolveError!usize {
+    const root_len = absoluteRootLen(raw_path);
+    if (root_len == 0) return error.InvalidPath;
+    if (root_len > scratch.len) return error.InvalidPath;
+    for (raw_path[0..root_len], scratch[0..root_len]) |byte, *out| {
+        out.* = if (isPathSep(byte)) std.fs.path.sep else byte;
+    }
+    if (is_windows and raw_path[1] == ':') scratch[0] = std.ascii.toUpper(scratch[0]);
+    // A bare UNC share root gains its trailing separator.
+    if (!isPathSep(scratch[root_len - 1])) {
+        if (root_len == scratch.len) return error.InvalidPath;
+        scratch[root_len] = std.fs.path.sep;
+        return root_len + 1;
+    }
+    return root_len;
+}
+
 fn normalizeAbsolutePathInto(scratch: []u8, raw_path: []const u8) FileTargetResolveError![]const u8 {
     if (!std.fs.path.isAbsolute(raw_path)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.fs.path.sep;
-    var len: usize = 1;
-    try normalizeRelativePathPartInto(scratch, &len, raw_path);
+    var len = try writeAbsoluteRoot(scratch, raw_path);
+    try normalizeRelativePathPartInto(scratch, &len, raw_path[absoluteRootLen(raw_path)..]);
     return scratch[0..len];
 }
 
@@ -723,9 +765,8 @@ fn normalizeBaseRelativePathInto(
     if (!std.fs.path.isAbsolute(base_abs)) return error.InvalidPath;
     if (scratch.len == 0) return error.InvalidPath;
 
-    scratch[0] = std.fs.path.sep;
-    var len: usize = 1;
-    try normalizeRelativePathPartInto(scratch, &len, base_abs);
+    var len = try writeAbsoluteRoot(scratch, base_abs);
+    try normalizeRelativePathPartInto(scratch, &len, base_abs[absoluteRootLen(base_abs)..]);
     try normalizeRelativePathPartInto(scratch, &len, relative_path);
     return scratch[0..len];
 }
@@ -737,13 +778,13 @@ fn normalizeRelativePathPartInto(
 ) FileTargetResolveError!void {
     var index: usize = 0;
     while (index < raw_path.len) {
-        while (index < raw_path.len and raw_path[index] == std.fs.path.sep) {
+        while (index < raw_path.len and isPathSep(raw_path[index])) {
             index += 1;
         }
         if (index >= raw_path.len) return;
 
         const start = index;
-        while (index < raw_path.len and raw_path[index] != std.fs.path.sep) : (index += 1) {
+        while (index < raw_path.len and !isPathSep(raw_path[index])) : (index += 1) {
             if (raw_path[index] == 0) return error.InvalidPath;
         }
         const component = raw_path[start..index];
@@ -759,13 +800,14 @@ fn normalizeRelativePathPartInto(
 }
 
 fn popNormalizedPathComponent(path: []const u8, path_len: *usize) void {
-    if (path_len.* <= 1) return;
+    const root_len = absoluteRootLen(path[0..path_len.*]);
+    if (path_len.* <= root_len) return;
 
     var index = path_len.* - 1;
-    while (index > 0 and path[index] != std.fs.path.sep) {
+    while (index > root_len and path[index] != std.fs.path.sep) {
         index -= 1;
     }
-    path_len.* = if (index == 0) 1 else index;
+    path_len.* = if (index <= root_len) root_len else index;
 }
 
 fn appendBoundedPathComponent(
@@ -777,7 +819,7 @@ fn appendBoundedPathComponent(
         return error.InvalidPath;
     }
 
-    const needs_separator = path_len.* > 1;
+    const needs_separator = path_len.* > 0 and scratch[path_len.* - 1] != std.fs.path.sep;
     const required_len = path_len.* + component.len + @intFromBool(needs_separator);
     if (required_len > scratch.len) return error.InvalidPath;
 
@@ -1096,10 +1138,12 @@ pub fn workspaceRelativePath(
 pub fn ensureParentDirectories(path_abs: []const u8) !void {
     const parent = std.fs.path.dirname(path_abs) orelse return;
 
-    var root = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), "/", .{});
+    const root_len = absoluteRootLen(parent);
+    if (root_len == 0) return error.InvalidPath;
+    var root = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent[0..root_len], .{});
     defer root.close(io_mod.getIo());
 
-    const relative_to_root = std.mem.trimStart(u8, parent, "/");
+    const relative_to_root = parent[root_len..];
     if (relative_to_root.len == 0) return;
     try root.createDirPath(io_mod.getIo(), relative_to_root);
 }
@@ -2310,4 +2354,21 @@ test "ensureParentDirectories creates missing absolute parent directories" {
 
     var parent = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), parent_path, .{});
     parent.close(io_mod.getIo());
+}
+
+test "absolute roots follow the host path syntax" {
+    var scratch: [64]u8 = undefined;
+    if (comptime builtin_mod.os.tag == .windows) {
+        try std.testing.expectEqual(@as(usize, 3), absoluteRootLen("c:/work"));
+        try std.testing.expectEqual(@as(usize, 0), absoluteRootLen("work"));
+        try std.testing.expectEqual(@as(usize, 13), absoluteRootLen("\\\\host\\share\\x"));
+        try std.testing.expectEqualStrings("C:\\work\\a.txt", try normalizeAbsolutePathInto(&scratch, "c:/work/./b/../a.txt"));
+        try std.testing.expectEqualStrings("C:\\", try normalizeAbsolutePathInto(&scratch, "C:\\work\\.."));
+        try std.testing.expectEqualStrings("\\\\host\\share\\x", try normalizeAbsolutePathInto(&scratch, "//host/share/x"));
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), absoluteRootLen("/work"));
+        try std.testing.expectEqual(@as(usize, 0), absoluteRootLen("work"));
+        try std.testing.expectEqualStrings("/work/a.txt", try normalizeAbsolutePathInto(&scratch, "/work/./b/../a.txt"));
+        try std.testing.expectEqualStrings("/", try normalizeAbsolutePathInto(&scratch, "/work/.."));
+    }
 }
