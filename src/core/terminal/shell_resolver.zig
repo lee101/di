@@ -43,7 +43,7 @@ pub const Invocation = struct {
         return self.values[0..self.len];
     }
 
-    fn append(self: *Invocation, value: []const u8) void {
+    pub fn append(self: *Invocation, value: []const u8) void {
         self.values[self.len] = value;
         self.len += 1;
     }

@@ -87,6 +87,13 @@ pub fn build(b: *std.Build) void {
     const install_fx = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
     b.getInstallStep().dependOn(&install_fx.step);
 
+    // A sibling zash executable lets captured commands run with in-process
+    // utilities; command_runner falls back to sh when it is absent.
+    if (b.option([]const u8, "zash-bin", "Path of a zash executable to install next to di")) |zash_bin| {
+        const install_zash = b.addInstallBinFile(.{ .cwd_relative = zash_bin }, "zash");
+        b.getInstallStep().dependOn(&install_zash.step);
+    }
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {

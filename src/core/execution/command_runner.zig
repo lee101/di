@@ -14,6 +14,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
+const zash_shell = @import("zash_shell.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1850,6 +1851,24 @@ fn executeRawBashWithResultCommand(
         const argv = [_][]const u8{ "cmd", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
         return formatCollectedOutput(alloc, result_command, cwd, result);
+    }
+
+    if (zash_shell.eligible(execution_command)) {
+        var zash_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (zash_shell.locate(&zash_buf)) |zash_path| zash: {
+            var env_map = io_mod.cloneEnvironMap(scratch) catch break :zash;
+            env_map.put("ZASH_BASH_FALLBACK", "/bin/bash") catch break :zash;
+            const inv = zash_shell.invocation(zash_path, execution_command);
+            const result = try executeProcessWithScript(
+                scratch,
+                cfg,
+                inv.argv(),
+                cwd,
+                "",
+                &env_map,
+            );
+            return formatCollectedOutput(alloc, result_command, cwd, result);
+        }
     }
 
     const argv = [_][]const u8{
@@ -6316,4 +6335,33 @@ test "supervisor fallback force remains timeout dominant" {
     try std.testing.expect(returned_result == null);
     try std.testing.expect(delay.seen);
     try std.testing.expect(!absoluteFileExists(term_path));
+}
+
+test "zash shell integration matches the sh launcher output" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var zash_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const zash_path = zash_shell.locate(&zash_buf) orelse return error.SkipZigTest;
+    _ = zash_path;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const commands = [_][]const u8{
+        "printf 'b 2\\na 1\\nb 3\\n' | sort | cut -d' ' -f1 | uniq -c | head -n 5",
+        "echo out; echo err >&2; exit 3",
+        "echo a |",
+        "sleep 0 & wait; echo done",
+        "for i in 1 2 3; do echo $i; done | sed -n '2p'",
+    };
+    for (commands) |command| {
+        const cfg: Config = .{ .max_command_output_bytes = 1 << 20 };
+        const fast = try executeCommand(cfg, arena, command, "/tmp");
+        const set = struct {
+            extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+            extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+        };
+        _ = set.setenv(zash_shell.env_switch, "0", 1);
+        defer _ = set.unsetenv(zash_shell.env_switch);
+        const slow = try executeCommand(cfg, arena, command, "/tmp");
+        try std.testing.expectEqualStrings(slow.output, fast.output);
+    }
 }
