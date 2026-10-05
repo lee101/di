@@ -45,12 +45,11 @@ const LaunchOutcome = enum {
 const opener_wait_bound_ms = 250;
 const opener_reap_interval_ms = 10;
 
-var detached_opener_pid: ?std.posix.pid_t = null;
+var detached_opener_id: ?std.process.Child.Id = null;
 
 fn reapDetachedOpener() void {
-    const pid = detached_opener_pid orelse return;
-    var status: c_int = undefined;
-    if (std.c.waitpid(pid, &status, std.c.W.NOHANG) != 0) detached_opener_pid = null;
+    const id = detached_opener_id orelse return;
+    if (native.childHasExited(id)) detached_opener_id = null;
 }
 
 fn launchActual(_: *anyopaque, _: Allocator, argv: []const []const u8) anyerror!LaunchResult {
@@ -70,7 +69,7 @@ fn launchActual(_: *anyopaque, _: Allocator, argv: []const []const u8) anyerror!
         if (try native.try_reap_child_process(&child)) |term| return .{ .term = term };
         const now = std.Io.Clock.Timestamp.now(io, .awake);
         if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
-            detached_opener_pid = child.id.?;
+            detached_opener_id = child.id.?;
             return .{ .term = null };
         }
         try std.Io.sleep(io, .fromMilliseconds(opener_reap_interval_ms), .awake);
@@ -191,14 +190,19 @@ test "url opener detaches a hanging launcher without blocking" {
 
     try std.testing.expect(result.term == null);
     try std.testing.expect(elapsed_ms < 5000);
-    const pid = detached_opener_pid orelse return error.TestUnexpectedResult;
-    detached_opener_pid = null;
-    std.posix.kill(pid, .KILL) catch {};
+    const id = detached_opener_id orelse return error.TestUnexpectedResult;
+    detached_opener_id = null;
+    if (comptime builtin.os.tag == .windows) {
+        _ = io_mod.windowsSys().CloseHandle(id);
+        return;
+    }
+    std.posix.kill(id, .KILL) catch {};
     var status: c_int = undefined;
-    _ = std.c.waitpid(pid, &status, 0);
+    _ = std.c.waitpid(id, &status, 0);
 }
 
 test "url opener real launcher maps fast exit terms" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const ok_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
     const ok = try launchActual(undefined, alloc, &ok_argv);
@@ -207,10 +211,11 @@ test "url opener real launcher maps fast exit terms" {
     const bad_argv = [_][]const u8{ "/bin/sh", "-c", "exit 3" };
     const bad = try launchActual(undefined, alloc, &bad_argv);
     try std.testing.expectEqual(@as(?std.process.Child.Term, .{ .exited = 3 }), bad.term);
-    try std.testing.expect(detached_opener_pid == null);
+    try std.testing.expect(detached_opener_id == null);
 }
 
 test "url opener reaps a detached opener once it exits" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const io = io_mod.getIo();
     var child = try std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", "exit 0" },
@@ -218,13 +223,13 @@ test "url opener reaps a detached opener once it exits" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    detached_opener_pid = child.id.?;
+    detached_opener_id = child.id.?;
     child.id = null;
 
     var attempts: usize = 0;
-    while (detached_opener_pid != null and attempts < 500) : (attempts += 1) {
+    while (detached_opener_id != null and attempts < 500) : (attempts += 1) {
         reapDetachedOpener();
-        if (detached_opener_pid != null) try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+        if (detached_opener_id != null) try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     }
-    try std.testing.expect(detached_opener_pid == null);
+    try std.testing.expect(detached_opener_id == null);
 }

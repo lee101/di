@@ -182,7 +182,7 @@ test "legacy migration revalidates identity before signaling" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "background",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const background_path = try io_mod.dirRealpathAlloc(
         alloc,

@@ -389,18 +389,12 @@ const StdinManualCodeReader = struct {
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
         if (self.closed) return null;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, 0);
-        if (ready == 0 or
-            (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        const stdin = io_mod.stdinHandle();
+        if (!try io_mod.waitReadable(stdin, 0)) return null;
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
-        const read_len = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        const read_len = try io_mod.readHandle(stdin, &chunk);
         if (read_len == 0) {
             self.closed = true;
             return if (self.len == 0) null else self.buffer[0..self.len];

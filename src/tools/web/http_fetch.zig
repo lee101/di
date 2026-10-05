@@ -2,6 +2,7 @@ const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const url_policy = @import("url_policy.zig");
+const sock = @import("socket.zig");
 
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
@@ -411,14 +412,14 @@ fn cancelResolveSelect(alloc: Allocator, select: *std.Io.Select(ResolveSelect)) 
 
 const Dialer = struct {
     ctx: *anyopaque,
-    connect_fn: *const fn (*anyopaque, IpAddress, FetchOptions) anyerror!posix.fd_t,
+    connect_fn: *const fn (*anyopaque, IpAddress, FetchOptions) anyerror!sock.Handle,
 };
 
-fn connectDefaultDialer(_: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!posix.fd_t {
+fn connectDefaultDialer(_: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!sock.Handle {
     return connectPinned(address, options);
 }
 
-fn connectAdmitted(addresses: []const IpAddress, options: FetchOptions, dialer: Dialer) anyerror!posix.fd_t {
+fn connectAdmitted(addresses: []const IpAddress, options: FetchOptions, dialer: Dialer) anyerror!sock.Handle {
     if (addresses.len == 0) return error.NoAddressReturned;
 
     for (addresses, 0..) |address, index| {
@@ -467,7 +468,7 @@ fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options
     };
 }
 
-fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+fn fetchPlain(alloc: Allocator, fd: sock.Handle, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
     var writer: PlainDeadlineWriter = undefined;
     writer.init(fd, options);
     writeRequest(&writer.interface, target, options) catch |err| {
@@ -491,7 +492,7 @@ fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: F
     };
 }
 
-fn fetchTls(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+fn fetchTls(alloc: Allocator, fd: sock.Handle, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
     const zio = io_mod.getIo();
 
     var ca_bundle: std.crypto.Certificate.Bundle = .empty;
@@ -1221,136 +1222,60 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
     }
 }
 
-fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
+fn connectPinned(address: IpAddress, options: FetchOptions) !sock.Handle {
     try checkControl(options);
-    const family: posix.sa_family_t = switch (address) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
+    const family: sock.AddressFamily = switch (address) {
+        .ip4 => .ipv4,
+        .ip6 => .ipv6,
     };
     const fd = try openSocket(family);
     errdefer closeFd(fd);
 
-    var storage: PosixAddress = undefined;
-    const len = addressToPosix(address, &storage);
-    while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
-        .SUCCESS => return fd,
-        .INTR => {
-            try checkControl(options);
-            continue;
-        },
-        .INPROGRESS, .AGAIN, .ALREADY => {
-            try pollFd(fd, posix.POLL.OUT, options);
-            try checkSocketError(fd);
-            return fd;
-        },
-        else => |err| return classifyConnectErrno(err),
-    };
+    while (true) {
+        switch (sock.connect(fd, address)) {
+            .count => return fd,
+            .failure => |err| switch (err) {
+                .interrupted => {
+                    try checkControl(options);
+                    continue;
+                },
+                .connect_in_progress, .again => {
+                    try pollFd(fd, sock.POLL.OUT, options);
+                    try checkSocketError(fd);
+                    return fd;
+                },
+                else => return classifyConnectErrno(err),
+            },
+        }
+    }
 }
 
-fn classifyConnectErrno(err: posix.E) anyerror {
+fn classifyConnectErrno(err: sock.Errno) anyerror {
     return switch (err) {
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .TIMEDOUT => error.Timeout,
-        .NETUNREACH => error.NetworkUnreachable,
-        .HOSTUNREACH => error.HostUnreachable,
-        .NETDOWN => error.NetworkDown,
-        .NOBUFS, .NOMEM => error.SystemResources,
-        .BADF => error.InvalidDescriptor,
-        .CANCELED => error.Canceled,
-        .IO => error.InputOutput,
+        .connection_refused => error.ConnectionRefused,
+        .connection_reset, .broken_pipe => error.ConnectionResetByPeer,
+        .timed_out => error.Timeout,
+        .network_unreachable => error.NetworkUnreachable,
+        .host_unreachable => error.HostUnreachable,
+        .network_down => error.NetworkDown,
+        .system_resources => error.SystemResources,
+        .invalid_descriptor => error.InvalidDescriptor,
+        .canceled => error.Canceled,
+        .input_output => error.InputOutput,
         else => error.ConnectionFailed,
     };
 }
 
-const PosixAddress = extern union {
-    any: posix.sockaddr,
-    in: posix.sockaddr.in,
-    in6: posix.sockaddr.in6,
-};
-
-fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
-    return switch (address) {
-        .ip4 => |ip4| {
-            storage.in = .{
-                .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
-            };
-            return @sizeOf(posix.sockaddr.in);
-        },
-        .ip6 => |ip6| {
-            storage.in6 = .{
-                .port = std.mem.nativeToBig(u16, ip6.port),
-                .flowinfo = ip6.flow,
-                .addr = ip6.bytes,
-                .scope_id = ip6.interface.index,
-            };
-            return @sizeOf(posix.sockaddr.in6);
-        },
-    };
+fn openSocket(family: sock.AddressFamily) !sock.Handle {
+    return sock.open(family);
 }
 
-fn openSocket(family: posix.sa_family_t) !posix.fd_t {
-    const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
-            .INTR => continue,
-            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.SocketOpenFailed,
-        }
-    };
-    errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
-    return fd;
+fn checkSocketError(fd: sock.Handle) !void {
+    if (sock.connectFailure(fd)) |err| return classifyConnectErrno(err);
 }
 
-fn setCloexec(fd: posix.fd_t) !void {
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
-}
-
-fn setNonblocking(fd: posix.fd_t) !void {
-    const current = while (true) {
-        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-        switch (posix.errno(rc)) {
-            .SUCCESS => break rc,
-            .INTR => continue,
-            else => return error.SocketOptionFailed,
-        }
-    };
-    const current_flags: usize = @intCast(current);
-    const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-    const next: usize = current_flags | nonblock_flag;
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
-}
-
-fn checkSocketError(fd: posix.fd_t) !void {
-    var value: c_int = 0;
-    var len: std.c.socklen_t = @sizeOf(c_int);
-    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
-    if (value == 0) return;
-    const socket_error: posix.E = @enumFromInt(value);
-    return classifyConnectErrno(socket_error);
-}
-
-fn closeFd(fd: posix.fd_t) void {
-    while (true) switch (posix.errno(posix.system.close(fd))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
+fn closeFd(fd: sock.Handle) void {
+    sock.closeSocket(fd);
 }
 
 fn traceFailure(stage: FailureStage, err: anyerror) void {
@@ -1389,13 +1314,13 @@ const TlsDeadlineWriter = DeadlineWriter(tls_transport_buffer_len);
 
 fn DeadlineReader(comptime buffer_len: usize) type {
     return struct {
-        fd: posix.fd_t,
+        fd: sock.Handle,
         options: FetchOptions,
         buffer: [buffer_len]u8 = undefined,
         interface: std.Io.Reader = undefined,
         err: ?anyerror = null,
 
-        fn init(self: *@This(), fd: posix.fd_t, options: FetchOptions) void {
+        fn init(self: *@This(), fd: sock.Handle, options: FetchOptions) void {
             self.* = .{ .fd = fd, .options = options };
             self.interface = .{
                 .vtable = &.{
@@ -1445,13 +1370,13 @@ fn DeadlineReader(comptime buffer_len: usize) type {
 
 fn DeadlineWriter(comptime buffer_len: usize) type {
     return struct {
-        fd: posix.fd_t,
+        fd: sock.Handle,
         options: FetchOptions,
         buffer: [buffer_len]u8 = undefined,
         interface: std.Io.Writer = undefined,
         err: ?anyerror = null,
 
-        fn init(self: *@This(), fd: posix.fd_t, options: FetchOptions) void {
+        fn init(self: *@This(), fd: sock.Handle, options: FetchOptions) void {
             self.* = .{ .fd = fd, .options = options };
             self.interface = .{
                 .vtable = &.{
@@ -1489,25 +1414,15 @@ fn DeadlineWriter(comptime buffer_len: usize) type {
     };
 }
 
-const PollError = posix.PollError || error{Interrupted};
+const PollError = sock.PollError;
 
 const Poller = struct {
     ctx: ?*anyopaque,
-    poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
+    poll_fn: *const fn (?*anyopaque, []sock.PollFd, i32) PollError!usize,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
-    const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
-        return error.SystemResources;
-    const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .NETDOWN => error.NetworkDown,
-        .FAULT, .INVAL => unreachable,
-        else => |err| posix.unexpectedErrno(err),
-    };
+fn pollDefault(_: ?*anyopaque, fds: []sock.PollFd, timeout_ms: i32) PollError!usize {
+    return sock.poll(fds, timeout_ms);
 }
 
 const default_poller: Poller = .{
@@ -1522,19 +1437,18 @@ const SyscallErrorAction = union(enum) {
 
 const RawSyscallResult = union(enum) {
     count: usize,
-    failure: posix.E,
+    failure: sock.Errno,
 };
 
 const ReadSyscall = struct {
     ctx: ?*anyopaque,
-    read_fn: *const fn (?*anyopaque, posix.fd_t, []u8) RawSyscallResult,
+    read_fn: *const fn (?*anyopaque, sock.Handle, []u8) RawSyscallResult,
 };
 
-fn readDefault(_: ?*anyopaque, fd: posix.fd_t, buf: []u8) RawSyscallResult {
-    const rc = posix.system.read(fd, buf.ptr, buf.len);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => .{ .count = @intCast(rc) },
-        else => |err| .{ .failure = err },
+fn readDefault(_: ?*anyopaque, fd: sock.Handle, buf: []u8) RawSyscallResult {
+    return switch (sock.recvBytes(fd, buf)) {
+        .count => |count| .{ .count = count },
+        .failure => |err| .{ .failure = err },
     };
 }
 
@@ -1543,56 +1457,56 @@ const default_read_syscall: ReadSyscall = .{
     .read_fn = readDefault,
 };
 
-fn classifyReadErrno(err: posix.E) SyscallErrorAction {
+fn classifyReadErrno(err: sock.Errno) SyscallErrorAction {
     return switch (err) {
-        .AGAIN, .INTR => .retry,
-        .CONNRESET => .{ .failure = error.ConnectionResetByPeer },
-        .PIPE => .{ .failure = error.BrokenPipe },
-        .NOTCONN => .{ .failure = error.SocketUnconnected },
-        .NETDOWN => .{ .failure = error.NetworkDown },
-        .NOBUFS, .NOMEM => .{ .failure = error.SystemResources },
-        .IO => .{ .failure = error.InputOutput },
-        .BADF => .{ .failure = error.InvalidDescriptor },
-        .CANCELED => .{ .failure = error.Canceled },
-        .TIMEDOUT => .{ .failure = error.Timeout },
+        .again, .interrupted => .retry,
+        .connection_reset => .{ .failure = error.ConnectionResetByPeer },
+        .broken_pipe => .{ .failure = error.BrokenPipe },
+        .not_connected => .{ .failure = error.SocketUnconnected },
+        .network_down => .{ .failure = error.NetworkDown },
+        .system_resources => .{ .failure = error.SystemResources },
+        .input_output => .{ .failure = error.InputOutput },
+        .invalid_descriptor => .{ .failure = error.InvalidDescriptor },
+        .canceled => .{ .failure = error.Canceled },
+        .timed_out => .{ .failure = error.Timeout },
         else => .{ .failure = error.ReadFailed },
     };
 }
 
-fn classifyWriteErrno(err: posix.E) SyscallErrorAction {
+fn classifyWriteErrno(err: sock.Errno) SyscallErrorAction {
     return switch (err) {
-        .AGAIN, .INTR => .retry,
-        .CONNRESET => .{ .failure = error.ConnectionResetByPeer },
-        .PIPE => .{ .failure = error.BrokenPipe },
-        .NOTCONN => .{ .failure = error.SocketUnconnected },
-        .NETDOWN => .{ .failure = error.NetworkDown },
-        .NOBUFS, .NOMEM => .{ .failure = error.SystemResources },
-        .IO => .{ .failure = error.InputOutput },
-        .BADF => .{ .failure = error.InvalidDescriptor },
-        .CANCELED => .{ .failure = error.Canceled },
-        .TIMEDOUT => .{ .failure = error.Timeout },
+        .again, .interrupted => .retry,
+        .connection_reset => .{ .failure = error.ConnectionResetByPeer },
+        .broken_pipe => .{ .failure = error.BrokenPipe },
+        .not_connected => .{ .failure = error.SocketUnconnected },
+        .network_down => .{ .failure = error.NetworkDown },
+        .system_resources => .{ .failure = error.SystemResources },
+        .input_output => .{ .failure = error.InputOutput },
+        .invalid_descriptor => .{ .failure = error.InvalidDescriptor },
+        .canceled => .{ .failure = error.Canceled },
+        .timed_out => .{ .failure = error.Timeout },
         else => .{ .failure = error.WriteFailed },
     };
 }
 
-fn rawRead(fd: posix.fd_t, buf: []u8, options: FetchOptions) !usize {
+fn rawRead(fd: sock.Handle, buf: []u8, options: FetchOptions) !usize {
     return rawReadWith(fd, buf, options, default_poller, default_read_syscall);
 }
 
 fn rawReadWith(
-    fd: posix.fd_t,
+    fd: sock.Handle,
     buf: []u8,
     options: FetchOptions,
     poller: Poller,
     syscall: ReadSyscall,
 ) !usize {
     while (true) {
-        try pollFdWith(fd, posix.POLL.IN, options, poller);
+        try pollFdWith(fd, sock.POLL.IN, options, poller);
         switch (syscall.read_fn(syscall.ctx, fd, buf)) {
             .count => |count| return count,
             .failure => |err| switch (classifyReadErrno(err)) {
                 .retry => {
-                    if (err == .INTR) try checkControl(options);
+                    if (err == .interrupted) try checkControl(options);
                     continue;
                 },
                 .failure => |root| return root,
@@ -1601,42 +1515,38 @@ fn rawReadWith(
     }
 }
 
-fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
+fn rawWriteAll(fd: sock.Handle, bytes: []const u8, options: FetchOptions) !void {
     return rawWriteAllWith(fd, bytes, options, default_poller);
 }
 
-fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
+fn rawWriteAllWith(fd: sock.Handle, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
     var written: usize = 0;
     while (written < bytes.len) {
-        try pollFdWith(fd, posix.POLL.OUT, options, poller);
-        const rc = std.c.send(
-            fd,
-            bytes[written..].ptr,
-            bytes.len - written,
-            @intCast(posix.MSG.NOSIGNAL),
-        );
-        const errno = posix.errno(rc);
-        if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
-            .retry => {
-                if (errno == .INTR) try checkControl(options);
-                continue;
+        try pollFdWith(fd, sock.POLL.OUT, options, poller);
+        switch (sock.sendBytes(fd, bytes[written..])) {
+            .count => |n| {
+                if (n == 0) return error.UnexpectedClose;
+                written += n;
             },
-            .failure => |root| return root,
-        };
-        const n: usize = @intCast(rc);
-        if (n == 0) return error.UnexpectedClose;
-        written += n;
+            .failure => |err| switch (classifyWriteErrno(err)) {
+                .retry => {
+                    if (err == .interrupted) try checkControl(options);
+                    continue;
+                },
+                .failure => |root| return root,
+            },
+        }
     }
 }
 
-fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
+fn pollFd(fd: sock.Handle, events: u16, options: FetchOptions) !void {
     return pollFdWith(fd, events, options, default_poller);
 }
 
-fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
+fn pollFdWith(fd: sock.Handle, events: u16, options: FetchOptions, poller: Poller) !void {
     while (true) {
-        var fds = [_]posix.pollfd{.{
-            .fd = fd,
+        var fds = [_]sock.PollFd{.{
+            .handle = fd,
             .events = events,
             .revents = 0,
         }};
@@ -1656,35 +1566,30 @@ fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller
     }
 }
 
-fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
-    if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
+fn classifyPollEvents(fd: sock.Handle, events: u16, revents: u16) !void {
+    if ((revents & sock.POLL.NVAL) != 0) return error.InvalidDescriptor;
     if ((revents & events) != 0) return;
-    if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
-    if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
-    if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
+    if (events == sock.POLL.IN and (revents & sock.POLL.HUP) != 0) return;
+    if ((revents & sock.POLL.ERR) != 0) return pollSocketError(fd);
+    if ((revents & sock.POLL.HUP) != 0) return error.UnexpectedClose;
     return error.UnexpectedClose;
 }
 
-fn pollSocketError(fd: posix.fd_t) !void {
-    var value: c_int = 0;
-    var len: std.c.socklen_t = @sizeOf(c_int);
-    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
-        return error.UnexpectedClose;
-    if (value == 0) return error.UnexpectedClose;
-    const socket_error: posix.E = @enumFromInt(value);
-    return switch (socket_error) {
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .TIMEDOUT => error.Timeout,
-        .NETDOWN => error.NetworkDown,
-        .NETUNREACH => error.NetworkUnreachable,
-        .HOSTUNREACH => error.HostUnreachable,
-        .PIPE => error.BrokenPipe,
-        .NOTCONN => error.SocketUnconnected,
-        .NOBUFS, .NOMEM => error.SystemResources,
-        .IO => error.InputOutput,
-        .BADF => error.InvalidDescriptor,
-        .CANCELED => error.Canceled,
+fn pollSocketError(fd: sock.Handle) !void {
+    const failure = sock.connectFailure(fd) orelse return error.UnexpectedClose;
+    return switch (failure) {
+        .connection_refused => error.ConnectionRefused,
+        .connection_reset => error.ConnectionResetByPeer,
+        .timed_out => error.Timeout,
+        .network_down => error.NetworkDown,
+        .network_unreachable => error.NetworkUnreachable,
+        .host_unreachable => error.HostUnreachable,
+        .broken_pipe => error.BrokenPipe,
+        .not_connected => error.SocketUnconnected,
+        .system_resources => error.SystemResources,
+        .input_output => error.InputOutput,
+        .invalid_descriptor => error.InvalidDescriptor,
+        .canceled => error.Canceled,
         else => error.UnexpectedClose,
     };
 }
@@ -3413,7 +3318,7 @@ test "web_fetch transport traces stable stages and redact sensitive values" {
     };
     var scripted = ScriptedDialer{
         .errors = &.{ error.ConnectionRefused, error.NetworkUnreachable },
-        .returned_fds = &.{ -1, -1 },
+        .returned_fds = &.{ sock.invalid_handle, sock.invalid_handle },
     };
     try std.testing.expectError(error.NetworkUnreachable, connectAdmitted(
         &addresses,
@@ -3453,7 +3358,7 @@ test "web_fetch transport traces stable stages and redact sensitive values" {
 
 const ScriptedDialer = struct {
     errors: []const ?anyerror,
-    returned_fds: []const posix.fd_t,
+    returned_fds: []const sock.Handle,
     attempts: [4]IpAddress = undefined,
     deadlines: [4]?i64 = [_]?i64{null} ** 4,
     calls: usize = 0,
@@ -3464,7 +3369,7 @@ const ScriptedDialer = struct {
         return .{ .ctx = @ptrCast(self), .connect_fn = connect };
     }
 
-    fn connect(raw: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!posix.fd_t {
+    fn connect(raw: *anyopaque, address: IpAddress, options: FetchOptions) anyerror!sock.Handle {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const index = self.calls;
         self.calls += 1;
@@ -3493,7 +3398,7 @@ test "web_fetch admitted dialing preserves order and one shared deadline" {
     const deadline_ms = monotonicMillis() + 10_000;
     var scripted = ScriptedDialer{
         .errors = &.{ error.ConnectionRefused, null },
-        .returned_fds = &.{ -1, fds[0] },
+        .returned_fds = &.{ sock.invalid_handle, fds[0] },
     };
 
     const fd = try connectAdmitted(&addresses, .{
@@ -3517,7 +3422,7 @@ test "web_fetch admitted dialing stops on control and local resource failures" {
     var cancel_flag: std.atomic.Value(bool) = .init(false);
     var canceled = ScriptedDialer{
         .errors = &.{ error.ConnectionRefused, null },
-        .returned_fds = &.{ -1, -1 },
+        .returned_fds = &.{ sock.invalid_handle, sock.invalid_handle },
         .cancel_after_call = 1,
         .cancel_flag = &cancel_flag,
     };
@@ -3528,7 +3433,7 @@ test "web_fetch admitted dialing stops on control and local resource failures" {
 
     var resources = ScriptedDialer{
         .errors = &.{ error.SystemResources, null },
-        .returned_fds = &.{ -1, -1 },
+        .returned_fds = &.{ sock.invalid_handle, sock.invalid_handle },
     };
     try std.testing.expectError(error.SystemResources, connectAdmitted(
         &addresses,
@@ -3539,7 +3444,7 @@ test "web_fetch admitted dialing stops on control and local resource failures" {
 
     var expired = ScriptedDialer{
         .errors = &.{null},
-        .returned_fds = &.{-1},
+        .returned_fds = &.{sock.invalid_handle},
     };
     try std.testing.expectError(error.Timeout, connectAdmitted(&addresses, .{
         .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
@@ -3548,7 +3453,7 @@ test "web_fetch admitted dialing stops on control and local resource failures" {
 
     var exhausted = ScriptedDialer{
         .errors = &.{ error.ConnectionRefused, error.HostUnreachable },
-        .returned_fds = &.{ -1, -1 },
+        .returned_fds = &.{ sock.invalid_handle, sock.invalid_handle },
     };
     try std.testing.expectError(error.HostUnreachable, connectAdmitted(
         &addresses,
@@ -3566,21 +3471,20 @@ test "web_fetch admitted dialing stops on control and local resource failures" {
 
 test "web_fetch connect errno classification keeps terminal local failures out of fallback" {
     const cases = [_]struct {
-        errno: posix.E,
+        errno: sock.Errno,
         expected: anyerror,
         retryable: bool,
     }{
-        .{ .errno = .CONNREFUSED, .expected = error.ConnectionRefused, .retryable = true },
-        .{ .errno = .CONNRESET, .expected = error.ConnectionResetByPeer, .retryable = true },
-        .{ .errno = .TIMEDOUT, .expected = error.Timeout, .retryable = true },
-        .{ .errno = .NETUNREACH, .expected = error.NetworkUnreachable, .retryable = true },
-        .{ .errno = .HOSTUNREACH, .expected = error.HostUnreachable, .retryable = true },
-        .{ .errno = .NETDOWN, .expected = error.NetworkDown, .retryable = false },
-        .{ .errno = .NOBUFS, .expected = error.SystemResources, .retryable = false },
-        .{ .errno = .NOMEM, .expected = error.SystemResources, .retryable = false },
-        .{ .errno = .BADF, .expected = error.InvalidDescriptor, .retryable = false },
-        .{ .errno = .CANCELED, .expected = error.Canceled, .retryable = false },
-        .{ .errno = .IO, .expected = error.InputOutput, .retryable = false },
+        .{ .errno = .connection_refused, .expected = error.ConnectionRefused, .retryable = true },
+        .{ .errno = .connection_reset, .expected = error.ConnectionResetByPeer, .retryable = true },
+        .{ .errno = .timed_out, .expected = error.Timeout, .retryable = true },
+        .{ .errno = .network_unreachable, .expected = error.NetworkUnreachable, .retryable = true },
+        .{ .errno = .host_unreachable, .expected = error.HostUnreachable, .retryable = true },
+        .{ .errno = .network_down, .expected = error.NetworkDown, .retryable = false },
+        .{ .errno = .system_resources, .expected = error.SystemResources, .retryable = false },
+        .{ .errno = .invalid_descriptor, .expected = error.InvalidDescriptor, .retryable = false },
+        .{ .errno = .canceled, .expected = error.Canceled, .retryable = false },
+        .{ .errno = .input_output, .expected = error.InputOutput, .retryable = false },
     };
 
     for (cases) |case| {
@@ -3592,16 +3496,16 @@ test "web_fetch connect errno classification keeps terminal local failures out o
 
 const ScriptedPoller = struct {
     result: enum { ready, interrupted_once, system_resources, network_down } = .ready,
-    revents: i16 = 0,
+    revents: u16 = 0,
     calls: usize = 0,
-    observed_events: i16 = 0,
+    observed_events: u16 = 0,
     observed_timeout_ms: i32 = 0,
 
     fn poller(self: *@This()) Poller {
         return .{ .ctx = @ptrCast(self), .poll_fn = poll };
     }
 
-    fn poll(raw: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+    fn poll(raw: ?*anyopaque, fds: []sock.PollFd, timeout_ms: i32) PollError!usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.observed_events = fds[0].events;
@@ -3624,17 +3528,17 @@ const ScriptedPoller = struct {
 };
 
 test "web_fetch poll events preserve requested readiness and hangup semantics" {
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
-    try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.HUP);
+    try classifyPollEvents(sock.invalid_handle, sock.POLL.IN, sock.POLL.IN | sock.POLL.HUP);
+    try classifyPollEvents(sock.invalid_handle, sock.POLL.IN, sock.POLL.IN | sock.POLL.ERR);
+    try classifyPollEvents(sock.invalid_handle, sock.POLL.OUT, sock.POLL.OUT | sock.POLL.HUP);
+    try classifyPollEvents(sock.invalid_handle, sock.POLL.IN, sock.POLL.HUP);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.HUP),
+        classifyPollEvents(sock.invalid_handle, sock.POLL.OUT, sock.POLL.HUP),
     );
     try std.testing.expectError(
         error.InvalidDescriptor,
-        classifyPollEvents(-1, posix.POLL.IN, posix.POLL.NVAL),
+        classifyPollEvents(sock.invalid_handle, sock.POLL.IN, sock.POLL.NVAL),
     );
 
     var sockets: [2]std.c.fd_t = undefined;
@@ -3644,44 +3548,44 @@ test "web_fetch poll events preserve requested readiness and hangup semantics" {
     defer closeFd(sockets[1]);
     try std.testing.expectError(
         error.UnexpectedClose,
-        classifyPollEvents(sockets[0], posix.POLL.IN, posix.POLL.ERR),
+        classifyPollEvents(sockets[0], sock.POLL.IN, sock.POLL.ERR),
     );
 }
 
 test "web_fetch injected poll failures and arguments remain exact" {
     var interrupted = ScriptedPoller{
         .result = .interrupted_once,
-        .revents = posix.POLL.IN,
+        .revents = sock.POLL.IN,
     };
     try pollFdWith(
         42,
-        posix.POLL.IN,
+        sock.POLL.IN,
         .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
         interrupted.poller(),
     );
     try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
-    try std.testing.expectEqual(posix.POLL.IN, interrupted.observed_events);
+    try std.testing.expectEqual(sock.POLL.IN, interrupted.observed_events);
 
     var resources = ScriptedPoller{ .result = .system_resources };
     try std.testing.expectError(error.SystemResources, pollFdWith(
         42,
-        posix.POLL.IN,
+        sock.POLL.IN,
         .{},
         resources.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), resources.calls);
-    try std.testing.expectEqual(posix.POLL.IN, resources.observed_events);
+    try std.testing.expectEqual(sock.POLL.IN, resources.observed_events);
     try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
 
     var network_down = ScriptedPoller{ .result = .network_down };
     try std.testing.expectError(error.NetworkDown, pollFdWith(
         42,
-        posix.POLL.OUT,
+        sock.POLL.OUT,
         .{},
         network_down.poller(),
     ));
     try std.testing.expectEqual(@as(usize, 1), network_down.calls);
-    try std.testing.expectEqual(posix.POLL.OUT, network_down.observed_events);
+    try std.testing.expectEqual(sock.POLL.OUT, network_down.observed_events);
 }
 
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
@@ -3732,7 +3636,7 @@ test "web_fetch poll deadline is not extended by interrupted syscalls" {
 
     try std.testing.expectError(error.Timeout, pollFd(
         fds[0],
-        posix.POLL.IN,
+        sock.POLL.IN,
         .{ .deadline = .{ .deadline_ms = deadline_ms } },
     ));
     const elapsed_ms = monotonicMillis() - started_ms;
@@ -3748,32 +3652,31 @@ fn expectSyscallFailure(action: SyscallErrorAction, expected: anyerror) !void {
 
 test "web_fetch socket errno classifiers preserve named causes" {
     const Case = struct {
-        errno: posix.E,
+        errno: sock.Errno,
         read_error: anyerror,
         write_error: anyerror,
     };
     const cases = [_]Case{
-        .{ .errno = .CONNRESET, .read_error = error.ConnectionResetByPeer, .write_error = error.ConnectionResetByPeer },
-        .{ .errno = .PIPE, .read_error = error.BrokenPipe, .write_error = error.BrokenPipe },
-        .{ .errno = .NOTCONN, .read_error = error.SocketUnconnected, .write_error = error.SocketUnconnected },
-        .{ .errno = .NETDOWN, .read_error = error.NetworkDown, .write_error = error.NetworkDown },
-        .{ .errno = .NOBUFS, .read_error = error.SystemResources, .write_error = error.SystemResources },
-        .{ .errno = .NOMEM, .read_error = error.SystemResources, .write_error = error.SystemResources },
-        .{ .errno = .IO, .read_error = error.InputOutput, .write_error = error.InputOutput },
-        .{ .errno = .BADF, .read_error = error.InvalidDescriptor, .write_error = error.InvalidDescriptor },
-        .{ .errno = .CANCELED, .read_error = error.Canceled, .write_error = error.Canceled },
-        .{ .errno = .TIMEDOUT, .read_error = error.Timeout, .write_error = error.Timeout },
-        .{ .errno = .PERM, .read_error = error.ReadFailed, .write_error = error.WriteFailed },
+        .{ .errno = .connection_reset, .read_error = error.ConnectionResetByPeer, .write_error = error.ConnectionResetByPeer },
+        .{ .errno = .broken_pipe, .read_error = error.BrokenPipe, .write_error = error.BrokenPipe },
+        .{ .errno = .not_connected, .read_error = error.SocketUnconnected, .write_error = error.SocketUnconnected },
+        .{ .errno = .network_down, .read_error = error.NetworkDown, .write_error = error.NetworkDown },
+        .{ .errno = .system_resources, .read_error = error.SystemResources, .write_error = error.SystemResources },
+        .{ .errno = .input_output, .read_error = error.InputOutput, .write_error = error.InputOutput },
+        .{ .errno = .invalid_descriptor, .read_error = error.InvalidDescriptor, .write_error = error.InvalidDescriptor },
+        .{ .errno = .canceled, .read_error = error.Canceled, .write_error = error.Canceled },
+        .{ .errno = .timed_out, .read_error = error.Timeout, .write_error = error.Timeout },
+        .{ .errno = .access_denied, .read_error = error.ReadFailed, .write_error = error.WriteFailed },
     };
     for (cases) |case| {
         try expectSyscallFailure(classifyReadErrno(case.errno), case.read_error);
         try expectSyscallFailure(classifyWriteErrno(case.errno), case.write_error);
     }
 
-    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.AGAIN));
-    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.INTR));
-    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.AGAIN));
-    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.INTR));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.again));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyReadErrno(.interrupted));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.again));
+    try std.testing.expectEqual(SyscallErrorAction.retry, classifyWriteErrno(.interrupted));
 }
 
 const InterruptingRead = struct {
@@ -3784,17 +3687,17 @@ const InterruptingRead = struct {
         return .{ .ctx = @ptrCast(self), .read_fn = read };
     }
 
-    fn read(raw: ?*anyopaque, _: posix.fd_t, _: []u8) RawSyscallResult {
+    fn read(raw: ?*anyopaque, _: sock.Handle, _: []u8) RawSyscallResult {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.cancel_flag.store(true, .seq_cst);
-        return .{ .failure = .INTR };
+        return .{ .failure = .interrupted };
     }
 };
 
 test "web_fetch interrupted socket read rechecks cancellation before retry" {
     var cancel_flag: std.atomic.Value(bool) = .init(false);
-    var poller = ScriptedPoller{ .revents = posix.POLL.IN };
+    var poller = ScriptedPoller{ .revents = sock.POLL.IN };
     var read = InterruptingRead{ .cancel_flag = &cancel_flag };
     var buf: [1]u8 = undefined;
 
@@ -3869,7 +3772,7 @@ test "web_fetch closed peer write returns a cause without terminating process" {
         return error.SocketShutdownFailed;
     closeFd(sockets[1]);
 
-    var poller = ScriptedPoller{ .revents = posix.POLL.OUT | posix.POLL.HUP };
+    var poller = ScriptedPoller{ .revents = sock.POLL.OUT | sock.POLL.HUP };
     rawWriteAllWith(
         sockets[0],
         "x",

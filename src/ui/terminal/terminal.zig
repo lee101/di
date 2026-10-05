@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const io_mod = @import("../../core/shared/io.zig");
 const types = @import("../../core/shared/types.zig");
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
@@ -33,11 +35,22 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
         tmux_interactive_mode_enable_sequence;
 }
 
-pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+pub fn queryLayout(handle: std.Io.File.Handle, footer_rows: u16) !types.Layout {
+    if (comptime builtin.os.tag == .windows) {
+        // A Windows console reports its viewport through the screen buffer, not
+        // through an ioctl on the stream that was passed in.
+        const windows = io_mod.windowsSys();
+        const info = windows.consoleScreenBufferInfo(io_mod.stdoutHandle()) orelse
+            return error.UnableToReadTerminalSize;
+        const cols = @as(u16, @intCast(info.window.right - info.window.left + 1));
+        const rows = @as(u16, @intCast(info.window.bottom - info.window.top + 1));
+        if (rows == 0 or cols == 0) return error.UnableToReadTerminalSize;
+        return layoutFromSize(rows, cols, footer_rows);
+    }
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
-    const rc = std.c.ioctl(fd, req, &ws);
+    const rc = std.c.ioctl(handle, req, &ws);
     if (rc == -1 or ws.row == 0 or ws.col == 0) {
         return error.UnableToReadTerminalSize;
     }

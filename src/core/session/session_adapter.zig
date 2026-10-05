@@ -122,7 +122,7 @@ fn traceWiring(comptime action: []const u8, session_id: []const u8, comptime det
 
 fn processId() i64 {
     if (comptime builtin.os.tag == .wasi) return 0;
-    return std.c.getpid();
+    return @intCast(io_mod.currentProcessId());
 }
 
 // ---------------------------------------------------------------------------
@@ -2169,7 +2169,7 @@ fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
     const io = io_mod.getIo();
     var source = try from.openFile(io, name, .{ .follow_symlinks = false, .resolve_beneath = true, .allow_directory = false });
     defer source.close(io);
-    var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600), .resolve_beneath = true });
+    var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = io_mod.private_file_permissions, .resolve_beneath = true });
     defer target.close(io);
     var buffer: [16 * 1024]u8 = undefined;
     var offset: u64 = 0;

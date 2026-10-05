@@ -315,17 +315,165 @@ fn streamCompletion(
     const payload = request.prepared_request_body orelse
         try buildRequest(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    var result = streamPrepared(alloc, request, payload) catch |err| {
-        if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-        if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
-        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
-        return err;
+    var result = streamPrepared(alloc, request, payload) catch |err| switch (err) {
+        // Some upstreams (OpenRouter's stealth routes) intermittently answer a
+        // streamed turn with an empty-response 502 while the same body succeeds
+        // unstreamed. Nothing has been emitted yet, so one unstreamed retry
+        // replays the turn without duplicating events.
+        error.OpenPathsStreamUnavailable => retryUnstreamed(alloc, request, payload) catch |retry_err|
+            return streamFailure(request, retry_err),
+        else => return streamFailure(request, err),
     };
     if (requestDeadlineExpired(request)) {
         result.deinit(alloc);
         return stream_provider.failResult(error.Timeout);
     }
     return result;
+}
+
+fn retryUnstreamed(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const unstreamed = try unstreamedPayload(alloc, payload) orelse return error.OpenPathsStreamFailed;
+    defer alloc.free(unstreamed);
+    debug_trace.logf("stream", "openpaths stream unavailable before output; retrying unstreamed", .{});
+    return postPrepared(alloc, request, unstreamed, .json) catch |err| switch (err) {
+        // Callers and launchers key retries on the established error name.
+        error.OpenPathsStreamUnavailable => error.OpenPathsStreamFailed,
+        else => err,
+    };
+}
+
+fn streamFailure(request: stream_provider.ModelRequest, err: anyerror) anyerror!stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+    if (requestDeadlineExpired(request)) return stream_provider.failResult(error.Timeout);
+    request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
+    return err;
+}
+
+const streamed_request_flags = "\"stream\":true,\"stream_options\":{\"include_usage\":true}";
+
+/// The request body with streaming switched off, or null when the body was not
+/// built by `buildRequest` and cannot be rewritten safely.
+fn unstreamedPayload(alloc: Allocator, payload: []const u8) !?[]u8 {
+    const at = std.mem.find(u8, payload, streamed_request_flags) orelse return null;
+    return try std.mem.concat(alloc, u8, &.{
+        payload[0..at],
+        "\"stream\":false",
+        payload[at + streamed_request_flags.len ..],
+    });
+}
+
+/// Replays one chat.completion JSON body as SSE chunks so `consumeSse` emits
+/// the same events and builds the same completion as a streamed turn.
+fn syntheticSseFromCompletion(alloc: Allocator, body: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return error.OpenPathsStreamIncomplete;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.OpenPathsStreamIncomplete;
+    const root = parsed.value.object;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    if (root.get("error")) |err_value| {
+        try writer.writeAll("data: {\"error\":");
+        try std.json.Stringify.value(err_value, .{}, writer);
+        try writer.writeAll("}\n\ndata: [DONE]\n\n");
+        return out.toOwnedSlice();
+    }
+
+    const message: ?std.json.ObjectMap, const finish_reason: ?std.json.Value = choice: {
+        const choices = root.get("choices") orelse break :choice .{ null, null };
+        if (choices != .array or choices.array.items.len == 0) break :choice .{ null, null };
+        const first = choices.array.items[0];
+        if (first != .object) break :choice .{ null, null };
+        break :choice .{ objectMapField(first.object, "message"), first.object.get("finish_reason") };
+    };
+    const id = root.get("id");
+
+    if (message) |msg| {
+        for ([_][]const u8{ "reasoning", "reasoning_content", "content" }) |key| {
+            const value = msg.get(key) orelse continue;
+            if (value != .string or value.string.len == 0) continue;
+            try writeSyntheticChunk(writer, id, key, value, null);
+        }
+        if (msg.get("tool_calls")) |calls| if (calls == .array) for (calls.array.items, 0..) |call, index| {
+            if (call != .object) continue;
+            try writeSyntheticChunk(writer, id, "tool_calls", call, index);
+        };
+    }
+    try writer.writeAll("data: {");
+    if (id) |value| {
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    if (root.get("usage")) |usage| {
+        try writer.writeAll("\"usage\":");
+        try std.json.Stringify.value(usage, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
+    try std.json.Stringify.value(finish_reason orelse .null, .{}, writer);
+    try writer.writeAll("}]}\n\ndata: [DONE]\n\n");
+    return out.toOwnedSlice();
+}
+
+/// One SSE chunk carrying a single delta field. A tool call gets the stream
+/// `index` the unstreamed shape omits, so calls do not merge into one slot.
+fn writeSyntheticChunk(
+    writer: *std.Io.Writer,
+    id: ?std.json.Value,
+    key: []const u8,
+    value: std.json.Value,
+    tool_index: ?usize,
+) !void {
+    try writer.writeAll("data: {");
+    if (id) |id_value| {
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(id_value, .{}, writer);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"choices\":[{\"index\":0,\"delta\":{");
+    try std.json.Stringify.value(key, .{}, writer);
+    try writer.writeByte(':');
+    if (tool_index) |index| {
+        try writer.print("[{{\"index\":{d}", .{index});
+        var it = value.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "index")) continue;
+            try writer.writeByte(',');
+            try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+            try writer.writeByte(':');
+            try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+        }
+        try writer.writeAll("}]");
+    } else {
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeAll("},\"finish_reason\":null}]}\n\n");
+}
+
+/// An SSE error object that means the upstream produced nothing for this turn
+/// (OpenRouter reports 502 / provider_unavailable), as opposed to a refusal or
+/// a request the provider rejected.
+fn isUnavailableStreamError(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (value.object.get("code")) |code| switch (code) {
+        .integer => |n| if (n == 502) return true,
+        .string => |s| if (std.mem.eql(u8, s, "502")) return true,
+        else => {},
+    };
+    if (objectMapField(value.object, "metadata")) |metadata| {
+        if (stringField(metadata, "error_type")) |kind| {
+            if (std.mem.eql(u8, kind, "provider_unavailable")) return true;
+        }
+    }
+    return false;
 }
 
 fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
@@ -351,6 +499,19 @@ pub fn streamPrepared(
     request: stream_provider.ModelRequest,
     payload: []const u8,
 ) !stream_provider.Result {
+    return postPrepared(alloc, request, payload, .sse);
+}
+
+/// How the response body arrives: an SSE stream, or one chat.completion JSON
+/// object that is replayed through the same SSE consumer.
+const WireMode = enum { sse, json };
+
+fn postPrepared(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    mode: WireMode,
+) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     const api_key = request.credential.secret() orelse
         return stream_provider.failResult(error.OpenPathsCredentialRequired);
@@ -359,7 +520,10 @@ pub fn streamPrepared(
     const endpoint = try chatEndpoint(request.credential.credentialSource());
     const uri = try std.Uri.parse(endpoint);
     var extra_headers_buf: [2]std.http.Header = undefined;
-    extra_headers_buf[0] = .{ .name = "accept", .value = "text/event-stream" };
+    extra_headers_buf[0] = .{ .name = "accept", .value = switch (mode) {
+        .sse => "text/event-stream",
+        .json => "application/json",
+    } };
     var extra_header_count: usize = 1;
     if (prompt_cache_policy.validSessionHeader(request.session_id)) |session_id| {
         extra_headers_buf[1] = .{ .name = "x-session-id", .value = session_id };
@@ -383,7 +547,9 @@ pub fn streamPrepared(
             connect_deadline = deadline;
         }
     }
-    try request.admission.admit();
+    // Admission is once per invocation; the unstreamed mode only ever runs as
+    // the retry of a streamed attempt that was already admitted.
+    if (mode == .sse) try request.admission.admit();
     var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
@@ -429,7 +595,23 @@ pub fn streamPrepared(
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
+    const response_reader = response.reader(&transfer_buffer);
+    var synthetic_wire: ?[]u8 = null;
+    defer if (synthetic_wire) |wire| alloc.free(wire);
+    var synthetic_reader: std.Io.Reader = undefined;
+    const reader = switch (mode) {
+        .sse => response_reader,
+        .json => reader: {
+            const body = response_reader.allocRemaining(alloc, .limited(max_sse_aggregate_bytes)) catch |err| switch (err) {
+                error.StreamTooLong => return error.OpenPathsSseEventTooLarge,
+                else => return err,
+            };
+            defer alloc.free(body);
+            synthetic_wire = try syntheticSseFromCompletion(alloc, body);
+            synthetic_reader = .fixed(synthetic_wire.?);
+            break :reader &synthetic_reader;
+        },
+    };
     var events = request.events;
     const completion = try consumeSse(
         alloc,
@@ -624,6 +806,9 @@ fn consumeSse(
     var generation_id: ?[]u8 = null;
     errdefer if (generation_id) |id| alloc.free(id);
     var saw_activity = false;
+    // Any callback fired, including reasoning-only deltas that `saw_activity`
+    // does not count; past that point a retry would duplicate output.
+    var emitted_output = false;
     var event_count: usize = 0;
 
     while (try sse.next(alloc, reader)) |json_text| {
@@ -634,7 +819,12 @@ fn consumeSse(
             continue;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
-        if (parsed.value.object.contains("error")) return error.OpenPathsStreamFailed;
+        if (parsed.value.object.get("error")) |err_value| {
+            if (!emitted_output and tools.items.len == 0 and isUnavailableStreamError(err_value)) {
+                return error.OpenPathsStreamUnavailable;
+            }
+            return error.OpenPathsStreamFailed;
+        }
 
         if (generation_id == null) {
             if (stringField(parsed.value.object, "id")) |id| generation_id = try alloc.dupe(u8, id);
@@ -647,6 +837,7 @@ fn consumeSse(
         if (choice != .object) continue;
 
         if (choice.object.get("delta")) |delta| {
+            if (delta == .object and deltaHasOutput(delta.object)) emitted_output = true;
             if (delta == .object) try consumeDelta(
                 alloc,
                 delta.object,
@@ -704,6 +895,14 @@ fn consumeSse(
         .finish_reason = finish_reason.?,
         .usage = usage,
     };
+}
+
+fn deltaHasOutput(delta: std.json.ObjectMap) bool {
+    for ([_][]const u8{ "content", "reasoning", "reasoning_content" }) |key| {
+        if (delta.get(key)) |value| if (value == .string and value.string.len > 0) return true;
+    }
+    if (delta.get("tool_calls")) |calls| if (calls == .array and calls.array.items.len > 0) return true;
+    return false;
 }
 
 fn consumeDelta(
@@ -1995,4 +2194,92 @@ test "chat completions SSE stream yields deltas tool calls and usage" {
     if (completion.content) |content| std.testing.allocator.free(@constCast(content));
     types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
     if (completion.generation_id) |id| std.testing.allocator.free(id);
+}
+
+fn testConsume(wire: []const u8, capture_ctx: *anyopaque, on_content: stream_provider.StreamCallback) !types.ModelCompletion {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var reader: std.Io.Reader = .fixed(wire);
+    return consumeSse(std.testing.allocator, &reader, capture_ctx, on_content, null, null, null, &cancelled, null);
+}
+
+fn testIgnoreChunk(_: *anyopaque, _: []const u8) void {}
+
+test "SSE unavailable error before any output is retryable, after output it is not" {
+    var ctx: u8 = 0;
+    const unavailable =
+        "data: {\"id\":\"gen-1\",\"choices\":[],\"error\":{\"code\":502,\"message\":\"Provider returned an empty response\",\"metadata\":{\"error_type\":\"provider_unavailable\"}}}\n\n";
+    try std.testing.expectError(error.OpenPathsStreamUnavailable, testConsume(unavailable, &ctx, testIgnoreChunk));
+
+    const by_type_only = "data: {\"error\":{\"code\":\"x\",\"metadata\":{\"error_type\":\"provider_unavailable\"}}}\n\n";
+    try std.testing.expectError(error.OpenPathsStreamUnavailable, testConsume(by_type_only, &ctx, testIgnoreChunk));
+
+    const after_content =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" ++ unavailable;
+    try std.testing.expectError(error.OpenPathsStreamFailed, testConsume(after_content, &ctx, testIgnoreChunk));
+
+    const after_reasoning =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n" ++ unavailable;
+    try std.testing.expectError(error.OpenPathsStreamFailed, testConsume(after_reasoning, &ctx, testIgnoreChunk));
+
+    const rejected = "data: {\"error\":{\"code\":400,\"message\":\"bad request\"}}\n\n";
+    try std.testing.expectError(error.OpenPathsStreamFailed, testConsume(rejected, &ctx, testIgnoreChunk));
+}
+
+test "unstreamed payload switches only the stream flags" {
+    const body = "{\"model\":\"m\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"usage\":{\"include\":true},\"messages\":[]}";
+    const rewritten = (try unstreamedPayload(std.testing.allocator, body)).?;
+    defer std.testing.allocator.free(rewritten);
+    try std.testing.expectEqualStrings(
+        "{\"model\":\"m\",\"stream\":false,\"usage\":{\"include\":true},\"messages\":[]}",
+        rewritten,
+    );
+    try std.testing.expectEqual(@as(?[]u8, null), try unstreamedPayload(std.testing.allocator, "{\"model\":\"m\"}"));
+}
+
+test "unstreamed completion replays as the same deltas tool calls and usage" {
+    const Capture = struct {
+        content: std.ArrayList(u8) = .empty,
+        fn append(raw: *anyopaque, chunk: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.content.appendSlice(std.testing.allocator, chunk) catch {};
+        }
+    };
+    const body =
+        "{\"id\":\"gen-7\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\"," ++
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Reading both.\",\"tool_calls\":[" ++
+        "{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}," ++
+        "{\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b\\\"}\"}}]}}]," ++
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}";
+    const wire = try syntheticSseFromCompletion(std.testing.allocator, body);
+    defer std.testing.allocator.free(wire);
+
+    var capture: Capture = .{};
+    defer capture.content.deinit(std.testing.allocator);
+    const completion = try testConsume(wire, @ptrCast(&capture), Capture.append);
+    defer {
+        if (completion.content) |content| std.testing.allocator.free(@constCast(content));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+        if (completion.generation_id) |id| std.testing.allocator.free(id);
+    }
+
+    try std.testing.expectEqualStrings("Reading both.", capture.content.items);
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
+    try std.testing.expectEqual(@as(usize, 2), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_a", completion.tool_calls[0].id);
+    try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("call_b", completion.tool_calls[1].id);
+    try std.testing.expectEqualStrings("{\"path\":\"b\"}", completion.tool_calls[1].arguments_json);
+    try std.testing.expectEqual(@as(?u64, 11), completion.usage.input_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completion.usage.output_tokens);
+    try std.testing.expectEqualStrings("gen-7", completion.generation_id.?);
+}
+
+test "unstreamed error body replays as a stream error" {
+    var ctx: u8 = 0;
+    const wire = try syntheticSseFromCompletion(
+        std.testing.allocator,
+        "{\"error\":{\"code\":502,\"message\":\"Provider returned an empty response\"}}",
+    );
+    defer std.testing.allocator.free(wire);
+    try std.testing.expectError(error.OpenPathsStreamUnavailable, testConsume(wire, &ctx, testIgnoreChunk));
 }

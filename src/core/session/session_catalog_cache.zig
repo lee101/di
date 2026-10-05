@@ -173,7 +173,7 @@ pub const Loaded = struct {
         var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
         defer file.close(io_mod.getIo());
         const stat = try file.stat(io_mod.getIo());
-        if (stat.kind != .file or stat.nlink > 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidCatalogCache;
+        if (stat.kind != .file or stat.nlink > 1 or io_mod.permissionsAreExposedToOthers(stat.permissions) or stat.size > max_bytes) return error.InvalidCatalogCache;
         const bytes = try alloc.alloc(u8, @intCast(stat.size));
         errdefer alloc.free(bytes);
         var offset: usize = 0;
@@ -489,11 +489,26 @@ fn statOptional(dir: std.Io.Dir, path: []const u8) !?std.Io.File.Stat {
 
 fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
     return a.inode == b.inode and a.nlink == b.nlink and a.kind == b.kind and a.size == b.size and
-        a.permissions.toMode() == b.permissions.toMode() and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
+        io_mod.permissionsMode(a.permissions) == io_mod.permissionsMode(b.permissions) and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
 }
 
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    // Windows reports a signed inode and link count where POSIX reports
+    // unsigned ones; a fingerprint only needs the same bytes per file.
+    const unsigned = struct {
+        fn of(value: anytype) u128 {
+            return @intCast(@max(value, 0));
+        }
+    };
+    const values = [_]u128{
+        unsigned.of(stat.inode),
+        unsigned.of(stat.nlink),
+        stat.size,
+        unsigned.of(@intFromEnum(stat.kind)),
+        unsigned.of(io_mod.permissionsMode(stat.permissions)),
+        @bitCast(@as(i128, stat.mtime.nanoseconds)),
+        @bitCast(@as(i128, stat.ctime.nanoseconds)),
+    };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
@@ -1000,8 +1015,8 @@ test "actionable catalog lists an unverifiable child marker without caching it" 
         .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
     });
     writable.deinit(alloc);
-    try tmp.dir.createDir(std.testing.io, "home/.fx/sessions/unverified/subagent", .fromMode(0o700));
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = .fromMode(0o600) } });
+    try tmp.dir.createDir(std.testing.io, "home/.fx/sessions/unverified/subagent", io_mod.permissionsFromMode(0o700));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.fx/sessions/unverified/subagent/control.json", .data = "not a control record", .flags = .{ .permissions = io_mod.permissionsFromMode(0o600) } });
 
     var writer = (try Writer.init(store)).?;
     defer writer.deinit();
@@ -1202,9 +1217,9 @@ test "catalog fingerprint detects event appends and child directory permissions"
     try std.testing.expect(!std.mem.eql(u8, &first, &appended));
     var child = try tmp.dir.openDir(std.testing.io, "session/subagent", .{ .iterate = true });
     defer child.close(std.testing.io);
-    try child.setPermissions(std.testing.io, .fromMode(0o700));
+    try child.setPermissions(std.testing.io, io_mod.permissionsFromMode(0o700));
     const private = (try fingerprint(tmp.dir, "session")).?;
-    try child.setPermissions(std.testing.io, .fromMode(0o755));
+    try child.setPermissions(std.testing.io, io_mod.permissionsFromMode(0o755));
     const changed = (try fingerprint(tmp.dir, "session")).?;
     try std.testing.expect(!std.mem.eql(u8, &private, &changed));
 }

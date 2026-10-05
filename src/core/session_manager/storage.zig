@@ -13,6 +13,7 @@
 //! and the driver. Without hooks that code does not exist in the binary.
 
 const std = @import("std");
+const permissions = @import("permissions.zig");
 const build_options = @import("build_options");
 const Io = std.Io;
 
@@ -101,7 +102,7 @@ pub const Storage = struct {
         // Missing parents are the manager's own folders, so private too, for
         // example `~/.fx/sessions` on a machine that never ran v1 (D19).
         // Existing ones are left as they are.
-        _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
+        _ = cwd.createDirPathStatus(s.io, parent_path, permissions.fromMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
         defer parent.close(s.io);
         return s.ensureDir(.{ .handle = parent }, name);
@@ -151,7 +152,7 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
-        parent.handle.createDir(s.io, name, .fromMode(folder_mode)) catch |err|
+        parent.handle.createDir(s.io, name, permissions.fromMode(folder_mode)) catch |err|
             return translate(err);
         if (hooks) if (s.fault) |f| try f.noteCreate(s, parent, name);
     }
@@ -176,7 +177,7 @@ pub const Storage = struct {
             .read = true,
             .truncate = false,
             .exclusive = true,
-            .permissions = .fromMode(mode),
+            .permissions = permissions.fromMode(mode),
             .resolve_beneath = true,
         }) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| {
@@ -351,7 +352,7 @@ pub const Storage = struct {
                 .directory => .directory,
                 else => .other,
             },
-            .mode = st.permissions.toMode() & 0o777,
+            .mode = permissions.mode(st.permissions) & 0o777,
             .mtime_ms = st.mtime.toMilliseconds(),
         };
     }

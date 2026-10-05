@@ -313,9 +313,11 @@ pub const Reader = struct {
         return initCallback(context, read_fn);
     }
 
-    // Native ACP uses raw read(2) because Linux may pass socket-based stdin to
-    // child processes. WASI has no std.posix surface, so use the injected std.Io
-    // backend and let the host's fd_read import suspend through JSPI.
+    // Native ACP uses a blocking read because Linux may pass socket-based
+    // stdin to child processes. Windows has no `read(2)` over a console or pipe
+    // handle, so the shared helper routes through `std.Io` there. WASI has no
+    // std.posix surface at all, so the injected std.Io backend lets the host's
+    // fd_read import suspend through JSPI.
     fn readStdin(_: ?*anyopaque, destination: []u8) usize {
         if (comptime host_target.is_wasm) {
             return std.Io.File.stdin().readStreaming(
@@ -323,7 +325,7 @@ pub const Reader = struct {
                 &.{destination},
             ) catch return 0;
         }
-        return std.posix.read(std.posix.STDIN_FILENO, destination) catch return 0;
+        return io_mod.readHandle(io_mod.stdinHandle(), destination) catch return 0;
     }
 
     fn readFromSource(self: *Reader) usize {

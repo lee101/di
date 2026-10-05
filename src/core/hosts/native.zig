@@ -104,6 +104,14 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
 }
 
 pub fn try_reap_child_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = io_mod.windowsSys();
+        const handle = child.id orelse return error.WaitFailed;
+        if (windows.WaitForSingleObject(handle, 0) != windows.WAIT_OBJECT_0) return null;
+        const term = child.wait(io_mod.getIo()) catch return error.WaitFailed;
+        child.id = null;
+        return term;
+    }
     const pid = child.id orelse return error.WaitFailed;
     var status: c_int = undefined;
     const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
@@ -115,12 +123,31 @@ pub fn try_reap_child_process(child: *std.process.Child) error{WaitFailed}!?std.
 }
 
 fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
+    if (comptime builtin.os.tag == .windows) {
+        if (child.id == null) return error.WaitFailed;
+        child.kill() catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => |kill_err| return kill_err,
+        };
+        return child.wait(io_mod.getIo());
+    }
     const pid = child.id orelse return error.WaitFailed;
     std.posix.kill(pid, .KILL) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => |kill_err| return kill_err,
     };
     return child.wait(io_mod.getIo());
+}
+
+/// Reports whether a child that this process spawned has already exited,
+/// without consuming its exit status.
+pub fn childHasExited(id: std.process.Child.Id) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const windows = io_mod.windowsSys();
+        return windows.WaitForSingleObject(id, 0) == windows.WAIT_OBJECT_0;
+    }
+    var status: c_int = undefined;
+    return std.c.waitpid(id, &status, std.c.W.NOHANG) != 0;
 }
 
 fn wait_for_clipboard_process(

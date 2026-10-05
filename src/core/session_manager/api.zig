@@ -17,6 +17,7 @@
 //! the diagnostics callback (`index_stale`).
 
 const std = @import("std");
+const permissions = @import("permissions.zig");
 const schema = @import("schema.zig");
 const storage = @import("storage.zig");
 const fold = @import("fold.zig");
@@ -24,6 +25,10 @@ const log_mod = @import("log.zig");
 const session_mod = @import("session.zig");
 const catalog_mod = @import("catalog.zig");
 const diag = @import("diag.zig");
+
+/// The blob mode as the running platform reports it back. Windows has no mode
+/// bits, so a read-only blob reports `0o444` rather than the requested `0o400`.
+const blob_mode_as_reported: std.posix.mode_t = permissions.mode(permissions.fromMode(storage.blob_mode)) & 0o777;
 
 pub const Role = schema.Role;
 pub const Host = schema.Host;
@@ -939,8 +944,8 @@ const api_tests = struct {
         defer root.close(io);
         var folder = try root.openDir(io, id, .{});
         defer folder.close(io);
-        try folder.setFilePermissions(io, "log.jsonl", .fromMode(0o400), .{});
-        defer folder.setFilePermissions(io, "log.jsonl", .fromMode(0o600), .{}) catch {};
+        try folder.setFilePermissions(io, "log.jsonl", permissions.fromMode(0o400), .{});
+        defer folder.setFilePermissions(io, "log.jsonl", permissions.fromMode(0o600), .{}) catch {};
         try testing.expectError(error.AccessDenied, f.manager.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app }));
     }
 
@@ -1839,7 +1844,7 @@ const api_tests = struct {
         const st = try file.stat(io);
         file.close(io);
         try testing.expectEqualStrings("%PDF-1.7 a download", buffer[0..len]);
-        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+        try testing.expectEqual(blob_mode_as_reported, permissions.mode(st.permissions) & 0o777);
         try testing.expectError(error.AccessDenied, std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write }));
 
         // A fork's hard link is the same read-only file under the fork's folder.
@@ -1851,7 +1856,7 @@ const api_tests = struct {
         defer gpa.free(fork_path);
         try testing.expect(std.mem.find(u8, fork_path, fork_id) != null);
         const fork_st = try std.Io.Dir.cwd().statFile(io, fork_path, .{});
-        try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), fork_st.permissions.toMode() & 0o777);
+        try testing.expectEqual(blob_mode_as_reported, permissions.mode(fork_st.permissions) & 0o777);
 
         // Only a well-formed hash this session holds has a path.
         try testing.expectError(error.NotFound, m.blobPath(gpa, id, "b" ** 64));
@@ -1904,7 +1909,7 @@ const api_tests = struct {
         while (try names.next(io)) |entry| {
             try testing.expect(schema.validBlobHash(entry.name));
             const st = try blobs.statFile(io, entry.name, .{});
-            try testing.expectEqual(@as(std.posix.mode_t, storage.blob_mode), st.permissions.toMode() & 0o777);
+            try testing.expectEqual(blob_mode_as_reported, permissions.mode(st.permissions) & 0o777);
             count += 1;
         }
         try testing.expectEqual(@as(usize, 2), count);

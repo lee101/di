@@ -84,7 +84,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // Canonical `fx` name pinned by suites, CI workflows, and PGSO corpus.py.
-    const install_fx = b.addInstallArtifact(exe, .{ .dest_sub_path = "fx" });
+    const install_fx = b.addInstallArtifact(exe, .{
+        .dest_sub_path = if (target.result.os.tag == .windows) "fx.exe" else "fx",
+    });
     b.getInstallStep().dependOn(&install_fx.step);
 
     const run_cmd = b.addRunArtifact(exe);

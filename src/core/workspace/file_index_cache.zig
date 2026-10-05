@@ -87,7 +87,7 @@ fn loadPath(alloc: Allocator, path: []const u8, roots: []const []const u8) !?Loa
     var file = try std.Io.Dir.openFileAbsolute(zio, path, .{ .follow_symlinks = false, .allow_directory = false });
     defer file.close(zio);
     const stat = try file.stat(zio);
-    if (stat.kind != .file or stat.nlink != 1 or (stat.permissions.toMode() & 0o077) != 0 or stat.size > max_bytes) return error.InvalidIndexCache;
+    if (stat.kind != .file or stat.nlink != 1 or io_mod.permissionsAreExposedToOthers(stat.permissions) or stat.size > max_bytes) return error.InvalidIndexCache;
     const bytes = try alloc.alloc(u8, @intCast(stat.size));
     defer alloc.free(bytes);
     var offset: usize = 0;
@@ -197,7 +197,7 @@ pub fn saveTo(alloc: Allocator, home: []const u8, roots: []const []const u8, can
     defer dir.close(zio);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
     try io_mod.durableReplaceVerified(alloc, &verified, std.fs.path.basename(path), out.written());
-    try dir.setPermissions(zio, .fromMode(0o700));
+    try dir.setPermissions(zio, io_mod.permissionsFromMode(0o700));
 }
 
 test "file index cache round trips and rejects tampering" {

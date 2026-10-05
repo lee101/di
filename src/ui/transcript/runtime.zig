@@ -2873,7 +2873,7 @@ test "historical command detail keeps artifact handles after command block attac
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -4255,7 +4255,7 @@ test "render diagnostic commit skips unchanged same-row paints" {
 }
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    stdout_file: std.Io.File = io_mod.stdout_file_default,
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
@@ -4449,6 +4449,7 @@ pub const TranscriptRuntime = struct {
             entry.* = null;
         }
         result.compact_transcript_source_cache.next_replacement = 0;
+        result.stdout_file = io_mod.resolveStdout(result.stdout_file);
         return result;
     }
 
