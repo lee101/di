@@ -547,7 +547,9 @@ fn postPrepared(
             connect_deadline = deadline;
         }
     }
-    try request.admission.admit();
+    // Admission is once per invocation; the unstreamed mode only ever runs as
+    // the retry of a streamed attempt that was already admitted.
+    if (mode == .sse) try request.admission.admit();
     var opened = try gateway_client.openBoundedPost(
         alloc,
         request.cancel_flag,
