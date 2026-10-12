@@ -553,7 +553,45 @@ pub const VerifiedDir = struct {
     }
 };
 
+threadlocal var deferred_sync_depth: u32 = 0;
+
+/// Within a deferred scope, file and directory syncs on this thread are skipped
+/// and one `syncfs` in `endDeferredSyncAndFlush` makes them all durable. Use it
+/// only for state that stays invisible until a later publishing rename.
+pub fn beginDeferredSync() void {
+    if (comptime builtin.os.tag != .linux) return;
+    deferred_sync_depth += 1;
+}
+
+pub fn endDeferredSync() void {
+    if (comptime builtin.os.tag != .linux) return;
+    if (deferred_sync_depth > 0) deferred_sync_depth -= 1;
+}
+
+pub fn endDeferredSyncAndFlush(dir: std.Io.Dir) !void {
+    if (comptime builtin.os.tag != .linux) return;
+    const was_deferred = deferred_sync_depth > 0;
+    endDeferredSync();
+    if (!was_deferred or deferred_sync_depth > 0) return;
+    while (true) {
+        const rc = std.os.linux.syscall1(.syncfs, @as(usize, @bitCast(@as(isize, dir.handle))));
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .NOSPC => return error.NoSpaceLeft,
+            .ROFS => return error.ReadOnlyFileSystem,
+            else => return error.DirectorySyncFailed,
+        }
+    }
+}
+
+pub fn syncDeferred() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    return deferred_sync_depth > 0;
+}
+
 fn defaultSyncFile(_: ?*anyopaque, file: std.Io.File) anyerror!void {
+    if (syncDeferred()) return;
     try file.sync(getIo());
 }
 
@@ -622,6 +660,7 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
 pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
     if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+    if (syncDeferred()) return;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;

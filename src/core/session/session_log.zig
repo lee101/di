@@ -555,6 +555,7 @@ pub const ConversationWriter = struct {
         if (comptime builtin.is_test) {
             return self.test_sync_ops.sync_file(self.test_sync_ops.ctx, self.file);
         }
+        if (io_mod.syncDeferred()) return;
         try self.file.sync(io_mod.getIo());
     }
 
@@ -4094,6 +4095,9 @@ pub const Root = struct {
             };
         };
 
+        io_mod.beginDeferredSync();
+        var sync_deferred = true;
+        defer if (sync_deferred) io_mod.endDeferredSync();
         var session_dir = try io_mod.openOrCreateVerifiedPrivateDir(sessions, staging_name);
         options.test_controls.lock(.session);
         var writer_lock = acquireLockWithDeadline(
@@ -4126,6 +4130,8 @@ pub const Root = struct {
         );
         writable_owned = false;
         errdefer loaded.deinit(alloc);
+        sync_deferred = false;
+        try io_mod.endDeferredSyncAndFlush(loaded.log.dir.dir);
         try loaded.conversation_writer.file.sync(io_mod.getIo());
         try io_mod.syncVerifiedDir(loaded.log.dir.dir);
         publishSessionDirectory(sessions.dir, staging_name, initial_state.id) catch |err| {
