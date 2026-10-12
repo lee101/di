@@ -4833,6 +4833,49 @@ describe("gateway stream lifecycle", () => {
     }
   }, 45_000);
 
+  test("captured shell mismatch gives an actionable correction without executing", async () => {
+    const root = createFixtureRoot("captured-shell-mismatch");
+    const tracePath = join(root.root, "trace.log");
+    const marker = join(root.workspace, "executions.txt");
+    const command = "printf 'once\\n' >> executions.txt; printf CAPTURED_OK";
+    let step = 0;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0:
+          return fakeGatewayToolCall("invalid_shell", "shell", {
+            request: { action: "run", command, tty: false, shell: { kind: "executable", path: "/bin/bash" } },
+          });
+        case 1: {
+          expect(existsSync(marker)).toBe(false);
+          const correction = JSON.parse(toolResultOutput(body, "invalid_shell")).error;
+          expect(correction.executed).toBe(false);
+          expect(correction.retry_with).toBeUndefined();
+          expect(correction.problems.join(" ")).toContain("remove request.shell and keep tty=false");
+          return fakeGatewayToolCall("captured_shell", "shell", { request: { action: "run", command, tty: false } });
+        }
+        case 2:
+          expect(shellResult(body, "captured_shell")).toMatchObject({ state: "completed", exit_code: 0, output_delta: "CAPTURED_OK" });
+          return fakeGatewayFinalText("CAPTURED_REPAIR_OK");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Run the marker command once."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).output).toContain("CAPTURED_REPAIR_OK");
+      expect(readFileSync(marker, "utf8")).toBe("once\n");
+      expect(gateway.requestCount()).toBe(3);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("shell request correction repairs one call before its only execution", async () => {
     const root = createFixtureRoot("shell-request-correction");
     const tracePath = join(root.root, "trace.log");

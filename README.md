@@ -118,6 +118,7 @@ di ask "explain the changes in this repository"
 ```
 
 Repeated invalid shell calls stop the tool loop with a nonzero exit status.
+For captured commands, omit `request.shell`; an explicit shell requires `tty=true`. Validation errors explain this distinction without changing or executing the request.
 The rejected commands do not execute; valid neighboring tool results remain
 in the saved session.
 

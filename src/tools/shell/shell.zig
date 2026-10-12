@@ -356,7 +356,7 @@ fn argument_problem(input: Input) ?[]const u8 {
             if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
             if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
             if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
-            if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
+            if (!input.tty and input.shell != null) return "For ordinary captured commands, remove request.shell and keep tty=false. An explicit request.shell requires tty=true; use that only when you intend to open a terminal.";
             if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
         },
         .interact => {
@@ -2009,6 +2009,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
+        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"},\"tty\":false}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
@@ -2033,6 +2034,9 @@ test "shell request correction suggests only unambiguous repairs without executi
         try std.testing.expectEqualStrings("invalid_shell_request", detail.get("code").?.string);
         try std.testing.expect(!detail.get("executed").?.bool);
         try std.testing.expect(detail.get("problems").?.array.items.len > 0);
+        if (std.mem.find(u8, case.input, "\"shell\":") != null and std.mem.find(u8, case.input, "\"profile\":") == null) {
+            try std.testing.expect(std.mem.find(u8, failure, "remove request.shell and keep tty=false") != null);
+        }
         try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
         if (case.retry) |expected| {
             const request = detail.get("retry_with").?.object.get("request").?;
