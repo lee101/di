@@ -84,7 +84,7 @@ const ReplayFile = union(enum) {
     fn sync(self: *ReplayFile) !void {
         switch (self.*) {
             .saved => |*file| try file.sync(),
-            .ephemeral => |file| try file.sync(io_mod.getIo()),
+            .ephemeral => {},
             .blob => return error.ReplayReadOnly,
         }
     }
