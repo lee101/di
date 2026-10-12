@@ -1025,6 +1025,45 @@ describe("cli: status", () => {
   );
 
   test(
+    "fx status reports the effort a new session starts with, workspace override first",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-status-effort-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        const elsewhere = join(root, "elsewhere");
+        mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+        mkdirSync(workspace);
+        mkdirSync(elsewhere);
+        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+
+        const unset = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        expect(unset.code).toBe(0);
+        expect(JSON.parse(unset.stdout.trim()).effort).toBe("auto");
+
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({ effort: "xhigh", workspaces: { [realpathSync(workspace)]: { effort: "low" } } }) + "\n",
+          { mode: 0o600 },
+        );
+        const inWorkspace = await runFx(["status", "--json"], { cwd: realpathSync(workspace), env });
+        const global = await runFx(["status", "--json"], { cwd: realpathSync(elsewhere), env });
+        const text = await runFx(["status"], { cwd: realpathSync(elsewhere), env });
+        for (const result of [inWorkspace, global, text]) {
+          expect(result.code).toBe(0);
+          expect(result.stderr).toBe("");
+        }
+        expect(JSON.parse(inWorkspace.stdout.trim()).effort).toBe("low");
+        expect(JSON.parse(global.stdout.trim()).effort).toBe("xhigh");
+        expect(text.stdout).toContain("[status] effort=xhigh\n");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx upgrade help documents release channels",
     async () => {
       const result = await runFx(["upgrade", "--help"]);
@@ -3242,6 +3281,7 @@ describe("cli: models", () => {
             more_count: 0,
             private_models_hidden: true,
             ids: ["public/fallback"],
+            models: [{ id: "public/fallback", efforts: [], fast: false, ultrafast: false }],
           });
 
           expect(gateway.modelRequests).toHaveLength(2);
@@ -3262,6 +3302,53 @@ describe("cli: models", () => {
           gateway.stop();
           cleanupIsolatedTestHome(home);
         }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx models --json describes each Gateway model's name, efforts, and speed lanes",
+    async () => {
+      const home = createIsolatedTestHome();
+      const gateway = startFakeGateway([], {
+        models: () => [
+          {
+            id: "openai/astra",
+            name: "Astra ",
+            type: "language",
+            owned_by: "openai",
+            tags: ["tool-use"],
+            reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+            pricing: {
+              service_tiers: {
+                priority: { input: "1", output: "2" },
+                ultrafast: { input: "3", output: "4" },
+              },
+            },
+          },
+          { id: "provider/plain", type: "language", tags: ["tool-use"] },
+        ],
+      });
+
+      try {
+        const result = await runFx(["models", "--json"], {
+          env: modelsGatewayEnv(home, `${gateway.baseUrl}/coding-agent/v1/models`),
+        });
+
+        expect(result.code).toBe(0);
+        expect(result.stderr).toBe("");
+        const json = JSON.parse(result.stdout.trim());
+        expect(json.models).toHaveLength(2);
+        expect(json.models).toEqual(
+          expect.arrayContaining([
+            { id: "openai/astra", name: "Astra", efforts: ["low", "high"], fast: true, ultrafast: true },
+            { id: "provider/plain", efforts: [], fast: false, ultrafast: false },
+          ]),
+        );
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(home);
       }
     },
     TIMEOUT,

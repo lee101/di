@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -50,7 +51,27 @@ fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const To
     return len;
 }
 
-pub const GroupKind = enum { none, read_only, subagent };
+/// Host tool calls that may run together, up to the first writer. A build
+/// without threads runs them one at a time.
+fn isConcurrentHostCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+    if (builtin.single_threaded) return false;
+    if (call.provider_result != null) return false;
+    const tool = registry.lookup(call.name) orelse return false;
+    return tool.executor_kind == .host and tool.host_concurrent;
+}
+
+/// Each running host call holds one of the host's pending requests, which
+/// journal barriers and permission prompts share, so a group stays well
+/// below that limit. Later calls form the next group.
+const max_parallel_host_calls = 16;
+
+fn parallelHostPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var len: usize = 0;
+    while (len < calls.len and len < max_parallel_host_calls and isConcurrentHostCall(registry, calls[len])) : (len += 1) {}
+    return len;
+}
+
+pub const GroupKind = enum { none, read_only, subagent, host };
 
 // A model can emit arbitrarily large read groups. Bound the number of native
 // threads, search processes and live result arenas in each scheduler batch.
@@ -69,6 +90,8 @@ pub fn leadingParallelGroup(
     if (read_only_len > 0) return .{ .kind = .read_only, .len = @min(read_only_len, max_parallel_group_calls) };
     const subagent_len = parallelSubagentPrefixLen(registry, calls);
     if (subagent_len > 0) return .{ .kind = .subagent, .len = @min(subagent_len, max_parallel_group_calls) };
+    const host_len = parallelHostPrefixLen(registry, calls);
+    if (host_len > 0) return .{ .kind = .host, .len = host_len };
     return .{};
 }
 
@@ -657,6 +680,51 @@ test "parallel classifier bounds large groups without crossing a mutation" {
     try std.testing.expectEqual(@as(usize, 4), second.len);
     try std.testing.expectEqual(GroupKind.none, leadingParallelGroup(registry, calls[first.len + second.len ..]).kind);
     try std.testing.expectEqual(@as(usize, 1), leadingParallelGroup(registry, calls[13..]).len);
+}
+
+test "host calls run together until a writer, which runs alone" {
+    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"list","description":"List","inputSchema":{}},
+        \\ {"name":"read","description":"Read","inputSchema":{},"writes":false},
+        \\ {"name":"write","description":"Write","inputSchema":{},"writes":true}]
+    , .{});
+    defer parsed.deinit();
+    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
+    defer host.deinit();
+    const registry = host.toolSet().registry;
+    const calls = [_]ToolCall{
+        toolCall("call_1", "list", "{}"),
+        toolCall("call_2", "read", "{}"),
+        toolCall("call_3", "write", "{}"),
+        toolCall("call_4", "read", "{}"),
+    };
+
+    const expected_first: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 2 };
+    try std.testing.expectEqual(expected_first, leadingParallelGroup(registry, &calls));
+    // The writer is a fence: no group includes it, and the call after it
+    // starts a new group.
+    try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
+    const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
+    try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));
+}
+
+test "a host group holds at most max_parallel_host_calls calls" {
+    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"read","description":"Read","inputSchema":{}}]
+    , .{});
+    defer parsed.deinit();
+    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
+    defer host.deinit();
+    const registry = host.toolSet().registry;
+    var calls: [max_parallel_host_calls + 4]ToolCall = undefined;
+    for (&calls) |*call| call.* = toolCall("call", "read", "{}");
+
+    const expected: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = max_parallel_host_calls };
+    try std.testing.expectEqual(expected, leadingParallelGroup(registry, &calls));
+    const rest: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 4 };
+    try std.testing.expectEqual(rest, leadingParallelGroup(registry, calls[max_parallel_host_calls..]));
 }
 
 test "parallel classifier keeps one leading registered subagent group" {

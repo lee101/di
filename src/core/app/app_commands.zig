@@ -412,6 +412,39 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
+        /// What MCP-v2 and `/mcp` have to say, and the reload a `/mcp` change asked for.
+        fn closeOtherMenusForMcp(app: *App) void {
+            closeModelMenuIfPresent(app);
+            closeHelpMenuIfPresent(app);
+            closeInlineCommandMenusIfPresent(app);
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "input_runtime")) {
+                if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
+                    app.input_runtime.settings_menu.close();
+                }
+            }
+            if (comptime @hasField(App, "session_persistence")) {
+                app.session_persistence.session_picker.active = false;
+            }
+        }
+
+        pub fn collectMcpHostFacts(app: *App) !void {
+            if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
+            app.applyMcpHostReload() catch |err| {
+                debug_trace.logf("mcp", "MCP-v2 reload failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
+            };
+            const notices = app.takeMcpHostNotices();
+            defer {
+                for (notices) |n| std.heap.c_allocator.free(n.text);
+                std.heap.c_allocator.free(notices);
+            }
+            for (notices) |n| try app.writeDomainNotice(.{ .topic = "mcp", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
+            app.refreshMcpCompletion();
+            app.refreshMcpHostMenu();
+            app.refreshMcpHostStatus();
+        }
+
         pub fn collectMcpStartupHealthFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
             const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
@@ -1312,21 +1345,19 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const command = std.mem.trim(u8, rest, " \t");
+            // MCP-v2: `/mcp` alone opens the menu, and `/mcp
+            // VERB` runs the verbs `fx mcp` has.
+            if (comptime @hasDecl(App, "runMcpVerbs")) if (app.mcpHostSelected()) {
+                if (command.len > 0) return app.runMcpVerbs(command);
+                closeOtherMenusForMcp(app);
+                app.openMcpHostMenu();
+                app.shell.render_requests.request(.footer);
+                return;
+            };
             if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
                 comptime @hasDecl(App, "openMcpMenu"))
             {
-                closeModelMenuIfPresent(app);
-                closeHelpMenuIfPresent(app);
-                closeInlineCommandMenusIfPresent(app);
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "input_runtime")) {
-                    if (comptime @hasField(@TypeOf(app.input_runtime), "settings_menu")) {
-                        app.input_runtime.settings_menu.close();
-                    }
-                }
-                if (comptime @hasField(App, "session_persistence")) {
-                    app.session_persistence.session_picker.active = false;
-                }
+                closeOtherMenusForMcp(app);
                 try app.openMcpMenu();
                 app.shell.render_requests.request(.footer);
                 return;
@@ -2661,6 +2692,8 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writer.writeByte('\n');
     }
 
+    count += try writeMcpHostProblems(writer, app, alloc);
+
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
     else
@@ -2819,6 +2852,62 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     try writer.writeByte('\n');
 }
 
+/// MCP-v2's servers, one line each; false when there is no host to ask.
+fn writeMcpHostServers(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !bool {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return false;
+    if (statuses.len == 0) {
+        try writer.writeAll("mcp_servers: none\n");
+        return true;
+    }
+    try writer.print("mcp_servers ({d}):\n", .{statuses.len});
+    for (statuses) |s| {
+        try writer.print("  - {s} state={s} transport={s} tools={d} signed_in={s} needs_login={s}\n", .{
+            s.name,
+            @tagName(s.state),
+            @tagName(s.transport),
+            s.tools,
+            boolLabel(s.signed_in),
+            boolLabel(s.needs_login),
+        });
+        if (s.last_error) |err| {
+            try writer.writeAll("    error: ");
+            try writeMaskedInline(writer, alloc, err);
+            try writer.writeByte('\n');
+        }
+    }
+    return true;
+}
+
+/// MCP-v2's servers that need someone to act: down, retrying, missing a
+/// variable, or waiting for a login.
+fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !usize {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return 0;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return 0;
+    var count: usize = 0;
+    for (statuses) |s| {
+        const what = switch (s.state) {
+            .failed => "failed",
+            .retrying => "retrying",
+            .missing_env => "missing a variable",
+            else => if (s.needs_login) "needs login" else continue,
+        };
+        count += 1;
+        try writer.print("- mcp server {s} name={s}", .{ what, s.name });
+        if (s.missing) |variable| try writer.print(" variable={s}", .{variable});
+        if (s.last_error) |err| {
+            try writer.writeAll(" error=");
+            try writeMaskedInline(writer, alloc, err);
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
+}
+
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     try writer.writeAll("\n## Runtime Context\n");
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
@@ -2828,6 +2917,11 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
         boolLabel(io_mod.getenv("TMUX") != null),
         boolLabel(io_mod.getenv("CMUX_WORKSPACE_ID") != null),
     });
+
+    if (comptime @hasDecl(@TypeOf(app.*), "mcpHostSelected")) {
+        try writer.print("mcp_engine: {s}\n", .{if (app.mcpHostSelected()) "v2" else "v1"});
+    }
+    if (try writeMcpHostServers(writer, app, alloc)) return;
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()

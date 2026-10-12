@@ -637,7 +637,7 @@ fn streamAgentCompletion(
     else
         vercel_failure_diagnostics.collect(alloc, payload, result.err_body);
     if (result.status != .ok) return .{ .failed = .{
-        .kind = failureKind(result.status),
+        .kind = gatewayFailureKind(alloc, result.status, result.err_body),
         .detail = result.err_body,
         .diagnostics = .{
             .schema = diagnostics.schema,
@@ -706,6 +706,25 @@ const EventBridge = struct {
         sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
     }
 };
+
+/// Gateway reports the last provider it tried, so a provider's size rejection
+/// can arrive as a 400 from a later fallback. Classify it as too large.
+fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
+    const kind = failureKind(status);
+    if (kind != .invalid_request) return kind;
+    const body = err_body orelse return kind;
+    return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
+}
+
+test "Gateway 400 with a provider 413 attempt is a size failure" {
+    const alloc = std.testing.allocator;
+    const fallback_body = "{\"providerMetadata\":{\"gateway\":{\"routing\":{\"modelAttempts\":[{\"providerAttempts\":[{\"statusCode\":413},{\"statusCode\":400}]}]}}}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .bad_request, fallback_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, "AI_APICallError: Bad Request"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
+}
 
 fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
     return switch (status) {
@@ -997,14 +1016,17 @@ fn fetchCliModelCatalog(
     return switch (result) {
         .loaded => |loaded| project: {
             var catalog = loaded.catalog;
-            defer freeModelCatalog(alloc, &catalog);
-            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch return .{ .failure = .{
-                .access = loaded.provenance.access,
-                .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
-                .failure = .{ .category = .resource_exhausted },
-            } };
+            const ids = model_catalog.projectModelIds(alloc, catalog.items) catch {
+                freeModelCatalog(alloc, &catalog);
+                break :project .{ .failure = .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
+                    .failure = .{ .category = .resource_exhausted },
+                } };
+            };
             break :project .{ .loaded = .{
                 .ids = ids,
+                .entries = catalog,
                 .provenance = loaded.provenance,
             } };
         },
@@ -2859,9 +2881,12 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(id);
     const owned_model_type = try alloc.dupe(u8, model_type);
     errdefer alloc.free(owned_model_type);
+    const name = try parseModelName(alloc, entry.object.get("name"));
+    errdefer if (name) |value| alloc.free(value);
 
     return .{
         .id = id,
+        .name = name,
         .model_type = owned_model_type,
         .released = released,
         .has_tool_use = has_tool_use,
@@ -2878,6 +2903,15 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
     };
+}
+
+/// The catalog's display name without surrounding whitespace; null when it is missing, not a string, or blank.
+fn parseModelName(alloc: std.mem.Allocator, value: ?std.json.Value) !?[]u8 {
+    const raw = value orelse return null;
+    if (raw != .string) return null;
+    const trimmed = std.mem.trim(u8, raw.string, &std.ascii.whitespace);
+    if (trimmed.len == 0) return null;
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseReasoningEfforts(alloc: std.mem.Allocator, options: ?std.json.Value) !std.ArrayList(shared_types.ReasoningEffort) {
@@ -2961,6 +2995,27 @@ test "Ultrafast catalog support requires OpenAI priced metadata rather than mode
     try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
     for (catalog.items) |entry| {
         try std.testing.expectEqual(std.mem.eql(u8, entry.id, "openai/gpt-6-astra"), entry.supports_ultrafast_mode);
+    }
+}
+
+test "Gateway catalog entries keep the trimmed display name" {
+    const json =
+        \\{"data":[
+        \\{"id":"openai/gpt-6-astra","name":"GPT-6 Astra ","type":"language"},
+        \\{"id":"provider/blank","name":"  ","type":"language"},
+        \\{"id":"provider/unnamed","type":"language"},
+        \\{"id":"provider/numeric","name":7,"type":"language"}
+        \\]}
+    ;
+    var catalog = try parseSortedModelCatalog(std.testing.allocator, json);
+    defer freeModelCatalog(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 4), catalog.items.len);
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, "openai/gpt-6-astra")) {
+            try std.testing.expectEqualStrings("GPT-6 Astra", entry.name.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]u8, null), entry.name);
+        }
     }
 }
 

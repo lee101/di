@@ -205,17 +205,15 @@ const PendingCardPaintContext = struct {
     }
 };
 
-fn pendingCardLeadingAdvanceRows(
-    cursor_row: u16,
-    cursor_col: u16,
-    content_bottom: u16,
-) u16 {
-    if (cursor_col == 1 or cursor_row >= content_bottom) return 0;
-    const canonical_rows = render_engine.transcript_blocks.blockSeparatorNewlineCount(
+// A mid-line flow endpoint always takes the canonical user-turn separator,
+// even at the content bottom: the frame scrolls to reserve the card rows, so
+// the preview starts on a fresh row instead of overwriting the endpoint.
+fn pendingCardLeadingAdvanceRows(cursor_col: u16) u16 {
+    if (cursor_col == 1) return 0;
+    return render_engine.transcript_blocks.blockSeparatorNewlineCount(
         .unknown_raw,
         .user_turn,
     );
-    return @min(canonical_rows, content_bottom - cursor_row);
 }
 
 fn buildPendingCardProjection(
@@ -252,11 +250,7 @@ fn buildPendingCardProjection(
         @max(presentation_shell.cursor_row, 1),
         presentation_shell.layout.content_bottom,
     );
-    const leading_advance_rows = pendingCardLeadingAdvanceRows(
-        cursor_row,
-        presentation_shell.cursor_col,
-        presentation_shell.layout.content_bottom,
-    );
+    const leading_advance_rows = pendingCardLeadingAdvanceRows(presentation_shell.cursor_col);
     const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_advance_rows;
     const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
         app.alloc,
@@ -333,11 +327,7 @@ fn buildPendingSteeringCardProjection(
         row_count += @as(u16, @intCast(std.mem.count(u8, card, "\n"))) + gap;
     }
     if (row_count == 0) return null;
-    const leading_rows = pendingCardLeadingAdvanceRows(
-        @min(@max(shell.cursor_row, 1), shell.layout.content_bottom),
-        shell.cursor_col,
-        shell.layout.content_bottom,
-    );
+    const leading_rows = pendingCardLeadingAdvanceRows(shell.cursor_col);
     return .{
         .bytes = try pendingCardTerminalWireBytes(alloc, card_bytes.items),
         .row_count = row_count +| leading_rows,
@@ -773,6 +763,14 @@ pub fn Runtime(comptime App: type) type {
                     render_input.skillsMenuProjection(&app.skills)
                 else
                     .{},
+                .mcp_host_menu = if (comptime @hasField(App, "mcp")) .{
+                    .state = app.mcp.host_menu,
+                    .rows = app.mcp.host_menu_rows,
+                    .filter = app.input_runtime.edit_state.input.items,
+                    .tools = app.mcp.host_menu_tools,
+                    .notes = app.mcp.host_menu_notes,
+                    .sign_in_url = app.mcp.hostMenuSignInUrl(),
+                } else .{},
                 .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
                     const view = app.mcp.menuView();
                     break :blk .{
@@ -842,6 +840,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .upgrade_status = upgrade_label,
+                .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
                 else
@@ -1044,6 +1043,10 @@ pub fn Runtime(comptime App: type) type {
                 if (snapshot.reasons.contains(.first_frame)) {
                     App.startPromptCredentialPrewarm(app);
                 }
+            }
+            // MCP servers start once the first frame is on screen, never before.
+            if (comptime @hasDecl(App, "startMcpHostServers")) {
+                if (snapshot.reasons.contains(.first_frame)) App.startMcpHostServers(app);
             }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
@@ -1682,11 +1685,11 @@ pub fn Runtime(comptime App: type) type {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
-            const pending_preview_deferred = pending_submission_card and if (prepared_transcript) |prepared|
+            const pending_preview_overlaps_flow = pending_submission_card and if (prepared_transcript) |prepared|
                 pending_card.?.overlaps_flow_endpoint(prepared.cursor.cursor_col)
             else
                 false;
-            var pending_paint_ctx = if (pending_preview_deferred) null else if (pending_card) |card|
+            var pending_paint_ctx = if (pending_preview_overlaps_flow) null else if (pending_card) |card|
                 PendingCardPaintContext.init(
                     card,
                     footer_frame.paint.transcript_band,
@@ -1695,6 +1698,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
+            // A band too short for the preview below the flow endpoint defers it
+            // the same way: adoption writes the real card.
+            const pending_preview_deferred = pending_submission_card and
+                prepared_transcript != null and pending_paint_ctx == null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
                 .paint => {},
                 .retain => |retained_source| {
@@ -2118,13 +2125,6 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 candidate.transcript_area,
                 self.pending_tail_rows,
             );
-            if (canonical_area.isEmpty()) return .{
-                .inline_advance_rows = 0,
-                .occupied_transcript_rows = @min(
-                    self.pending_tail_rows,
-                    candidate.transcript_area.height(),
-                ),
-            };
 
             self.prepared_transcript.* = try self.presentation_shell.prepareTranscriptSurfacePaintFromSourceForFrame(
                 self.app.alloc,
@@ -2163,15 +2163,6 @@ fn FixedPointTranscriptContext(comptime App: type) type {
             const candidate_rows = candidate.transcript_area.height();
             if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) {
                 return .{ .occupied_transcript_rows = candidate_rows };
-            }
-            if (transcriptAreaBeforePendingTail(
-                candidate.transcript_area,
-                self.pending_tail_rows,
-            ).isEmpty()) {
-                return .{ .occupied_transcript_rows = @min(
-                    self.pending_tail_rows,
-                    candidate_rows,
-                ) };
             }
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
             const prepared = if (self.prepared_transcript.*) |*value| value else return error.MissingTranscriptPaint;
@@ -2240,8 +2231,11 @@ fn transcriptAreaBeforePendingTail(
     tail_rows: u16,
 ) render_engine.frame_layout.FrameRect {
     if (area.isEmpty() or tail_rows == 0) return area;
-    if (tail_rows >= area.height()) return .empty();
-    return .{ .top = area.top, .bottom = area.bottom - tail_rows };
+    // A tail taller than the band still leaves the flow endpoint row. Without
+    // it the frame seals no transcript transition, and adoption would rebase
+    // onto rows that never reached scrollback.
+    const canonical_rows = @max(area.height() -| tail_rows, 1);
+    return .{ .top = area.top, .bottom = area.top + canonical_rows - 1 };
 }
 
 fn FramePaintContext(comptime App: type) type {
@@ -2680,7 +2674,7 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     });
     try std.testing.expect(scroll > preview_row);
     try std.testing.expectEqual(@as(usize, 1), preview_summary_count);
-    try std.testing.expectEqual(@as(usize, 0), preview_card_count);
+    try std.testing.expectEqual(@as(usize, 1), preview_card_count);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, summary));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, "┃ - evidence gaps"));
@@ -2701,6 +2695,240 @@ test "pending prompt at an occupied band bottom preserves the summary through ad
     try std.testing.expectEqualStrings(finished, quiet);
 }
 
+fn currentCompactSource(shell: *transcript_runtime.TranscriptRuntime) ?*transcript_runtime.TranscriptPreparationSource {
+    for (&shell.compact_transcript_source_cache.entries) |*entry| {
+        if (entry.*) |*cached| {
+            if (cached.content_revision == shell.full_transcript_content_revision and
+                cached.cols == shell.layout.cols and
+                cached.has_committed_frame == shell.has_committed_frame)
+            {
+                return &cached.source;
+            }
+        }
+    }
+    return null;
+}
+
+const compact_source_cache_capacity = @typeInfo(@FieldType(
+    @FieldType(transcript_runtime.TranscriptRuntime, "compact_transcript_source_cache"),
+    "entries",
+)).array.len;
+
+fn compactSourceCacheSlots(shell: *const transcript_runtime.TranscriptRuntime) [compact_source_cache_capacity]?[*]const u8 {
+    var slots: [compact_source_cache_capacity]?[*]const u8 = undefined;
+    for (shell.compact_transcript_source_cache.entries, &slots) |entry, *slot| {
+        slot.* = if (entry) |cached| cached.source.bytes.ptr else null;
+    }
+    return slots;
+}
+
+fn findGridRow(alloc: std.mem.Allocator, physical: *vt_emulator.Grid, needle: []const u8) !?u16 {
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    for (1..physical.rows + 1) |row| {
+        row_text.clearRetainingCapacity();
+        try physical.rowTextTrimmed(@intCast(row), &row_text);
+        if (std.mem.find(u8, row_text.items, needle) != null) return @intCast(row);
+    }
+    return null;
+}
+
+test "pending prompt on a full screen is visible before adoption and keeps its row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-full-screen.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, 24);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 60, .unknown_raw);
+    const summary = "  6m 25s (↑14 ↓30k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    // The flow endpoint sits mid-line at the content bottom, as after any
+    // finished turn in a long session.
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+
+    const prompt = "FULL_SCREEN_PROMPT";
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+    const preview_row = (try findGridRow(alloc, &physical, prompt)) orelse return error.PendingPreviewNotPainted;
+    const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
+    try std.testing.expect(preview_row <= app.shell.layout.content_bottom);
+    try std.testing.expectEqual(summary_row + 2, preview_row);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, prompt));
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    const seeded = currentCompactSource(&app.shell) orelse return error.CommittedSourceNotCached;
+    const slots_before = compactSourceCacheSlots(&app.shell);
+    // A cache hit refreshes the cursor from the shell, so clearing this
+    // column proves the frame read the commit's source instead of rebuilding.
+    const poisoned_col = std.math.maxInt(@TypeOf(seeded.preview.cursor_col));
+    seeded.preview.cursor_col = poisoned_col;
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(slots_before, compactSourceCacheSlots(&app.shell));
+    try std.testing.expect(seeded.preview.cursor_col != poisoned_col);
+    try std.testing.expectEqual(preview_row, (try findGridRow(alloc, &physical, prompt)) orelse return error.AdoptedCardMissing);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, prompt));
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(adopted, quiet);
+}
+
+test "pending steering on a full screen paints below the summary and leaves no fragment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-steering-full-screen.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, 24);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 60, .unknown_raw);
+    const summary = "  6m 25s (↑14 ↓30k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+
+    const steering = "FULL_SCREEN_STEERING";
+    app.worker.steering_messages = &.{steering};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const steering_row = (try findGridRow(alloc, &physical, steering)) orelse return error.SteeringPreviewNotPainted;
+    const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
+    try std.testing.expectEqual(summary_row + 2, steering_row);
+    try std.testing.expect(steering_row <= app.shell.layout.content_bottom);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, steering));
+
+    app.worker.steering_messages = &.{};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const cleared = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(cleared);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cleared, summary));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, cleared, steering));
+}
+
+test "pending prompt taller than a near-empty transcript reaches scrollback through adoption" {
+    // The short terminal leaves the preview no row below the flow endpoint.
+    for ([_]struct { rows: u16, preview_tail: usize }{
+        .{ .rows = 24, .preview_tail = 1 },
+        .{ .rows = 7, .preview_tail = 0 },
+    }) |case| try expectTallPendingPromptReachesScrollback(case.rows, case.preview_tail);
+}
+
+fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-banner-paste.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = rows, .content_bottom = rows - 4, .divider_top_row = rows - 3, .input_row = rows - 2, .divider_bottom_row = rows - 1, .hint_row = rows } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, rows);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    const banner = "BANNER_ROW · Run /help for commands";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, banner, .unknown_raw);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    try std.testing.expectEqual(@as(u16, 1), app.shell.cursor_row);
+    try std.testing.expect(app.shell.cursor_col > 1);
+
+    const first_line = "FIRST_PROMPT_LINE";
+    const last_line = "LAST_PROMPT_LINE";
+    const prompt = first_line ++ "\n" ++ ("PASTE_BODY\n" ** 60) ++ last_line;
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+    try std.testing.expect(app.shell.transcript_commit_state == .stable);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, banner));
+    try std.testing.expectEqual(preview_tail, std.mem.count(u8, preview, last_line));
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    try std.testing.expect(try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset) > 0);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, banner));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, first_line));
+    try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, adopted, "PASTE_BODY"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, last_line));
+    try std.testing.expect(std.mem.find(u8, adopted, banner).? < std.mem.find(u8, adopted, first_line).?);
+}
+
 test "pending prompt preview preserves blank bottom rows and canonical leading space" {
     const alloc = std.testing.allocator;
     const TestApp = struct {
@@ -2717,12 +2945,14 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
         } } },
     };
     defer app.submission.pending.?.deinit(alloc);
-    const cases = [_]struct { row: u16, col: u16, advance: u16, deferred: bool }{
-        .{ .row = 20, .col = 1, .advance = 0, .deferred = false },
-        .{ .row = 8, .col = 47, .advance = 2, .deferred = false },
-        .{ .row = 19, .col = 47, .advance = 1, .deferred = false },
-        .{ .row = 20, .col = 47, .advance = 0, .deferred = true },
-        .{ .row = 24, .col = 47, .advance = 0, .deferred = true },
+    // Rows at or near the content bottom keep the canonical separator; the
+    // frame scrolls to reserve it, so only unscrolled rows check the paint row.
+    const cases = [_]struct { row: u16, col: u16, advance: u16, unscrolled: bool }{
+        .{ .row = 20, .col = 1, .advance = 0, .unscrolled = true },
+        .{ .row = 8, .col = 47, .advance = 2, .unscrolled = true },
+        .{ .row = 19, .col = 47, .advance = 2, .unscrolled = false },
+        .{ .row = 20, .col = 47, .advance = 2, .unscrolled = false },
+        .{ .row = 24, .col = 47, .advance = 2, .unscrolled = false },
     };
     for (cases) |case| {
         var shell = transcript_runtime.TranscriptRuntime{
@@ -2734,8 +2964,8 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
         var card = (try buildPendingCardProjection(TestApp, &app, &shell, null)).?;
         defer card.deinit(alloc);
         try std.testing.expectEqual(case.advance, card.leading_advance_rows);
-        try std.testing.expectEqual(case.deferred, card.overlaps_flow_endpoint(case.col));
-        if (case.deferred) continue;
+        try std.testing.expect(!card.overlaps_flow_endpoint(case.col));
+        if (!case.unscrolled) continue;
         const context = PendingCardPaintContext.init(card, .{ .top = 1, .bottom = 20, .owner = .transcript }, case.row, false).?;
         try std.testing.expectEqual(case.row + case.advance, context.row);
         try std.testing.expect(context.max_rows > 0);
@@ -2743,22 +2973,8 @@ test "pending prompt preview preserves blank bottom rows and canonical leading s
 }
 
 test "pending prompt uses the canonical user turn boundary" {
-    try std.testing.expectEqual(
-        @as(u16, 2),
-        pendingCardLeadingAdvanceRows(8, 47, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 0),
-        pendingCardLeadingAdvanceRows(8, 1, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 0),
-        pendingCardLeadingAdvanceRows(20, 47, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 1),
-        pendingCardLeadingAdvanceRows(19, 47, 20),
-    );
+    try std.testing.expectEqual(@as(u16, 2), pendingCardLeadingAdvanceRows(47));
+    try std.testing.expectEqual(@as(u16, 0), pendingCardLeadingAdvanceRows(1));
 }
 
 test "pending prompt painting fits the solved transcript band" {
@@ -3486,6 +3702,22 @@ const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
+    steering_messages: []const []const u8 = &.{},
+
+    pub fn snapshotSteeringPresentation(
+        self: *const @This(),
+        alloc: std.mem.Allocator,
+    ) !@import("../agent/worker_runtime.zig").SteeringPresentationSnapshot {
+        var snapshot: @import("../agent/worker_runtime.zig").SteeringPresentationSnapshot = .{};
+        errdefer snapshot.deinit(alloc);
+        if (self.steering_messages.len == 0) return snapshot;
+        snapshot.messages = try alloc.alloc([]u8, self.steering_messages.len);
+        for (snapshot.messages) |*message| message.* = &.{};
+        for (self.steering_messages, 0..) |message, index| {
+            snapshot.messages[index] = try alloc.dupe(u8, message);
+        }
+        return snapshot;
+    }
 
     pub fn isCancelRequested(self: *const @This()) bool {
         return self.cancel_requested;

@@ -1104,7 +1104,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "a20d692342fa726324ee0ed73a9e67a18062ace183f63703c7e0774f39c81848",
+        "2456f7b562b73a04fae1e77e01264c323378b2345ec58fd37a6af8f2ec63d929",
         &actual_hex,
     );
 }
@@ -1236,7 +1236,7 @@ test "shell advertises only run interact and stop" {
 }
 
 test "shell run schema separates profile and explicit shell forms" {
-    try std.testing.expect(std.mem.find(u8, shell_description, "omit profile and shell; never provide both") != null);
+    try std.testing.expect(std.mem.find(u8, shell_description, "Omit shell and profile unless the user named a shell") != null);
     try std.testing.expectEqual(@as(usize, 4), shell_action_schemas.len);
     const profile_run = shell_action_schemas[0];
     const explicit_run = shell_action_schemas[1];

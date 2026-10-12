@@ -10,7 +10,7 @@ single native process with no daemon and no background index. It is
 model-agnostic, embeds as a harness in larger systems, and its interface stays
 closer to a Unix shell than an IDE in the terminal.
 
-## Highlights
+fx is the smallest coding agent: one native binary with no runtime to install. It's written in Zig and runs the same on your laptop, in CI, or inside an agent sandbox.
 
 - **Efficient by default:** tool output is capped, parallel tool batches stay bounded, and the whole agent is one native process, so token spend and CPU/RAM use stay predictable
 - **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter, including [OpenPaths](https://openpaths.io)
@@ -111,7 +111,9 @@ cd your_project
 di
 ```
 
-Or make a one-shot request:
+Type what you want done and press Enter. `/help` lists the slash commands.
+
+For a single request without the interactive shell, use `fx ask`. Add `--json` when a script needs to read the result:
 
 ```bash
 di ask "explain the changes in this repository"
@@ -319,13 +321,13 @@ Inside the shell, run `/help` to browse interactive commands.
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 di preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
-## Images
+Skill instructions and MCP tool schemas don't go to the model up front. They load when the model asks for them, which keeps the context small and leaves more room for your code.
 
 Paste an image, attach one with `di ask --image PATH`, or ask di to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
 
 When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. di does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
 
-## Shell commands
+## Use fx from other programs
 
 Commands run in your login shell, zsh or bash, with your startup files applied, so your aliases, functions, and `PATH` work as they do in your terminal. di runs the startup files once and restores their result for each command, so a slow `.zshrc` does not slow down every call.
 
@@ -337,18 +339,18 @@ Commands run in your login shell, zsh or bash, with your startup files applied, 
 
 ## Documentation
 
-Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
+The manual lives at [fx.sh/docs](https://fx.sh/docs). It covers models, permissions, configuration, skills, MCP, sessions, and every CLI and slash command.
 
-## Custom model connections
+For agents, [fx.sh/llms.txt](https://fx.sh/llms.txt) lists every page as Markdown, and [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file. Adding `.md` to any docs URL returns that page as Markdown.
 
-Add named connections for any OpenAI Chat Completions endpoint, including local servers such as Ollama and gateways such as OpenRouter, in `~/.fx/settings.json`, then select one for the profile or a single invocation:
+## Feedback
 
 ```bash
 di provider local
 FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 di ask "review this change"
 ```
 
-See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
+## Contributing
 
 Custom connections retain provider reasoning across tool calls and saved-session resumes. Adjacent unsigned text or summary fragments with identical metadata are combined to reduce replay size; signed, encrypted, and unfamiliar blocks stay separate. Automatic permission review retries temporary provider failures once without executing the pending action before approval.
 
@@ -534,13 +536,13 @@ live message test.
 
 ## Security
 
-Report security vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
+Report vulnerabilities through the [contact page](https://fx.sh/contact) instead of a public issue.
 
 On Linux, di marks itself non-dumpable (`PR_SET_DUMPABLE=0`) and sets `RLIMIT_CORE` to 0 at startup, so same-user processes cannot ptrace it or read its memory, and crashes do not write core files. Child processes inherit the zero core limit. Set `FX_ALLOW_DEBUG=1` to skip this hardening when attaching gdb or running under valgrind.
 
 ## License
 
-[Apache-2.0](LICENSE). Third-party licenses and attributions are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[Apache-2.0](LICENSE). Third-party licenses and attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Credits
 

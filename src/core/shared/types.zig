@@ -3091,7 +3091,7 @@ fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult
     };
 }
 
-fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) void {
+pub fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) void {
     alloc.free(result.tool_call_id);
     alloc.free(result.tool_name);
     alloc.free(result.output);
