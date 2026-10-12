@@ -474,9 +474,9 @@ fn getenvFromRaw(raw: RawEnviron, key: []const u8) ?[]const u8 {
     @setRuntimeSafety(false);
     var i: usize = 0;
     while (raw[i]) |entry_z| : (i += 1) {
-        const entry = std.mem.sliceTo(entry_z, 0);
-        if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        var j: usize = 0;
+        while (j < key.len and entry_z[j] == key[j] and entry_z[j] != 0) j += 1;
+        if (j == key.len and entry_z[j] == '=') return std.mem.sliceTo(entry_z + j + 1, 0);
     }
     return null;
 }
