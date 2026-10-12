@@ -134,6 +134,8 @@ fn buildPendingPromptDraft(
     };
 }
 
+pub const PromptDelivery = enum { auto, after_turn };
+
 pub fn SubmitRuntime(comptime App: type) type {
     return struct {
         pub fn request_context_compaction(app: *App) !void {
@@ -666,6 +668,10 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         pub fn submit(app: *App, max_prompt_history: usize) !void {
+            try submitWithDelivery(app, max_prompt_history, .auto);
+        }
+
+        pub fn submitWithDelivery(app: *App, max_prompt_history: usize, delivery: PromptDelivery) !void {
             if (comptime @hasField(App, "worker")) {
                 if (comptime @hasDecl(@TypeOf(app.worker), "compactionActivitySnapshot")) {
                     const observed = app.worker.compactionActivitySnapshot();
@@ -780,7 +786,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             if (trimmed.len == 0) {
                 if (app.pending_images.items.len > 0) {
-                    const admission = try enqueuePromptForSubmit(app, "", &.{});
+                    const admission = try enqueuePromptForSubmit(app, "", &.{}, delivery);
                     if (admission == .rejected) return;
                     releasePendingImages(app);
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
@@ -902,12 +908,14 @@ pub fn SubmitRuntime(comptime App: type) type {
                     visual_text.text,
                     display_skill_tokens,
                     images,
+                    delivery,
                 )
             else
                 try enqueuePromptForSubmit(
                     app,
                     visual_text.text,
                     display_skill_tokens,
+                    delivery,
                 );
             if (admission == .rejected) return;
             commitStableExtractedImageIds(app, extracted.images);
@@ -1133,7 +1141,13 @@ pub fn SubmitRuntime(comptime App: type) type {
             app: *App,
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
+            delivery: PromptDelivery,
         ) !PromptAdmission {
+            if (delivery == .after_turn and comptime @hasDecl(App, "enqueueDeferredPromptWithSkillBindings")) {
+                if (!try preflightPrompt(app)) return .rejected;
+                if (!try App.enqueueDeferredPromptWithSkillBindings(app, prompt, skill_tokens)) return .rejected;
+                return .enqueued;
+            }
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
@@ -1201,6 +1215,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
             staged_images: *std.ArrayList(types.ImageAttachment),
+            delivery: PromptDelivery,
         ) !PromptAdmission {
             const original_images = app.pending_images;
             app.pending_images = staged_images.*;
@@ -1214,6 +1229,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 app,
                 prompt,
                 skill_tokens,
+                delivery,
             );
             if (admission == .rejected) {
                 staged_images.* = app.pending_images;

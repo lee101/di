@@ -1,0 +1,5 @@
+[
+  {"id":"orbit-dodger","prompt":"Build a polished Three.js orbit-dodger game: move a spacecraft with arrow keys or WASD, dodge incoming asteroids, earn score over time, show health and game over, and restart with R. Include responsive rendering and an accessible controls panel."},
+  {"id":"crystal-maze","prompt":"Build a polished Three.js crystal maze: move with WASD or arrow keys, navigate walls with collision detection, collect five crystals, reach the exit to win, and restart with R. Include a readable HUD, responsive camera, and clear controls."},
+  {"id":"island-hopper","prompt":"Build a polished Three.js island-hopper platform game: move with WASD, jump with Space, land on platforms with deterministic gravity and collision detection, collect coins, respawn after falling, and restart with R. Include a follow camera, HUD, and clear controls."}
+]

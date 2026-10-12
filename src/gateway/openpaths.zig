@@ -1035,11 +1035,30 @@ fn fetchCatalogForProvider(
     if (response.status != .ok) {
         return .{ .failure = model_catalog.failureForHttpStatus(response.status) };
     }
-    const catalog = parseCatalog(alloc, response.body) catch |err| {
+    var catalog = parseCatalog(alloc, response.body) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
+    if (source == .openpaths_api_key) {
+        ensureFreeModel(alloc, &catalog) catch |err| {
+            model_catalog.freeModelCatalog(alloc, &catalog);
+            return err;
+        };
+    }
     return .{ .catalog = catalog };
+}
+
+pub const free_model_id = "openpaths/free";
+
+fn ensureFreeModel(alloc: Allocator, catalog: *std.ArrayList(model_catalog.ModelCatalogEntry)) !void {
+    for (catalog.items) |entry| {
+        if (std.mem.eql(u8, entry.id, free_model_id)) return;
+    }
+    const id = try alloc.dupe(u8, free_model_id);
+    errdefer alloc.free(id);
+    const model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(model_type);
+    try catalog.append(alloc, .{ .id = id, .model_type = model_type, .has_tool_use = true });
 }
 
 const BoundedGetResponse = struct {
@@ -1114,6 +1133,10 @@ fn fetchBoundedGet(
 }
 
 fn modelsUrl(alloc: Allocator, source: types.CredentialSource) ![]const u8 {
+    if (io_mod.getenv("FX_E2E_OPENPATHS_MODELS_URL")) |override| {
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenPathsEndpoint;
+        return alloc.dupe(u8, override);
+    }
     if (io_mod.getenv(e2e_endpoint_env)) |_| {
         // The e2e chat override only covers POST /chat/completions; catalogs stay live.
         return switch (source) {
@@ -1461,6 +1484,15 @@ test "parse catalog keeps every chat id the models endpoint returns" {
     try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-flash", catalog.items[1].id);
     try std.testing.expectEqualStrings("brand-new/vendor-model", catalog.items[2].id);
     try std.testing.expectEqualStrings("zai/glm-5.2", catalog.items[3].id);
+}
+
+test "ensureFreeModel appends openpaths/free once" {
+    var catalog = try parseCatalog(std.testing.allocator, "{\"data\":[{\"id\":\"gpt-5\"}]}");
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+    try ensureFreeModel(std.testing.allocator, &catalog);
+    try ensureFreeModel(std.testing.allocator, &catalog);
+    try std.testing.expectEqual(@as(usize, 2), catalog.items.len);
+    try std.testing.expectEqualStrings(free_model_id, catalog.items[1].id);
 }
 
 test "parse catalog drops models that only serve embeddings, speech, or media" {

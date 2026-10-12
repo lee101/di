@@ -1621,6 +1621,7 @@ describe("cli: doctor", () => {
         expect(r.code).toBe(0);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("doctor");
+        expect(json.workspace).toBe(realpathSync(workspace));
         expect(Array.isArray(json.checks)).toBe(true);
         expect(json).toHaveProperty("ok_count");
         expect(json).toHaveProperty("warn_count");

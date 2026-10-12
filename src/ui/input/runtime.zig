@@ -2152,7 +2152,8 @@ test "input escape parser resolves unmapped single-parameter CSI u to ignore" {
 
 test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[57352;2u", moveEscape(.visual_up, true));
-    try expectEscapeAction("[57352;3u", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("[57352;3u", .edit_queued_prompt);
+    try expectEscapeAction("[57352;4u", moveEscape(.paragraph_up, true));
     try expectEscapeAction("[57353;5u", moveEscape(.visual_down, false));
     try expectEscapeAction("[57353;9u", moveEscape(.draft_end, false));
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
@@ -2262,9 +2263,9 @@ test "input escape parser decodes application-keypad SS3 keys" {
 }
 
 test "input escape parser preserves double escape meta behavior" {
-    try expectEscapeAction("\x1b[A", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("\x1b[A", .edit_queued_prompt);
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
-    try expectEscapeAction("\x1bOA", moveEscape(.paragraph_up, false));
+    try expectEscapeAction("\x1bOA", .edit_queued_prompt);
     try expectEscapeAction("\x1bOB", moveEscape(.paragraph_down, false));
     try expectEscapeAction("\x1b[D", moveEscape(.word_left, false));
     try expectEscapeAction("\x1b[C", moveEscape(.word_right, false));
@@ -3587,7 +3588,7 @@ test "input escape parser handles double-ESC as meta prefix for arrows" {
     // ESC ESC [ A — Option+Up on terminals that send Meta as ESC prefix
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, 0x1b));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '['));
-    try std.testing.expectEqual(@as(?InputEscapeAction, moveEscape(.paragraph_up, false)), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .edit_queued_prompt), consumeInputEscapeByte(&stage, &param, &param2, 'A'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

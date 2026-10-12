@@ -45,6 +45,7 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
+const runtime_live_context = @import("live_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const compaction_activity = @import("../../output/compaction_activity.zig");
@@ -3335,7 +3336,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -4730,6 +4731,7 @@ fn disableFastRouteAfterFailure(
 /// can never splice output across two different models.
 noinline fn applyCircuitBreakerFallback(
     provider: model_provider.ProviderId,
+    credential_source: ?types.CredentialSource,
     fallback_slot: *?[]const u8,
     route_model: *[]const u8,
     cause: model_response_recovery.FailureCause,
@@ -4737,7 +4739,7 @@ noinline fn applyCircuitBreakerFallback(
     latest_diagnostic: *?types.ModelFailureDiagnostic,
     trace_ctx: TraceContext,
 ) bool {
-    if (provider != .gateway and provider != .openpaths) return false;
+    if (provider != .openpaths or credential_source != .openrouter_api_key) return false;
     if (!replay_safe) return false;
     if (cause != .provider_unavailable and cause != .transport_interrupted) return false;
     if (fallback_slot.* != null) return false;
@@ -4758,12 +4760,13 @@ noinline fn applyCircuitBreakerFallback(
 test "model circuit breaker is limited to compatible gateway transports" {
     const original = model_provider.openpaths_default_model;
 
-    inline for (.{ model_provider.ProviderId.codex, model_provider.ProviderId.grok }) |provider| {
+    inline for (.{ model_provider.ProviderId.codex, model_provider.ProviderId.grok, model_provider.ProviderId.gateway }) |provider| {
         var fallback: ?[]const u8 = null;
         var route: []const u8 = original;
         var diagnostic: ?types.ModelFailureDiagnostic = null;
         try std.testing.expect(!applyCircuitBreakerFallback(
             provider,
+            .openrouter_api_key,
             &fallback,
             &route,
             .provider_unavailable,
@@ -4776,11 +4779,21 @@ test "model circuit breaker is limited to compatible gateway transports" {
         try std.testing.expect(diagnostic == null);
     }
 
+    inline for (.{ @as(?types.CredentialSource, null), @as(?types.CredentialSource, .openpaths_api_key) }) |source| {
+        var fallback: ?[]const u8 = null;
+        var route: []const u8 = original;
+        var diagnostic: ?types.ModelFailureDiagnostic = null;
+        try std.testing.expect(!applyCircuitBreakerFallback(.openpaths, source, &fallback, &route, .provider_unavailable, true, &diagnostic, .{}));
+        try std.testing.expect(fallback == null);
+        try std.testing.expectEqualStrings(original, route);
+    }
+
     var fallback: ?[]const u8 = null;
     var route: []const u8 = "openpaths/stealth/ox-alpha";
     var diagnostic: ?types.ModelFailureDiagnostic = null;
     try std.testing.expect(applyCircuitBreakerFallback(
         .openpaths,
+        .openrouter_api_key,
         &fallback,
         &route,
         .provider_unavailable,
@@ -4788,7 +4801,7 @@ test "model circuit breaker is limited to compatible gateway transports" {
         &diagnostic,
         .{},
     ));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", fallback.?);
+    try std.testing.expectEqualStrings("openrouter/free", fallback.?);
     try std.testing.expectEqualStrings(fallback.?, route);
     try std.testing.expect(diagnostic != null);
 }
@@ -6950,7 +6963,6 @@ fn processQueuedPromptLoop(
     var fast_unavailable_notified = false;
     var ultrafast_unconfirmed_notified = false;
     var tool_image_strip_notified = false;
-    var attachment_withheld_notified = false;
     // Attachment pixel sizes probed during this turn, so each step does not
     // reread every attachment snapshot. Entries live in the turn arena.
     var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
@@ -7038,6 +7050,10 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
+        var remaining_steps_buffer: [256]u8 = undefined;
+        if (agent_steps.remaining_steps_notice(&remaining_steps_buffer, config.agent_step_limit, step)) |notice| {
+            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = notice });
+        }
         if (skills.explicit) |section| {
             if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
         }
@@ -7326,35 +7342,26 @@ fn processQueuedPromptLoop(
                 }
             }
             const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const loaded_messages = try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages);
+                const max_dimension = image_data.requestMaxDimension(image_data.countRequestImages(loaded_messages));
+                const safe_tool_messages = try runtime_execution_memory.withholdRequestToolImages(overlay_arena, loaded_messages, max_dimension, config.max_tool_result_bytes);
                 const projection = try image_attachments.withholdOversizedAttachments(
                     overlay_arena,
                     arena,
                     &attachment_dimensions,
-                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                    safe_tool_messages,
+                    max_dimension,
                 );
-                // The model gets a note for each withheld attachment. The user
-                // hears about ones attached this turn, once per turn.
-                var withheld_now: usize = 0;
-                for (projection.withheld_ids) |id| {
-                    for (job.images) |image| {
-                        if (image.id == id) withheld_now += 1;
-                    }
-                }
-                if (withheld_now > 0 and !attachment_withheld_notified) {
-                    attachment_withheld_notified = true;
-                    const limit = image_data.max_image_dimension;
-                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
-                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
-                    else
-                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
-                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
-                }
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            var request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
+            }
+            if (try runtime_live_context.project(overlay_arena, config, request_messages)) |projection| {
+                request_messages = try with_replyable_conversation_tail(overlay_arena, projection.messages);
+                try gateway_instructions.append(overlay_arena, .{ .role = .system, .content = projection.instructions });
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
@@ -7721,6 +7728,7 @@ fn processQueuedPromptLoop(
                 latest_recovery_diagnostic = failure_diagnostic;
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     failure_cause,
@@ -8373,6 +8381,7 @@ fn processQueuedPromptLoop(
                 const recovery_elapsed_ns: u64 = recoveryElapsedNs(recovery_started_at_ms) orelse 0;
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,
@@ -8770,6 +8779,7 @@ fn processQueuedPromptLoop(
                 );
                 _ = applyCircuitBreakerFallback(
                     job.provider,
+                    job.credential_source,
                     &circuit_fallback_model,
                     &gateway_model,
                     cause,
@@ -11951,7 +11961,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,
@@ -12222,7 +12232,7 @@ fn processQueuedPromptLoop(
                 within_turn_suffix.items,
                 &summary_accumulator,
                 assistant_text,
-                .completed,
+                .failed,
                 null,
                 &finish_trace,
                 "terminal_validation_retry",

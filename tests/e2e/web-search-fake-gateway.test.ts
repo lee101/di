@@ -319,6 +319,8 @@ function fakeGatewayEnv(
     HOME: root.home,
     AI_GATEWAY_API_KEY: "fake-e2e-key",
     VERCEL_OIDC_TOKEN: undefined,
+    OPENPATHS_API_KEY: undefined,
+    OPENROUTER_API_KEY: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -1211,6 +1213,7 @@ describe("web_search Gateway fixture", () => {
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(result.stderr).toContain("Agent step limit reached");
+        expect(JSON.stringify(gateway.requests[0].body)).toContain("Turn budget: 1 model call left, including this one.");
         expect(gateway.requests[0].headers.get("ai-language-model-id")).toBe(PARALLEL_OUTER_MODEL);
         expect(readFileSync(join(root.workspace, "env-proof.txt"), "utf8")).toBe(
           "environment overrides applied",
@@ -1323,6 +1326,8 @@ describe("web_search Gateway fixture", () => {
       const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
       try {
         await startAcpCodeSession(client);
+        const mode = await client.request("session/set_mode", { modeId: "ask" }, 4);
+        expect(mode.error).toBeUndefined();
         const messages = await runAcpPrompt(client, "Issue denied web search.");
 
         expect(gateway.requests).toHaveLength(1);

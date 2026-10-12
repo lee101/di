@@ -1184,6 +1184,10 @@ pub fn Runtime(comptime App: type) type {
                         try app_permission_runtime.Runtime(App).toggleMode(app);
                     }
                 },
+                .edit_queued_prompt => {
+                    if (try restoreQueuedPromptToComposer(app)) return .done;
+                    try routeComposerShortcutAction(app, .{ .move = .{ .kind = .paragraph_up } }, max_input_len);
+                },
                 .open_all_sessions => {
                     if (comptime @hasField(App, "session_persistence") and
                         runtime_profile.allows(App, .durable_sessions))
@@ -1470,6 +1474,56 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn plainComposerPrompt(app: *App) bool {
+            if (helpMenuActive(app) or settingsMenuActive(app) or modelMenuActive(app) or
+                skillsMenuActive(app) or commandSkillsMenuActive(app)) return false;
+            if (completion_rt.hasFileQuery(app) or completion_rt.hasModelQuery(app) or
+                provider_picker_rt.hasQuery(app)) return false;
+            if (app.input_runtime.model_picker_draft != null) return false;
+            const text = std.mem.trim(u8, app.input_runtime.edit_state.input.items, " \t\r\n");
+            if (text.len == 0 or text[0] == '/') return false;
+            return true;
+        }
+
+        fn workerBusy(app: *App) bool {
+            if (comptime !@hasField(App, "worker")) return false;
+            if (comptime !@hasDecl(@TypeOf(app.worker), "isProcessing")) return false;
+            return app.worker.isProcessing();
+        }
+
+        /// Queues the composer text to run after the active work and queued
+        /// prompts finish. With `submit_when_idle`, an idle worker submits normally.
+        fn queueCurrentPrompt(app: *App, max_prompt_history: usize, submit_when_idle: bool) !bool {
+            if (!plainComposerPrompt(app)) return false;
+            if (!workerBusy(app)) {
+                if (!submit_when_idle) return false;
+                try submit_rt.submit(app, max_prompt_history);
+                return true;
+            }
+            try submit_rt.submitWithDelivery(app, max_prompt_history, .after_turn);
+            if (app.input_runtime.edit_state.input.items.len > 0) return true;
+            if (comptime @hasDecl(App, "writeDomainNotice")) {
+                var buf: [64]u8 = undefined;
+                const body = std.fmt.bufPrint(&buf, "queued, {d} waiting (alt+up to edit)", .{app.worker.queuedPromptCount()}) catch "queued";
+                try app.writeDomainNotice(.{ .topic = "queue", .tone = .information, .body = body }, true);
+            }
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
+        fn restoreQueuedPromptToComposer(app: *App) !bool {
+            if (comptime !@hasDecl(App, "popQueuedPromptForEdit")) return false;
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            if (app.input_runtime.composer_history.activeIndex() != null) return false;
+            const text = (try App.popQueuedPromptForEdit(app)) orelse return false;
+            defer std.heap.c_allocator.free(text);
+            try app.input_runtime.edit_state.setText(app.alloc, text);
+            app.input_runtime.vertical_navigation.reset();
+            app.input_runtime.historyBoundary(app.alloc);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn handleComposerByte(
             app: *App,
             byte: u8,
@@ -1483,6 +1537,9 @@ pub fn Runtime(comptime App: type) type {
                 },
                 4 => {
                     try handleSemanticCtrlD(app, max_input_len);
+                },
+                17 => {
+                    _ = try queueCurrentPrompt(app, max_prompt_history, true);
                 },
                 '\t' => {
                     if (cycleHelpMenuCategory(app, 1) or cycleSettingsMenuCategory(app, 1)) {
@@ -1530,6 +1587,8 @@ pub fn Runtime(comptime App: type) type {
                                 }
                                 app.shell.render_requests.request(.footer);
                             }
+                        } else {
+                            _ = try queueCurrentPrompt(app, max_prompt_history, false);
                         }
                     }
                 },

@@ -389,7 +389,7 @@ pub fn resolveForProvider(
     preferred: ?Source,
 ) !Resolution {
     if (provider == .openpaths) {
-        const ordered = [_]Source{ .openpaths_api_key, .openrouter_api_key };
+        const ordered = [_]Source{ .openrouter_api_key, .openpaths_api_key };
         if (preferred) |source| {
             for (ordered) |candidate| {
                 if (candidate != source) continue;

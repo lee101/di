@@ -1390,6 +1390,42 @@ pub const WorkerRuntime = struct {
         return text;
     }
 
+    /// Removes the newest text-only prompt queued behind the active work and
+    /// returns an allocator-owned copy of its text for composer editing.
+    /// Steering, recovery, and image or skill carrying prompts stay queued.
+    pub fn popQueuedPromptForEdit(self: *WorkerRuntime, alloc: std.mem.Allocator) !?[]u8 {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var index: usize = self.queued_prompts.items.len;
+        const remove_index = while (index > 0) {
+            index -= 1;
+            const prompt = self.queued_prompts.items[index];
+            if (prompt.delivery != .ordinary) continue;
+            if (prompt.recovery_checkpoint != null or prompt.user_prompt_already_presented) continue;
+            if (!sameTurnSteeringEligible(prompt)) continue;
+            break index;
+        } else return null;
+
+        const text = try alloc.dupe(u8, self.queued_prompts.items[remove_index].prompt);
+        const prompt = self.queued_prompts.orderedRemove(remove_index);
+        if (self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        const turn_id = prompt.turn_id;
+        const remaining = self.queuedWorkCountLocked();
+        freeQueuedPrompt(alloc, prompt);
+        debug_trace.eventf(
+            "worker",
+            "prompt_queue_retracted",
+            .{ .turn_id = turn_id },
+            "remaining={d}",
+            .{remaining},
+        );
+        self.worker_cond.broadcast(io_mod.getIo());
+        return text;
+    }
+
     pub fn waitAndTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -4638,6 +4674,31 @@ test "active prompt admission drains steering in FIFO order" {
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
     try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
     try std.testing.expectEqualStrings("second", runtime.worker_events.items[1].append_user_feedback);
+}
+
+test "queued prompts run in order after the active turn and pop newest for edit" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 41;
+
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "first", "model"));
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "second", "model"));
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "steer", "model"));
+    try std.testing.expect(!runtime.isCancelRequested() or runtime.queued_prompts.items[2].delivery.isSteering());
+
+    const popped = (try runtime.popQueuedPromptForEdit(alloc)).?;
+    defer alloc.free(popped);
+    try std.testing.expectEqualStrings("second", popped);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
+    try std.testing.expectEqualStrings("first", runtime.queued_prompts.items[0].prompt);
+
+    const popped_first = (try runtime.popQueuedPromptForEdit(alloc)).?;
+    defer alloc.free(popped_first);
+    try std.testing.expectEqualStrings("first", popped_first);
+    try std.testing.expect((try runtime.popQueuedPromptForEdit(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queued_prompts.items.len);
 }
 
 test "immediate steering owns and clears only its cancellation" {

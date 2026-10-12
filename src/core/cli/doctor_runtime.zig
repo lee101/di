@@ -54,13 +54,14 @@ pub const Snapshot = struct {
 
 pub fn collect(
     alloc: Allocator,
+    resolved_workspace_root: []const u8,
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
     sessions_v2: bool,
 ) !Snapshot {
-    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    const workspace_root = try alloc.dupe(u8, resolved_workspace_root);
     debug_trace.configureFromEnv(alloc, workspace_root);
 
     var checks: std.ArrayList(Check) = .empty;
@@ -106,7 +107,7 @@ pub fn collect(
         return snapshot;
     };
     defer detailed.deinit(alloc);
-    snapshot.provider = detailed.settings.provider orelse .gateway;
+    snapshot.provider = model_provider.effectiveProvider(detailed.settings.provider);
     if (detailed.settings.models.get(snapshot.provider)) |model| {
         snapshot.provider = model_provider.rerouteUnservableSelection(
             .{ .provider = snapshot.provider, .model = model },

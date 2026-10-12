@@ -52,13 +52,18 @@ export OPENPATHS_API_KEY=...   # or OPENROUTER_API_KEY
 di
 ```
 
-The default model is `xiaomi/mimo-v2.6-pro` for an OpenPaths key and
-`stealth/space-bunny-alpha` for an OpenRouter key. Model lists are fetched
+The compatible-provider default is `stealth/space-bunny-alpha`, which requires
+an OpenRouter key. With an OpenPaths key, choose an available model explicitly.
+When both keys are available, automatic credential selection prefers
+OpenRouter; an explicit `credential_source` keeps its selected source.
+Model lists are fetched
 live from OpenPaths or OpenRouter and cached on disk, so new models such as
 `xiaomi/mimo-v2.6-flash` show up in `/model` without an update; when a listing
 is unavailable, any model id can be typed directly. OpenRouter may retire a
-stealth model without notice, so both stealth routes circuit-break to
-`xiaomi/mimo-v2.6-pro` for the rest of the turn and show a recovered banner.
+stealth model without notice. With an OpenRouter key, a failed stealth route
+circuit-breaks to `openrouter/free` for the rest of the turn and shows a
+recovered banner. This fallback does not switch to a paid model or reuse an
+OpenPaths or Gateway credential on OpenRouter.
 
 OpenRouter `:free` variants and the `openrouter/free` router still require an
 `OPENROUTER_API_KEY`; “free” describes inference price, not anonymous API
@@ -112,6 +117,11 @@ Or make a one-shot request:
 di ask "explain the changes in this repository"
 ```
 
+Repeated invalid shell calls stop the tool loop with a nonzero exit status.
+For captured commands, omit `request.shell`; an explicit shell requires `tty=true`. Validation errors explain this distinction without changing or executing the request.
+The rejected commands do not execute; valid neighboring tool results remain
+in the saved session.
+
 The status line keeps session spend honest: cumulative cost, token totals,
 context usage against the model window, and the current Git branch, backed by
 the same accounting as `/cost` and `/usage`. PNG images in the transcript
@@ -131,6 +141,15 @@ A few fx names stay because they are identities the CLI does not own. The
 documentation lives at `fx.sh`, the npm package is `libfx` with `fx-*`
 artifacts, the built-in themes are `fx-dark` and `fx-light`, and the Slack
 workspace app is registered as fx with its callback at `fx.sh`.
+
+### Queued prompts
+
+While a turn is running, Enter steers it. Tab or Ctrl+Q instead queues the
+composer text to run, in order, after the current turn and earlier queued
+prompts finish. Alt+Up pulls the newest queued text-only prompt back into an
+empty composer for editing; with nothing queued it keeps its paragraph-up
+movement. Slash commands are not queued, and Ctrl+Q on an idle composer
+submits normally.
 
 ## Efficiency
 
@@ -257,6 +276,8 @@ How the cycle runs:
 
 Autonomous mode requires session saving and cannot be combined with `--no-save`. Pair it with `--json` to get one parseable result object per turn on stdout.
 
+When you set `max_agent_steps` or `FX_MAX_AGENT_STEPS`, the model receives a remaining-budget reminder during the last three calls. The cap stays exact; unfinished turns still exit unsuccessfully. The default unbounded mode adds no reminder.
+
 ## di improves di
 
 di can act as a subagent on its own repository. Every iteration starts from a
@@ -298,6 +319,22 @@ Inside the shell, run `/help` to browse interactive commands.
 In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
 di preserves those tmux views while resizing, including when the switcher zooms a split pane.
 
+## Images
+
+Paste an image, attach one with `di ask --image PATH`, or ask di to `read_file` a PNG, JPEG, GIF, or WebP. File-backed attachments retain the original image. Before each model request, it checks the complete image count and sends only images that fit: at most 8000 pixels per side with 20 or fewer images, or 2000 pixels per side with more than 20. The encoded per-image limit is 5 MiB.
+
+When a file-backed image cannot be sent, the model receives its source path and the reason. It can use an image tool already on your system, such as `sips` on macOS or `ffmpeg` on Linux, to save a smaller **new** file and read that copy. di does not automatically install image tools or overwrite the original. If no usable file or tool is available, the model should ask you for a smaller copy or permission before installing software.
+
+## Shell commands
+
+Commands run in your login shell, zsh or bash, with your startup files applied, so your aliases, functions, and `PATH` work as they do in your terminal. di runs the startup files once and restores their result for each command, so a slow `.zshrc` does not slow down every call.
+
+- di reloads automatically when your zsh or bash startup files change, such as `.zshrc`, `.zprofile`, `.bash_profile`, or `.bashrc`. After changing a file they source, run `/shell reload`.
+- Each command starts fresh: `cd`, `export`, and alias changes do not carry over to the next one.
+- Tools that switch the environment by directory, such as direnv or mise hooks, apply the environment of the directory where di captured the startup files, usually your workspace.
+- If the startup files cannot be captured, di says so once and runs them for every command instead.
+- Terminals opened with `tty: true` run your full login shell and end when di exits.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
@@ -312,6 +349,10 @@ FX_PROVIDER=openrouter FX_MODEL=openai/gpt-4.1 di ask "review this change"
 ```
 
 See [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) for connection JSON, model metadata, and behavior details.
+
+Custom connections retain provider reasoning across tool calls and saved-session resumes. Adjacent unsigned text or summary fragments with identical metadata are combined to reduce replay size; signed, encrypted, and unfamiliar blocks stay separate. Automatic permission review retries temporary provider failures once without executing the pending action before approval.
+
+To enable `--effort` for a custom connection, set its `reasoning_format` to `openrouter` for `reasoning.effort`, or `effort` for `reasoning_effort`. Declare the supported names in each model's `model_metadata.reasoning_efforts` array, such as `["low", "medium", "high"]`. Reasoning controls stay disabled when the format is omitted or no efforts are declared; di does not infer support from the endpoint hostname.
 
 ## Ultrafast mode
 
@@ -379,7 +420,9 @@ di ships with `fx-dark` and `fx-light` and follows your terminal's light or dark
 
 ## Context compaction
 
-When a conversation fills the model's context, di compacts it so the work can continue. The newest few turns stay unchanged. Every compacted turn keeps your messages and the assistant's final reply word for word. The conversation's own model adds a short note on what the assistant did in between, and a line for each tool call: di writes what the call was from the call itself, like `shell zig build test (failed, exit 1, 3120 bytes)`, and the model adds why it was used and what it showed. The model also keeps numbered entries for your rules, quoted word for word, and for facts, decisions, status and open questions, plus a list of the skills and MCP tools used. Entries are never rewritten: a later entry can say it replaces an earlier one. At the next compaction, the one before it is saved whole with an ID like `L2`, and in its place the agent sees a short summary the model writes of all earlier compactions, plus their rules, status and open entries still in force, word for word. The turns of earlier compactions leave the agent's view however many compactions a session has; only those kept entries grow with it. In a session that is not saved, nothing can be stored, so earlier compactions stay in view. di checks every new note and entry, and marks without removing one that names no source, quotes words you did not write, states a path, number, version or quoted text found in none of the compacted turns and tool calls, names an ID that does not exist, or calls a failed tool call a success; turns the model skipped, or a missing summary of earlier compactions, are asked for once more. Only when the compacted conversation would leave too little room to continue are its longest texts shortened to their start and end, each naming the saved turn that keeps it whole. Every compacted turn is saved word for word with an ID like `M3`, every tool call with its input and output as the model saw them, plus the handle of any full output saved separately, with an ID like `T12`, and every earlier compaction with an ID like `L2`. The agent can search them by text or open one by ID with `read_tool_result`; a search also says how many saved records hold all of its words, and which came first and last.
+Saved sessions with local file storage enable model-managed context by default. Before each request, di writes a private `tool-results/live-context.json` mirror with indexed messages and an editable `edits` array. The model can use ordinary permission-checked file or shell tools to replace stale message ranges with concise notes. Your messages stay pinned, tool-call groups stay intact, and the original session history is unchanged. Accepted edits survive restart while their source prefix still matches; stale or malformed edits fall back to the canonical conversation. System text is excluded from the mirror, and model-authored notes never become permission authority. Unsaved sessions and blob-backed sessions retain the existing compaction path. Automatic compaction also remains available as an overflow fallback for local mirrors.
+
+When a conversation fills the model's context, di compacts it so the work can continue. The newest few turns stay unchanged. Every compacted turn keeps your messages and the assistant's final reply word for word. The conversation's own model adds a short note on what the assistant did in between, and a line for each tool call: di writes what the call was from the call itself, like `shell zig build test (failed, exit 1, 3120 bytes)`, and the model adds why it was used and what it showed. The model also keeps numbered entries for your rules, quoted word for word, and for facts, decisions, status and open questions, plus a list of the skills and MCP tools used. Entries are never rewritten: a later entry can say it replaces an earlier one, and a status entry can close an open entry it answers or finishes. At the next compaction, the one before it is saved whole with an ID like `L2`, and in its place the agent sees a short summary the model writes of all earlier compactions, plus their rules, status and open entries still in force, word for word. The turns of earlier compactions leave the agent's view however many compactions a session has; only those kept entries grow with it. In a session that is not saved, nothing can be stored, so earlier compactions stay in view. di checks every new note and entry, and marks without removing one that names no source, quotes words you did not write, states a path, long number, version or quoted text found in none of the compacted turns and tool calls or the turns that stay after them, names an ID that does not exist, or calls a failed tool call a success; turns the model skipped, or a missing summary of earlier compactions, are asked for once more. Only when the compacted conversation would leave too little room to continue are its longest texts shortened to their start and end, each naming the saved turn that keeps it whole. Every compacted turn is saved word for word with an ID like `M3`, every tool call with its input and output as the model saw them, plus the handle of any full output saved separately, with an ID like `T12`, and every earlier compaction with an ID like `L2`. The agent can search them by text or open one by ID with `read_tool_result`; a search also says how many saved records hold all of its words, and which came first and last.
 
 Automatic compaction asks the model right after the conversation, exactly as the agent was about to send it and with the same settings, so the provider can reuse what it has cached. When that request does not fit or fails, and when you run `/compact` to compact now, di writes the turns out in a separate request at the model's lowest reasoning; turns too large for one such request go oldest first, in as many requests as it takes. If a separate request fails or comes back empty on AI Gateway, di retries it once with a model from another provider.
 
@@ -396,6 +439,12 @@ Warm compaction runs after a turn instead of inside the next one. When a turn fi
 // ~/.fx/settings.json
 { "auto_compact_warm_percent": 50 }
 ```
+
+## Live task benchmarks
+
+The [game-making benchmarks](games/README.md) run bounded Three.js tasks
+through the built binary with Space Bunny. They retain traces, verification
+results, binary fingerprints, and sampled disk-I/O counters in private runs.
 
 ## Embed di
 

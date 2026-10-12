@@ -513,6 +513,8 @@ export async function runFx(
       HOME: process.env.HOME ?? "",
       PATH: process.env.PATH ?? "",
     };
+    delete env.OPENPATHS_API_KEY;
+    delete env.OPENROUTER_API_KEY;
     for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (value === undefined) {
         delete env[key];
