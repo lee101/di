@@ -649,6 +649,7 @@ pub const Runtime = struct {
         var loaded = switch (result) {
             .loaded => |loaded| loaded,
             .failed => |failure| {
+                if (self.adoptMergedCatalogAfterFailure(failure)) return;
                 self.markFailed(failure);
                 self.mutex.lockUncancelable(io_mod.getIo());
                 self.completion_pending = true;
@@ -663,7 +664,7 @@ pub const Runtime = struct {
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
         const fallback_origin = primaryOriginFromAccess(loaded.provenance.access);
-        self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
+        _ = self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         if (loaded.catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0) {
@@ -810,7 +811,7 @@ pub const Runtime = struct {
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
         fillOrigins(self.alloc, &origins, moved.items.len, fallback_origin) catch {};
-        self.fetchMergeSourcesInto(&moved, &origins, fallback_origin, fallback_origin);
+        _ = self.fetchMergeSourcesInto(&moved, &origins, fallback_origin, fallback_origin);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -1158,6 +1159,7 @@ pub const Runtime = struct {
         var loaded = switch (result) {
             .loaded => |loaded| loaded,
             .failed => |failure| {
+                if (self.adoptMergedCatalogAfterFailure(failure)) return;
                 self.markFailed(failure);
                 return;
             },
@@ -1170,7 +1172,7 @@ pub const Runtime = struct {
         var origins: std.ArrayList(?ModelOrigin) = .empty;
         defer origins.deinit(self.alloc);
         const fallback_origin = primaryOriginFromAccess(loaded.provenance.access);
-        self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
+        _ = self.fetchMergeSourcesInto(&loaded.catalog, &origins, fallback_origin, null);
 
         self.mutex.lockUncancelable(io_mod.getIo());
         if (loaded.catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0) {
@@ -1216,17 +1218,19 @@ pub const Runtime = struct {
     /// Fetches every configured secondary catalog best-effort and appends its
     /// entries to `catalog`, keeping `origins` aligned. Runs on the loader
     /// thread (or inline for cooperative hosts) without the runtime lock held.
+    /// Returns the access metadata of the first source that contributed rows.
     fn fetchMergeSourcesInto(
         self: *Self,
         catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
         origins: *std.ArrayList(?ModelOrigin),
         fallback_origin: ?ModelOrigin,
         skip_origin: ?ModelOrigin,
-    ) void {
-        fillOrigins(self.alloc, origins, catalog.items.len, fallback_origin) catch return;
+    ) ?model_catalog.AccessMetadata {
+        var first_access: ?model_catalog.AccessMetadata = null;
+        fillOrigins(self.alloc, origins, catalog.items.len, fallback_origin) catch return first_access;
         for (self.owned_merge_sources) |*source| {
             if (source.origin == skip_origin) continue;
-            if (self.cancel_requested.load(.seq_cst)) return;
+            if (self.cancel_requested.load(.seq_cst)) return first_access;
             const result = source.catalog.fetch(self.alloc, .{
                 .access = source.access.access,
                 .endpoint = self.models_path,
@@ -1234,20 +1238,58 @@ pub const Runtime = struct {
                 .view = .picker,
             }) catch continue;
             switch (result) {
-                .catalog => |source_catalog| appendMovedCatalog(
-                    self.alloc,
-                    catalog,
-                    origins,
-                    source_catalog,
-                    source.origin,
-                ) catch {
-                    var failed = source_catalog;
-                    model_catalog.freeModelCatalog(self.alloc, &failed);
-                    return;
+                .catalog => |source_catalog| {
+                    if (source_catalog.items.len > 0 and first_access == null) {
+                        first_access = model_catalog.AccessMetadata.init(source.access.access);
+                    }
+                    appendMovedCatalog(
+                        self.alloc,
+                        catalog,
+                        origins,
+                        source_catalog,
+                        source.origin,
+                    ) catch {
+                        var failed = source_catalog;
+                        model_catalog.freeModelCatalog(self.alloc, &failed);
+                        return first_access;
+                    };
                 },
                 .failure => {},
             }
         }
+        return first_access;
+    }
+
+    fn adoptMergedCatalogAfterFailure(self: *Self, failure: model_catalog.FailedOutcome) bool {
+        var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+        var origins: std.ArrayList(?ModelOrigin) = .empty;
+        defer origins.deinit(self.alloc);
+
+        const merged_access = self.fetchMergeSourcesInto(&catalog, &origins, null, null);
+        if (catalog.items.len == 0) {
+            model_catalog.freeModelCatalog(self.alloc, &catalog);
+            return false;
+        }
+
+        self.mutex.lockUncancelable(io_mod.getIo());
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.catalog = catalog;
+        replaceOriginsLocked(self, &origins);
+        // The primary route failed, but every installed entry carries its own
+        // origin, so the menu can still offer and switch to the catalogs that
+        // did answer. Report the first answering source instead of the failed
+        // primary so the menu's access banner stays accurate.
+        self.outcome = .{
+            .loaded = .{ .access = merged_access orelse failure.access },
+            .last_failure = failure,
+        };
+        self.cache_seeded = false;
+        self.state = .ready;
+        self.completion_pending = true;
+        const entries = self.catalog.items.len;
+        self.mutex.unlock(io_mod.getIo());
+        diagnostics.recordModelCatalogEvent(false, .load, "outcome=merged_after_failure entries={d}", .{entries});
+        return true;
     }
 
     fn markFailed(self: *Self, failure: model_catalog.FailedOutcome) void {
@@ -2700,6 +2742,34 @@ test "model catalog cache loads when the network result is a failure" {
     try std.testing.expectEqual(ModelMenuLoadState.ready, runtime.menu.load_state);
     try std.testing.expectEqual(@as(usize, 2), runtime.menu.items.items.len);
     try std.testing.expect(runtime.menu.catalog_state.failure == null);
+}
+
+test "model cache publishes merged catalogs when the primary route fails" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    defer runtime.reset();
+
+    var secondary = StaticCatalog{ .ids = &.{ "openpaths/free", "auto-medium" } };
+    const sources = [_]MergeSource{.{
+        .origin = .openpaths_api_key,
+        .catalog = secondary.provider(),
+        .access = credentials.catalogAccessForCredential(.openpaths_api_key, "openpaths-key", "team_123"),
+    }};
+    try runtime.setMergeSources(&sources);
+
+    var failing = StaticCatalog{ .fail = true };
+    runtime.loadCooperative(failing.provider(), authenticatedCatalogAccess("primary-key", "team_123"));
+
+    try std.testing.expectEqual(ModelCacheState.ready, runtime.state);
+    try std.testing.expectEqual(@as(usize, 2), runtime.catalog.items.len);
+    try std.testing.expectEqualStrings("openpaths/free", runtime.catalog.items[0].id);
+    try std.testing.expectEqualStrings("auto-medium", runtime.catalog.items[1].id);
+    try std.testing.expectEqual(ModelOrigin.openpaths_api_key, runtime.origins.items[0].?);
+    try std.testing.expectEqual(ModelOrigin.openpaths_api_key, runtime.origins.items[1].?);
+    try std.testing.expectEqual(@as(?credentials.Source, .openpaths_api_key), runtime.outcome.loaded.?.access.source);
+    try std.testing.expect(runtime.outcome.last_failure != null);
+    try std.testing.expect(!runtime.cache_seeded);
 }
 
 test "model cache request resolution records lookup misses for the trace report" {

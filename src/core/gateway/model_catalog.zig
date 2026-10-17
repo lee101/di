@@ -314,7 +314,7 @@ fn traceCatalogLoadOutcome(
 /// Upper bound on model ids kept per catalog, whether fetched live or restored
 /// from the on-disk cache. Providers reject larger listings outright; the cache
 /// truncates to this bound.
-pub const max_catalog_models: usize = 512;
+pub const max_catalog_models: usize = 1024;
 
 pub const ModelCatalogEntry = struct {
     id: []u8,

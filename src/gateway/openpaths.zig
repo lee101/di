@@ -1138,6 +1138,17 @@ fn parseCatalog(
     if (data != .array) return error.InvalidOpenPathsModelCatalog;
     if (data.array.items.len > model_catalog.max_catalog_models) return error.InvalidOpenPathsModelCatalog;
 
+    // Every id the catalog defines is reserved, including ids for models that
+    // are not selectable, so an alias can never shadow a real row.
+    var known_ids = std.StringHashMap(void).init(alloc);
+    defer known_ids.deinit();
+    for (data.array.items) |value| {
+        if (value != .object) continue;
+        const raw_id = stringField(value.object, "id") orelse continue;
+        if (raw_id.len == 0 or raw_id.len > max_model_id_bytes) continue;
+        try known_ids.put(raw_id, {});
+    }
+
     var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
     errdefer model_catalog.freeModelCatalog(alloc, &catalog);
     for (data.array.items) |value| {
@@ -1148,18 +1159,42 @@ fn parseCatalog(
         // and 3D entries answer a different endpoint entirely, so listing them
         // offers a selection that cannot work once it is made.
         if (!isChatModel(value.object, raw_id)) continue;
-        const id = try alloc.dupe(u8, raw_id);
-        errdefer alloc.free(id);
-        const model_type = try alloc.dupe(u8, "language");
-        errdefer alloc.free(model_type);
-        try catalog.append(alloc, .{
-            .id = id,
-            .model_type = model_type,
-            .has_tool_use = true,
-            .image_input_claim = imageInputClaim(value.object),
-        });
+        try appendCatalogModel(alloc, &catalog, raw_id, value.object);
+
+        // OpenPaths exposes alternate routes such as `openpaths/free` and the
+        // `auto-easy`, `auto-medium`, and `auto-hard` tiers only as aliases.
+        // They are valid request ids, so list each one that the catalog does
+        // not already use as a row.
+        const aliases_value = value.object.get("aliases") orelse continue;
+        if (aliases_value != .array) continue;
+        for (aliases_value.array.items) |alias_value| {
+            if (alias_value != .string) continue;
+            const alias = alias_value.string;
+            if (alias.len == 0 or alias.len > max_model_id_bytes) continue;
+            if (known_ids.contains(alias)) continue;
+            try known_ids.put(alias, {});
+            try appendCatalogModel(alloc, &catalog, alias, value.object);
+        }
     }
     return catalog;
+}
+
+fn appendCatalogModel(
+    alloc: Allocator,
+    catalog: *std.ArrayList(model_catalog.ModelCatalogEntry),
+    raw_id: []const u8,
+    object: std.json.ObjectMap,
+) !void {
+    const id = try alloc.dupe(u8, raw_id);
+    errdefer alloc.free(id);
+    const model_type = try alloc.dupe(u8, "language");
+    errdefer alloc.free(model_type);
+    try catalog.append(alloc, .{
+        .id = id,
+        .model_type = model_type,
+        .has_tool_use = true,
+        .image_input_claim = imageInputClaim(object),
+    });
 }
 
 /// A catalog entry is selectable when the provider says so, or -- for
@@ -1543,6 +1578,41 @@ test "parse catalog trusts a provider type over the id" {
     try std.testing.expectEqualStrings("Acme/Chat-Model", catalog.items[1].id);
     try std.testing.expectEqualStrings("vendor/looks-embed", catalog.items[2].id);
     try std.testing.expectEqualStrings("vendor/no-type-here", catalog.items[3].id);
+}
+
+test "parse catalog lists aliases as selectable ids without shadowing real rows" {
+    const body =
+        \\{"data":[
+        \\  {"id":"missingno","type":"language","capabilities":{"tools":true},"aliases":["openpaths/free","stealth/missingno"]},
+        \\  {"id":"openpaths/auto-code","type":"language","capabilities":{"tools":true},"aliases":["auto-code","auto-medium","auto-medium-task"]},
+        \\  {"id":"openpaths/auto","type":"language","capabilities":{"tools":true},"aliases":["auto-easy","auto-hard","openpaths/free"]},
+        \\  {"id":"other","type":"language","capabilities":{"tools":true},"aliases":["missingno",""]},
+        \\  {"id":"image-model","type":"image","aliases":["image-alias","auto-easy"]}
+        \\]}
+    ;
+    var catalog = try parseCatalog(std.testing.allocator, body);
+    defer model_catalog.freeModelCatalog(std.testing.allocator, &catalog);
+
+    const expected = [_][]const u8{
+        "missingno",
+        "openpaths/free",
+        "stealth/missingno",
+        "openpaths/auto-code",
+        "auto-code",
+        "auto-medium",
+        "auto-medium-task",
+        "openpaths/auto",
+        "auto-easy",
+        "auto-hard",
+        "other",
+    };
+    try std.testing.expectEqual(expected.len, catalog.items.len);
+    for (expected, catalog.items) |want, entry| {
+        try std.testing.expectEqualStrings(want, entry.id);
+        try std.testing.expectEqualStrings("language", entry.model_type);
+        try std.testing.expect(entry.has_tool_use);
+    }
+    try std.testing.expectEqual(@as(?bool, null), catalog.items[7].image_input_claim);
 }
 
 test "parse catalog maps image input modalities to true claims" {

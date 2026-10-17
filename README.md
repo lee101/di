@@ -75,7 +75,10 @@ the credential and transport that advertised it, so model choice is the normal
 workflow rather than a separate provider-configuration exercise. The latest
 catalog is cached under `~/.fx` so the menu opens instantly and refreshes in the
 background, and a typed id that is not listed still selects through the
-`Use <query>` row.
+`Use <query>` row. OpenPaths advertises alternate route aliases such as
+`openpaths/free` and the `auto-easy`, `auto-medium`, and `auto-hard` tiers;
+each alias is listed as its own selectable row. A secondary catalog keeps
+contributing rows when the active provider's own catalog is unavailable.
 
 Only language models are listed. OpenPaths serves embeddings, speech
 transcription and synthesis, music, image, video, and 3D models from the same
