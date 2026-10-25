@@ -4447,11 +4447,39 @@ test "discarded completion prose preserves ownership and fails atomically" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
-fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
-    return switch (kind) {
+fn isRetryableModelFailure(failure: agent_stream_provider.Failure) bool {
+    return switch (failure.kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
+        .invalid_request => isTransientModelNotFound(failure.detail),
         else => false,
     };
+}
+
+/// Gateways intermittently answer 400 "model not found" while a route flaps
+/// between upstreams; the same request succeeds moments later.
+fn isTransientModelNotFound(detail: ?[]const u8) bool {
+    const text = detail orelse return false;
+    inline for (.{
+        "model not found",
+        "model_not_found",
+        "model does not exist",
+        "unknown model",
+        "no such model",
+    }) |needle| {
+        if (text_utils.containsIgnoreCase(text, needle)) return true;
+    }
+    return false;
+}
+
+test "model-not-found 400 is retryable but other 400s are not" {
+    var a = "{\"error\":{\"message\":\"Model not found: x\"}}".*;
+    var b = "model_not_found".*;
+    var c = "bad schema".*;
+    try std.testing.expect(isRetryableModelFailure(.{ .kind = .invalid_request, .detail = &a }));
+    try std.testing.expect(isRetryableModelFailure(.{ .kind = .invalid_request, .detail = &b }));
+    try std.testing.expect(!isRetryableModelFailure(.{ .kind = .invalid_request, .detail = &c }));
+    try std.testing.expect(!isRetryableModelFailure(.{ .kind = .invalid_request }));
+    try std.testing.expect(isRetryableModelFailure(.{ .kind = .server_error }));
 }
 
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
@@ -8485,7 +8513,7 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
+            if (response_failure) |failure| if (isRetryableModelFailure(failure)) {
                 const cause: model_response_recovery.FailureCause = if (failure.kind == .rate_limited)
                     .rate_limited
                 else
