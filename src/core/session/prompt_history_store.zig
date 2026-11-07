@@ -232,7 +232,8 @@ pub const Store = struct {
             };
         }
 
-        io_mod.setDirPermissions(self.durable_home.?.dir, 
+        io_mod.setDirPermissions(
+            self.durable_home.?.dir,
             io_mod.getIo(),
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
