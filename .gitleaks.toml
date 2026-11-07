@@ -18,4 +18,5 @@ regexes = [
   '''PROBE_TOKEN=0123456789abcdef[0-9a-f]*''',
   '''TOOL_DATA_TOKEN=0123456789abcdef[0-9a-f]*''',
   '''invalid-utf8-proof-key''',
+  '''gw\-key\-0123456789''',
 ]
