@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -258,8 +259,7 @@ pub fn prepareBrowserLogin(
 ) !PreparedLogin {
     const issuer = try alloc.dupe(u8, options.issuer);
     errdefer alloc.free(issuer);
-    const authorization_endpoint = try std.fmt.allocPrint(
-        alloc,
+    const authorization_endpoint = try alloc.print(
         "{s}{s}",
         .{
             std.mem.trimEnd(u8, options.issuer, "/"),
@@ -1146,8 +1146,14 @@ fn unavailableWaitForEnter(_: ?*anyopaque, _: u64) bool {
 }
 
 fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
+    if (comptime builtin.os.tag == .windows) {
+        const wait: i32 = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(i32)))));
+        if (!io_mod.pollReadable(io_mod.stdinHandle(), wait)) return false;
+        discardStdinLine();
+        return true;
+    }
     var fds = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
+        .fd = io_mod.stdinHandle(),
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -1161,7 +1167,7 @@ fn realWaitForEnter(_: ?*anyopaque, timeout_ms: u64) bool {
 fn discardStdinLine() void {
     var buf: [256]u8 = undefined;
     while (true) {
-        const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return;
+        const n = io_mod.readHandle(io_mod.stdinHandle(), &buf) catch return;
         if (n == 0) return;
         if (std.mem.findScalar(u8, buf[0..n], '\n') != null) return;
     }
@@ -1173,13 +1179,13 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     defer client.deinit();
 
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
     const endpoint = e2e_endpoint orelse teams_endpoint;
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const auth_header = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, auth_header);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -1207,7 +1213,7 @@ fn fetchTeamsFromJsHost(
     issuer_url: []const u8,
 ) !std.ArrayList(Team) {
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
@@ -1329,7 +1335,7 @@ fn selectTeamInteractive(alloc: Allocator, teams: []const Team, default_index: u
 
 fn canUseInteractiveTeamPicker() bool {
     const stdin_tty = std.Io.File.stdin().isTty(io_mod.getIo()) catch false;
-    return stdin_tty and std.c.isatty(std.posix.STDOUT_FILENO) != 0;
+    return stdin_tty and io_mod.isatty(io_mod.stdoutHandle());
 }
 
 fn renderTeamPicker(
@@ -1340,7 +1346,7 @@ fn renderTeamPicker(
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
-        const move_up = try std.fmt.allocPrint(alloc, "\x1b[{d}A\r", .{teams.len});
+        const move_up = try alloc.print("\x1b[{d}A\r", .{teams.len});
         defer alloc.free(move_up);
         try writeStdout(move_up);
     }
@@ -1364,21 +1370,15 @@ const TeamPickerKey = union(enum) {
 
 fn readTeamPickerKey() !TeamPickerKey {
     var buf: [8]u8 = undefined;
-    const first_read = try std.posix.read(std.posix.STDIN_FILENO, buf[0..1]);
+    const first_read = try io_mod.readHandle(io_mod.stdinHandle(), buf[0..1]);
     if (first_read == 0) return .ignored;
 
     var len = first_read;
     if (buf[0] == 0x1b) {
         while (len < buf.len) {
             if (escapeSequenceComplete(buf[0..len])) break;
-            var fds = [_]std.posix.pollfd{.{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            }};
-            const ready = try std.posix.poll(&fds, 25);
-            if (ready == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            const n = try std.posix.read(std.posix.STDIN_FILENO, buf[len .. len + 1]);
+            if (!io_mod.pollReadable(io_mod.stdinHandle(), 25)) break;
+            const n = try io_mod.readHandle(io_mod.stdinHandle(), buf[len .. len + 1]);
             if (n == 0) break;
             len += n;
         }
@@ -1417,16 +1417,22 @@ fn parseEscapeTeamPickerKey(bytes: []const u8) TeamPickerKey {
 }
 
 const TeamPickerRawMode = struct {
-    original: std.posix.termios = undefined,
+    original: if (builtin.os.tag == .windows) u32 else std.posix.termios = undefined,
     active: bool = false,
 
     fn enable() !TeamPickerRawMode {
-        if (std.c.isatty(std.posix.STDIN_FILENO) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
+        if (!io_mod.isatty(io_mod.stdinHandle()) or !io_mod.isatty(io_mod.stdoutHandle())) {
             return error.NotATerminal;
         }
 
         var self = TeamPickerRawMode{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        if (comptime builtin.os.tag == .windows) {
+            self.original = io_mod.consoleMode(io_mod.stdinHandle()) orelse return error.NotATerminal;
+            if (!io_mod.setConsoleMode(io_mod.stdinHandle(), (self.original & ~@as(u32, 0x7)) | 0x200)) return error.NotATerminal;
+            self.active = true;
+            return self;
+        }
+        self.original = try io_mod.tcgetattr(io_mod.stdinHandle());
         var raw = self.original;
 
         raw.iflag.BRKINT = false;
@@ -1450,20 +1456,25 @@ const TeamPickerRawMode = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(io_mod.stdinHandle(), .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        if (comptime builtin.os.tag == .windows) {
+            _ = io_mod.setConsoleMode(io_mod.stdinHandle(), self.original);
+            self.active = false;
+            return;
+        }
+        io_mod.tcsetattr(io_mod.stdinHandle(), .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
 
 fn vminIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 6,
         .macos, .ios, .tvos, .watchos, .visionos => 16,
         .freebsd, .netbsd, .dragonfly, .openbsd => 16,
@@ -1472,7 +1483,7 @@ fn vminIndex() usize {
 }
 
 fn vtimeIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 5,
         .macos, .ios, .tvos, .watchos, .visionos => 17,
         .freebsd, .netbsd, .dragonfly, .openbsd => 17,
@@ -1575,14 +1586,14 @@ fn checkBrowserPreparedAllocationFailures(alloc: Allocator) !void {
 
 test "browser login preparation cleans up allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBrowserPreparedAllocationFailures,
         .{},
     );
 }
 
 test "team parsing cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_teams_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_teams_allocation_failures, .{});
 }
 
 test "single team selection does not allocate" {
@@ -1594,7 +1605,7 @@ test "single team selection does not allocate" {
         .slug = &slug,
         .name = &name,
     }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
 }
@@ -1665,7 +1676,7 @@ test "team validation failure prevents the durable selection commit" {
 }
 
 test "login session transfer cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_take_login_session_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_take_login_session_allocation_failures, .{});
 }
 
 fn readLine(alloc: Allocator) ![]u8 {
@@ -1681,7 +1692,7 @@ fn writeStdout(text: []const u8) !void {
 
 fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, fmt, args);
+    const text = try std.mem.print(&buf, fmt, args);
     try writeStdout(text);
 }
 
@@ -2119,7 +2130,7 @@ const WithholdingTokenFixture = struct {
     }
 
     fn tokenEndpoint(self: *@This(), alloc: Allocator) ![]u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/oauth/token", .{
+        return alloc.print("http://127.0.0.1:{d}/oauth/token", .{
             self.server.socket.address.getPort(),
         });
     }
@@ -2156,9 +2167,9 @@ const WithholdingTokenFixture = struct {
 };
 
 fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !PreparedLogin {
-    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.lastIndexOfScalar(u8, token_endpoint, '/').?]);
+    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.findScalarLast(u8, token_endpoint, '/').?]);
     errdefer alloc.free(issuer);
-    const device_endpoint = try std.fmt.allocPrint(alloc, "{s}/device", .{issuer});
+    const device_endpoint = try alloc.print("{s}/device", .{issuer});
     errdefer alloc.free(device_endpoint);
     const owned_token_endpoint = try alloc.dupe(u8, token_endpoint);
     errdefer alloc.free(owned_token_endpoint);
@@ -2265,7 +2276,7 @@ test "cooperative sign-in store failure is traced and becomes a recoverable tran
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();

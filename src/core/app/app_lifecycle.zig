@@ -60,7 +60,7 @@ var old_sighup_action: ?std.posix.Sigaction = null;
 fn abnormalExitHandlerWithRestore(comptime restore: []const u8, sig: std.posix.SIG) void {
     // Signal context cannot recover from a failed async-signal-safe write.
     _ = std.c.write(
-        std.posix.STDOUT_FILENO,
+        io_mod.stdoutHandle(),
         restore.ptr,
         restore.len,
     );
@@ -741,7 +741,7 @@ fn loadStartupStateWithKeychainRead(
     if (auth_mode == .local and !state.model_requests_blocked) {
         if (credential_mode) |mode| defer_or_resolve: {
             if (keychain_read == .deferred and mode == .stored and keychainReadDeferrable(
-                builtin.os.tag == .macos,
+                builtin.target.os.tag == .macos,
                 secret_store.isDisabled(),
                 state.provider,
                 settings.credential_source,
@@ -1094,7 +1094,7 @@ pub fn writeLastShutdownReport(alloc: Allocator, trace: *const ShutdownStageTrac
 }
 
 fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTrace) !void {
-    const home = io_mod.getenv("HOME") orelse return;
+    const home = io_mod.homeDir() orelse return;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -1131,7 +1131,7 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
 /// Reads the persisted shutdown breakdown for the /trace report. Returns the
 /// owned file contents; caller frees. Missing or unreadable file is null.
 pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
     defer alloc.free(path);
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
@@ -1581,7 +1581,7 @@ test "loadSavedPermissionMode reads the mode saved after startup" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
@@ -1603,7 +1603,7 @@ test "loadSavedPermissionMode keeps the FX_PERMISSION_MODE override" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
@@ -1662,7 +1662,7 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
 test "loadStartupState starts Codex from FX_PROVIDER and FX_MODEL without a saved model" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -1700,7 +1700,7 @@ test "loadStartupState seeds a provider without a saved model from the launch --
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
@@ -1737,7 +1737,7 @@ test "loadStartupStatus reports where the selected model came from" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
 
@@ -1817,18 +1817,6 @@ fn soundEnvOverride() ?SoundEnvLevel {
     return if (off) .off else .on;
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const EnvEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -1839,8 +1827,6 @@ const TestEnv = struct {
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, entries: []const EnvEntry) !*TestEnv {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestEnv);
         errdefer alloc.destroy(self);
 
@@ -1859,9 +1845,7 @@ const TestEnv = struct {
     }
 
     fn deinit(self: *TestEnv) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -2371,18 +2355,18 @@ test "full transcript drift recovery is explicit and scoped to lifecycle" {
 
 test "abnormal exit restoration leaves the alternate screen" {
     try std.testing.expect(std.mem.startsWith(u8, abnormal_exit_restore, "\x1b[?2026l"));
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2026l").? <
-        std.mem.indexOf(u8, abnormal_exit_restore, ui_terminal.alternate_screen_leave_sequence).?);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?2026l").? <
+        std.mem.find(u8, abnormal_exit_restore, ui_terminal.alternate_screen_leave_sequence).?);
     try std.testing.expect(std.mem.startsWith(
         u8,
         normal_exit_restore,
         ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l",
     ));
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1000l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1006l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
-    try std.testing.expect(std.mem.indexOf(u8, normal_exit_restore, "\x1b[?2031l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1000l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1006l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?1049l") != null);
+    try std.testing.expect(std.mem.find(u8, abnormal_exit_restore, "\x1b[?2031l") != null);
+    try std.testing.expect(std.mem.find(u8, normal_exit_restore, "\x1b[?2031l") != null);
 }
 
 test "exit and suspend restoration clear the program status record" {
@@ -2544,10 +2528,10 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 }
 
 test "startup credential modes select a refresh policy, never a narrower source set" {
-    const modes = std.meta.fields(CredentialLoadMode);
+    const modes = @typeInfo(CredentialLoadMode).@"enum".field_names;
     try std.testing.expectEqual(@as(usize, 2), modes.len);
-    try std.testing.expectEqualStrings("stored", modes[0].name);
-    try std.testing.expectEqualStrings("refresh_if_needed", modes[1].name);
+    try std.testing.expectEqualStrings("stored", modes[0]);
+    try std.testing.expectEqualStrings("refresh_if_needed", modes[1]);
 }
 
 test "loadStartupState applies core env overrides" {
@@ -2585,8 +2569,8 @@ test "ultrafast startup separates profile preferences from process overrides" {
     defer tmp.cleanup();
     // The settings store reads the profile only when these directories are
     // private, so the fixture creates them with the mode it requires.
-    try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
-    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home", io_mod.permissionsFromMode(0o700));
+    try tmp.dir.createDir(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-off");
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-on");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -2595,8 +2579,7 @@ test "ultrafast startup separates profile preferences from process overrides" {
     defer alloc.free(profile_off_root);
     const profile_on_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "profile-on");
     defer alloc.free(profile_on_root);
-    const settings = try std.fmt.allocPrint(
-        alloc,
+    const settings = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"ultrafast_mode\":false}},\"{s}\":{{\"ultrafast_mode\":true}}}}}}\n",
         .{ profile_off_root, profile_on_root },
     );
@@ -2654,7 +2637,7 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2677,8 +2660,7 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     const codex_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "codex");
     defer std.testing.allocator.free(codex_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
         .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
     );
@@ -2730,7 +2712,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
@@ -2741,8 +2723,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     const disabled_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "disabled");
     defer std.testing.allocator.free(disabled_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
         .{disabled_root},
     );
@@ -2765,7 +2746,7 @@ test "loadStartupState resolves slash menu categories default and explicit false
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2866,7 +2847,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2917,7 +2898,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(io_mod.getIo(), "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"credential_source\":\"fx_login\"}");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -2938,7 +2919,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
         var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
-        if (keychain_read == .deferred and builtin.os.tag == .macos) {
+        if (keychain_read == .deferred and builtin.target.os.tag == .macos) {
             const request = state.deferred_credential orelse return error.TestExpectedDeferredCredential;
             try std.testing.expectEqual(model_provider.ProviderId.gateway, request.provider);
             try std.testing.expectEqual(@as(?credentials.Source, .fx_login), request.preferred);
@@ -2954,9 +2935,9 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
     });
     defer file.close(io_mod.getIo());
-    try file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o600));
+    try file.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o600));
     try file.writeStreamingAll(io_mod.getIo(), text);
 }

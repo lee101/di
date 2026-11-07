@@ -229,8 +229,6 @@ pub const Turn = struct {
             .max_output_tokens = sent.max_output_tokens,
             .capabilities_context = deps.ctx,
             .capabilities_fn = deps.available_model_capabilities,
-            .usage = deps.usage,
-            .usage_allocator = deps.usage_allocator,
             .conversation = conversation,
         };
         const started_ms = watch.started_ms;

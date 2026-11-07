@@ -1,0 +1,56 @@
+[
+  {
+    "description": "A held server is started with the rest (runtime.zig `.need` without its held check)",
+    "old": "Started(x) == IF x = \"idle\" THEN \"starting\" ELSE x",
+    "new": "Started(x) == IF x \\in {\"idle\", \"waiting\"} THEN \"starting\" ELSE x",
+    "invariant": "HeldNeverSpawned"
+  },
+  {
+    "description": "A reload never starts the server it approved or added back (reloadHost without startHostServers)",
+    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
+    "new": "          /\\ st' = [st EXCEPT ![cur][s] = Initial(nd, s)]",
+    "invariant": "StartedAfterFirstFrame"
+  },
+  {
+    "description": "A status refresh keeps the line it had",
+    "old": "    /\\ shown' = Line(cur)",
+    "new": "    /\\ shown' = shown",
+    "invariant": "RefreshedLineAgrees"
+  },
+  {
+    "description": "Quitting signals only running servers, not one a reload let go of that still stops",
+    "old": "    /\\ termed' = termed \\cup procs \\cup stopping",
+    "new": "    /\\ termed' = termed \\cup procs",
+    "invariant": "QuitSignalsEveryServer"
+  },
+  {
+    "description": "A removed server is loaded as an idle one",
+    "old": "Initial(d, s) == CASE d[s] = \"removed\" -> \"absent\"",
+    "new": "Initial(d, s) == CASE d[s] = \"removed\" -> \"idle\"",
+    "invariant": "RemovedNotRunning"
+  },
+  {
+    "description": "A server added back stays down",
+    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
+    "new": "          /\\ st' = [st EXCEPT ![cur][s] = IF d = \"ok\" THEN \"absent\" ELSE Started(Initial(nd, s))]",
+    "property": "ApprovedServersSettle"
+  },
+  {
+    "description": "A server whose host let go of it never exits until fx quits",
+    "old": "    /\\ <<h, s>> \\in stopping\n    /\\ stopping' = stopping \\ {<<h, s>>}\n    /\\ refreshed' = FALSE\n    /\\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, termed",
+    "new": "    /\\ <<h, s>> \\in stopping /\\ quit\n    /\\ stopping' = stopping \\ {<<h, s>>}\n    /\\ refreshed' = FALSE\n    /\\ UNCHANGED <<decision, cur, alive, retired, leases, st, procs, termed",
+    "property": "EveryStopEnds"
+  },
+  {
+    "description": "A server added back starts while the process its removal let go of still stops",
+    "old": "    /\\ \\A p \\in Live : p[2] # s\n",
+    "new": "    /\\ \\A p \\in procs : p[2] # s\n",
+    "invariant": "OneProcessPerServer"
+  },
+  {
+    "description": "A reload stops every running server, as a new host did",
+    "old": "           gone == {<<cur, s>>} \\cap procs\n",
+    "new": "           gone == Of(cur)\n",
+    "property": "KeptServersKeepRunning"
+  }
+]

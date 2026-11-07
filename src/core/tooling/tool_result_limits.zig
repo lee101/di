@@ -194,9 +194,9 @@ const WindowedCut = struct {
     fn buildMarker(self: WindowedCut, arena: Allocator, head_end: usize) error{OutOfMemory}![]u8 {
         const elided = self.total - head_end - self.tail_len;
         return if (self.elidedLines(head_end)) |lines|
-            std.fmt.allocPrint(arena, elision_marker_fmt, .{ self.tool_name, self.total, head_end, self.tail_len, elided, lines, self.max_bytes })
+            arena.print(elision_marker_fmt, .{ self.tool_name, self.total, head_end, self.tail_len, elided, lines, self.max_bytes })
         else
-            std.fmt.allocPrint(arena, elision_marker_no_lines_fmt, .{ self.tool_name, self.total, head_end, self.tail_len, elided, self.max_bytes });
+            arena.print(elision_marker_no_lines_fmt, .{ self.tool_name, self.total, head_end, self.tail_len, elided, self.max_bytes });
     }
 
     /// Largest line boundary near `anchor` whose realized size still fits the cap.
@@ -284,7 +284,7 @@ fn truncateTextWindowed(arena: std.mem.Allocator, opts: WindowedTruncateOptions)
 }
 
 fn legacyWindowedFallback(arena: std.mem.Allocator, opts: WindowedTruncateOptions) error{OutOfMemory}![]const u8 {
-    const marker = try std.fmt.allocPrint(arena, legacy_marker_fmt, .{ opts.tool_name, opts.text.len, opts.max_bytes });
+    const marker = try arena.print(legacy_marker_fmt, .{ opts.tool_name, opts.text.len, opts.max_bytes });
     return truncateText(arena, .{
         .text = opts.text,
         .max_bytes = opts.max_bytes,
@@ -341,7 +341,7 @@ test "prepareInlineResult preserves assignments without reclassifying lengths" {
 
 test "prepareModelOutput caps chatty output with explicit marker" {
     const alloc = std.testing.allocator;
-    const bytes = [_]u8{'x'} ** 1024;
+    const bytes: [1024]u8 = @splat('x');
     const output = try prepareModelOutput(alloc, "grep_files", &bytes, 512);
     defer alloc.free(@constCast(output));
 
@@ -398,9 +398,9 @@ test "prepareModelOutput marker states exact byte counts" {
 
 test "prepareModelOutput respects the cap at the boundary" {
     const alloc = std.testing.allocator;
-    const under = [_]u8{'x'} ** 299;
-    const at = [_]u8{'x'} ** 300;
-    const over = [_]u8{'x'} ** 301;
+    const under: [299]u8 = @splat('x');
+    const at: [300]u8 = @splat('x');
+    const over: [301]u8 = @splat('x');
 
     const fit_under = try prepareModelOutputWithTruncation(alloc, "grep_files", &under, 300);
     defer alloc.free(fit_under.model_output);
@@ -420,7 +420,7 @@ test "prepareModelOutput respects the cap at the boundary" {
 
 test "prepareModelOutput keeps complete codepoints at the cap" {
     const alloc = std.testing.allocator;
-    const single = "\xc3\xa9" ** 400;
+    const single = text_utils.repeat("\xc3\xa9", 400);
     for ([_]usize{ 256, 257 }) |cap| {
         const output = try prepareModelOutput(alloc, "grep_files", single, cap);
         defer alloc.free(@constCast(output));
@@ -455,7 +455,7 @@ test "prepareModelOutput keeps complete codepoints at the cap" {
 
 test "prepareModelOutput degrades to head-only marker for tiny caps" {
     const alloc = std.testing.allocator;
-    const bytes = [_]u8{'x'} ** 256;
+    const bytes: [256]u8 = @splat('x');
 
     const output = try prepareModelOutput(alloc, "grep_files", &bytes, 96);
     defer alloc.free(@constCast(output));

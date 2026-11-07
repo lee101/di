@@ -145,7 +145,7 @@ pub fn detectGraphics(env: Env) bool {
     if (env.kitty_window_id != null) return true;
     if (env.ghostty_resources_dir != null) return true;
     if (env.term) |term| {
-        if (std.ascii.indexOfIgnoreCase(term, "kitty") != null) return true;
+        if (std.ascii.findIgnoreCase(term, "kitty") != null) return true;
     }
     if (env.term_program) |program| {
         if (eqlIgnoreCase(program, "kitty") or

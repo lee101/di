@@ -8,6 +8,7 @@
 //! stdin watchdog. Nothing here outlives the process.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const host_target = @import("../hosts/target.zig");
 const contracts = @import("contracts.zig");
@@ -541,6 +542,9 @@ pub const Runtime = struct {
         std.debug.assert(self.live_correlations.remove(correlation_id));
     }
 
+    /// Publishes a worker's completion and frees the worker and its intent.
+    /// It frees them before the broadcast that lets `deinit` finish, so a
+    /// detached worker never touches the allocator after its runtime stopped.
     fn finishActive(
         self: *Runtime,
         worker: *RequestWorker,
@@ -554,6 +558,9 @@ pub const Runtime = struct {
         self.active_count -= 1;
         self.observeProjectionLocked(worker.intent.request.value, completion);
         self.completions.push(completion);
+        const alloc = self.alloc.?;
+        worker.intent.deinit(alloc);
+        alloc.destroy(worker);
         self.wake.broadcast(zio);
     }
 
@@ -591,12 +598,12 @@ pub const Runtime = struct {
         if (self.backend) |backend| return backend;
         if (self.backend_closed) return error.RuntimeStopping;
         const alloc = self.alloc.?;
-        const home = self.profile_home orelse io_mod.getenv("HOME") orelse
+        const home = self.profile_home orelse io_mod.homeDir() orelse
             return error.HomeNotSet;
 
-        const pid = std.c.getpid();
+        const pid: i32 = @intCast(io_mod.processId());
         var pid_buffer: [32]u8 = undefined;
-        const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+        const pid_text = try std.mem.print(&pid_buffer, "{d}", .{pid});
         const token = try self.process_provider.captureToken(alloc, pid_text);
         var instance_bytes: [16]u8 = undefined;
         zio.random(&instance_bytes);
@@ -669,8 +676,6 @@ fn workerMain(runtime: *Runtime) void {
                 .kind = .disconnected,
                 .correlation_id = worker.intent.correlation_id,
             });
-            worker.intent.deinit(alloc);
-            alloc.destroy(worker);
             continue;
         };
         thread.detach();
@@ -685,11 +690,9 @@ const RequestWorker = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *RequestWorker) void {
-        const alloc = self.runtime.alloc.?;
-        const completion = self.complete(alloc);
+        const completion = self.complete(self.runtime.alloc.?);
+        // This frees the worker, so nothing here may use it afterwards.
         self.runtime.finishActive(self, completion);
-        self.intent.deinit(alloc);
-        alloc.destroy(self);
     }
 
     fn complete(self: *RequestWorker, alloc: Allocator) Completion {
@@ -800,7 +803,7 @@ var file_descriptor_budget_checked: std.atomic.Value(bool) = .init(false);
 /// terminal start, so the PTY and pipe descriptors of a full session budget
 /// fit under limits as low as 256.
 fn ensureFileDescriptorBudget() void {
-    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    if (comptime builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return;
     if (file_descriptor_budget_checked.swap(true, .acq_rel)) return;
     var limits = std.posix.getrlimit(.NOFILE) catch |err| {
         debug_trace.logf(
@@ -869,7 +872,7 @@ fn checkIntentAllocationFailures(alloc: Allocator) !void {
 
 test "owned admission survives allocation failure and rollback has one owner" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkIntentAllocationFailures,
         .{},
     );
@@ -956,13 +959,16 @@ test "runtime correlation stays reserved until its completion is taken" {
         admitTestIntent(&runtime, 23),
     );
 
-    var worker = RequestWorker{
+    // Finishing frees the worker and its intent; the testing allocator
+    // reports a leak or a double free if it doesn't free them exactly once.
+    const worker = try std.testing.allocator.create(RequestWorker);
+    worker.* = .{
         .runtime = &runtime,
         .intent = takeIntent(&runtime).?,
     };
     const zio = io_mod.getIo();
     runtime.mutex.lockUncancelable(zio);
-    worker.slot = runtime.registerWorkerLocked(&worker).?;
+    worker.slot = runtime.registerWorkerLocked(worker).?;
     runtime.mutex.unlock(zio);
     try std.testing.expectError(
         error.DuplicateCorrelation,
@@ -970,11 +976,10 @@ test "runtime correlation stays reserved until its completion is taken" {
     );
 
     const correlation_id = worker.intent.correlation_id;
-    runtime.finishActive(&worker, .{
+    runtime.finishActive(worker, .{
         .kind = .cancelled,
         .correlation_id = correlation_id,
     });
-    worker.intent.deinit(std.testing.allocator);
     try std.testing.expect(runtime.live_correlations.contains(correlation_id));
     var completion = runtime.takeCompletion().?;
     completion.deinit();
@@ -1079,7 +1084,7 @@ test "ordered mutations run in ticket order" {
 }
 
 /// Drives one real terminal through the in-process runtime. The launcher is
-/// the installed fx binary that `zig build test` names in FX_TEST_PRODUCT_EXE.
+/// the installed fx binary that `zig build test` provides.
 const LiveTerminalFixture = struct {
     const owner_session_id = "terminal-client-owner";
     const action_executor = @import("action_executor.zig");
@@ -1091,10 +1096,9 @@ const LiveTerminalFixture = struct {
 
     fn init(fixture: *LiveTerminalFixture) !void {
         const host_capabilities = @import("../hosts/host.zig");
-        if (comptime !host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported()) {
+        if (comptime !host_capabilities.terminalSupportForOs(builtin.target.os.tag).isSupported()) {
             return error.SkipZigTest;
         }
-        if (std.c.getenv("FX_TEST_PRODUCT_EXE") == null) return error.SkipZigTest;
         const alloc = std.testing.allocator;
         fixture.tmp = std.testing.tmpDir(.{});
         errdefer fixture.tmp.cleanup();
@@ -1139,6 +1143,15 @@ const LiveTerminalFixture = struct {
 
     /// Starts `command` in a clean bash and returns its owned session id.
     fn start(fixture: *LiveTerminalFixture, command: []const u8) ![]u8 {
+        return fixture.startInShell("/bin/bash", command);
+    }
+
+    /// Starts `command` in a clean `shell_path` and returns its owned session id.
+    fn startInShell(
+        fixture: *LiveTerminalFixture,
+        shell_path: []const u8,
+        command: []const u8,
+    ) ![]u8 {
         const alloc = std.testing.allocator;
         if (fixture.persistence) |*previous| previous.deinit();
         fixture.persistence = try operation.prepareStartPersistence(alloc, .{
@@ -1155,7 +1168,7 @@ const LiveTerminalFixture = struct {
         var started = try fixture.run(.{ .start = .{
             .cwd = fixture.home,
             .command = command,
-            .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+            .shell = .{ .executable = .{ .path = shell_path, .clean_start = true } },
             .backend = .native,
             .return_when = .started,
             .wait_ceiling_ms = 15_000,
@@ -1245,9 +1258,9 @@ const LiveTerminalFixture = struct {
     /// The pid recorded for a terminal's shell, read from its durable record.
     fn shellPid(fixture: *LiveTerminalFixture, session_id: []const u8) !std.posix.pid_t {
         const alloc = std.testing.allocator;
-        const name = try std.fmt.allocPrint(alloc, "record-{s}.json", .{session_id});
+        const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
-        const path = try std.fs.path.join(alloc, &.{
+        const path = try std.Io.Dir.path.join(alloc, &.{
             ".fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);
@@ -1272,9 +1285,9 @@ const LiveTerminalFixture = struct {
         session_id: []const u8,
     ) !contracts.Lifecycle {
         const alloc = std.testing.allocator;
-        const name = try std.fmt.allocPrint(alloc, "record-{s}.json", .{session_id});
+        const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
-        const path = try std.fs.path.join(alloc, &.{
+        const path = try std.Io.Dir.path.join(alloc, &.{
             ".fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);
@@ -1295,7 +1308,7 @@ const LiveTerminalFixture = struct {
 };
 
 fn processGone(pid: std.posix.pid_t) bool {
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| return err == error.ProcessNotFound;
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err == error.ProcessNotFound;
     return false;
 }
 
@@ -1358,7 +1371,7 @@ test "in-process registry starts writes to and stops a real terminal" {
     defer signaled.deinit(alloc);
     try std.testing.expect(signaled.view() == .success);
     try std.testing.expectEqual(
-        contracts.ReturnOutcome{ .signal = @intCast(@intFromEnum(std.c.SIG.KILL)) },
+        contracts.ReturnOutcome{ .signal = @intCast(@backingInt(std.c.SIG.KILL)) },
         try fixture.waitForExit(sleeper),
     );
     var closed = try fixture.run(.{ .close = .{
@@ -1373,6 +1386,42 @@ test "in-process registry starts writes to and stops a real terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(sleeper),
     );
+}
+
+test "zsh terminal commands keep words that start with = literal" {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    const session_id = try fixture.startInShell(
+        "/bin/zsh",
+        "echo before; echo ======; [ x == x ] && echo same; echo after",
+    );
+    defer alloc.free(session_id);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 0 },
+        try fixture.waitForExit(session_id),
+    );
+
+    var read = try fixture.run(.{ .read = .{
+        .session_id = session_id,
+        .cursor = .{ .segment = 1, .offset = 0 },
+        .authority = fixture.claim(),
+    } });
+    defer read.deinit(alloc);
+    const output = switch (read.view()) {
+        .success => |success| switch (success) {
+            .read => |value| value.output,
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.find(u8, output, "======") != null);
+    try std.testing.expect(std.mem.find(u8, output, "same") != null);
+    try std.testing.expect(std.mem.find(u8, output, "after") != null);
 }
 
 test "closing owned terminals for exit leaves no orphan and records them ended" {

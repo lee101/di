@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
@@ -9,23 +10,16 @@ const language_script = @import("../shared/language_script.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const image_attachments = @import("../images/image_attachments.zig");
-const generation_usage_provider = @import("generation_usage_provider.zig");
 const compactor = @import("../compactor/compactor.zig");
 const web_fetch_artifacts = @import("web_fetch_artifacts.zig");
 const todo_state = @import("todo_state.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const session_child_store = @import("session_child_store.zig");
-pub const session_usage = @import("session_usage.zig");
-pub const profile_usage_runtime = @import("profile_usage_runtime.zig");
 const command_contract = @import("../execution/command_contract.zig");
 const managed_execution = @import("../execution/managed_execution.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
-
-test {
-    _ = session_usage;
-    _ = profile_usage_runtime;
-}
 
 const compact_continuation_preamble = "This session is being continued from earlier compacted context. The summary below covers the earlier portion of the conversation.\n\n";
 const compact_recent_messages_note = "Recent conversation turns are preserved verbatim.";
@@ -57,8 +51,8 @@ pub const interrupted_turn_context =
     "</turn_aborted>";
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
-    if (!std.fs.path.isAbsolute(path)) return path;
-    return std.fmt.bufPrint(buffer, "images/{s}", .{std.fs.path.basename(path)});
+    if (!std.Io.Dir.path.isAbsolute(path)) return path;
+    return std.mem.print(buffer, "images/{s}", .{std.Io.Dir.path.basename(path)});
 }
 
 pub const interrupted_before_completion_output = "The previous response ended before completion.";
@@ -131,7 +125,7 @@ pub const WorkIdError = error{
 pub fn validateWorkId(work_id: []const u8) WorkIdError!void {
     if (work_id.len == 0 or work_id.len > max_work_id_bytes or
         !std.unicode.utf8ValidateSlice(work_id) or
-        std.mem.indexOfScalar(u8, work_id, 0) != null)
+        std.mem.findScalar(u8, work_id, 0) != null)
     {
         return error.InvalidWorkId;
     }
@@ -227,12 +221,12 @@ pub fn collect_image_catalog(
 
     for (canonical_history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
-            catalog[copied] = try dupeImageAttachment(alloc, attachment);
+            catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
             copied += 1;
         }
     }
     for (current_images) |attachment| {
-        catalog[copied] = try dupeImageAttachment(alloc, attachment);
+        catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
 
@@ -285,12 +279,12 @@ pub fn merge_image_catalog_history_turn(
         core_types.freeImageAttachment(alloc, attachment);
     };
     for (catalog) |attachment| {
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     for (additions) |attachment| {
         if (image_attachment_for_id(catalog, attachment.id) != null) continue;
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     sort_utils.sort(ImageAttachment, merged, {}, image_id_less_than);
@@ -352,14 +346,6 @@ fn mutable_images_for_history_turn(turn: *HistoryTurn) []ImageAttachment {
     };
 }
 
-fn mutable_images_slice_for_history_turn(turn: *HistoryTurn) ?*[]ImageAttachment {
-    return switch (turn.*) {
-        .compacted_summary => null,
-        .assistant => |*entry| &entry.user.images,
-        .interrupted => |*entry| &entry.user.images,
-    };
-}
-
 fn user_text_for_history_turn(turn: HistoryTurn) []const u8 {
     return switch (turn) {
         .compacted_summary => "",
@@ -380,7 +366,7 @@ const LegacyImagePlaceholderIterator = struct {
     };
 
     fn next(self: *@This()) ?Slot {
-        const relative_start = std.mem.indexOf(u8, self.text[self.offset..], prefix) orelse
+        const relative_start = std.mem.find(u8, self.text[self.offset..], prefix) orelse
             return null;
         const start = self.offset + relative_start;
         if (image_attachments.matchImagePlaceholder(self.text, start)) |match| {
@@ -389,7 +375,7 @@ const LegacyImagePlaceholderIterator = struct {
         }
 
         const body_start = start + prefix.len;
-        self.offset = if (std.mem.indexOfScalar(u8, self.text[body_start..], ']')) |relative_end|
+        self.offset = if (std.mem.findScalar(u8, self.text[body_start..], ']')) |relative_end|
             body_start + relative_end + 1
         else
             body_start;
@@ -560,160 +546,6 @@ pub fn repair_legacy_zero_image_ids(
     return true;
 }
 
-pub fn repair_legacy_image_snapshots(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) Allocator.Error!bool {
-    const snapshot_dir_existed = snapshot_directory_exists(snapshot_dir);
-    const candidate = try alloc.alloc(HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (candidate[0..copied]) |turn| freeHistoryTurn(alloc, turn);
-        alloc.free(candidate);
-    }
-    while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
-    }
-
-    const changed = repair_legacy_image_snapshots_in_place(
-        alloc,
-        candidate,
-        snapshot_dir,
-    ) catch |err| {
-        cleanup_candidate_snapshot_files(candidate, history);
-        if (!snapshot_dir_existed) remove_empty_snapshot_directory(snapshot_dir);
-        return err;
-    };
-    if (!changed) {
-        freeHistoryTurnSlice(alloc, candidate);
-        return false;
-    }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
-}
-
-pub fn repair_legacy_images_transactionally(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) (Allocator.Error || error{ImageIdOverflow})!bool {
-    const candidate = try alloc.alloc(HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (candidate[0..copied]) |turn| freeHistoryTurn(alloc, turn);
-        alloc.free(candidate);
-    }
-    while (copied < history.len) : (copied += 1) {
-        candidate[copied] = try dupeHistoryTurn(alloc, history[copied]);
-    }
-
-    const ids_changed = try repair_legacy_zero_image_ids(alloc, candidate);
-    const snapshots_changed = try repair_legacy_image_snapshots(
-        alloc,
-        candidate,
-        snapshot_dir,
-    );
-    if (!ids_changed and !snapshots_changed) {
-        freeHistoryTurnSlice(alloc, candidate);
-        return false;
-    }
-
-    for (history, candidate) |*current, *replacement| {
-        std.mem.swap(HistoryTurn, current, replacement);
-    }
-    freeHistoryTurnSlice(alloc, candidate);
-    return true;
-}
-
-fn snapshot_directory_exists(path: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch return false;
-    dir.close(io_mod.getIo());
-    return true;
-}
-
-fn remove_empty_snapshot_directory(path: []const u8) void {
-    std.Io.Dir.deleteDirAbsolute(io_mod.getIo(), path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf(
-            "session",
-            "event=legacy_snapshot_directory_cleanup_failed err={s}",
-            .{@errorName(err)},
-        ),
-    };
-}
-
-fn repair_legacy_image_snapshots_in_place(
-    alloc: Allocator,
-    history: []HistoryTurn,
-    snapshot_dir: []const u8,
-) Allocator.Error!bool {
-    var changed = false;
-    for (history) |*turn| {
-        const images_ptr = mutable_images_slice_for_history_turn(turn) orelse continue;
-        if (images_ptr.*.len == 0) continue;
-
-        var drop_indexes: std.ArrayList(usize) = .empty;
-        defer drop_indexes.deinit(alloc);
-        for (images_ptr.*, 0..) |*image, image_index| {
-            if (image.snapshot_path != null and image.snapshot_sha256 != null) continue;
-            image_attachments.captureImageSnapshot(alloc, image, snapshot_dir) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => {
-                    debug_trace.logf(
-                        "session",
-                        "legacy image snapshot unavailable id={d} err={s}",
-                        .{ image.id, @errorName(err) },
-                    );
-                    try drop_indexes.append(alloc, image_index);
-                    continue;
-                },
-            };
-            changed = true;
-        }
-        if (drop_indexes.items.len == 0) continue;
-
-        const retained_len = images_ptr.*.len - drop_indexes.items.len;
-        var retained: []ImageAttachment = if (retained_len > 0)
-            try alloc.alloc(ImageAttachment, retained_len)
-        else
-            &.{};
-        var retained_index: usize = 0;
-        var drop_cursor: usize = 0;
-        for (images_ptr.*, 0..) |image, image_index| {
-            const drop = drop_cursor < drop_indexes.items.len and
-                drop_indexes.items[drop_cursor] == image_index;
-            if (drop) {
-                core_types.freeImageAttachment(alloc, image);
-                drop_cursor += 1;
-                continue;
-            }
-            retained[retained_index] = image;
-            retained_index += 1;
-        }
-        alloc.free(images_ptr.*);
-        images_ptr.* = retained;
-        changed = true;
-    }
-    return changed;
-}
-
-fn cleanup_candidate_snapshot_files(
-    candidate: []const HistoryTurn,
-    original: []const HistoryTurn,
-) void {
-    for (candidate, original) |candidate_turn, original_turn| {
-        image_attachments.deleteUnreferencedImageSnapshots(
-            images_for_history_turn(candidate_turn),
-            images_for_history_turn(original_turn),
-        );
-    }
-}
-
 fn make_owned_legacy_image_turn(
     alloc: Allocator,
     text: []const u8,
@@ -727,141 +559,6 @@ fn make_owned_legacy_image_turn(
         .media_type = @constCast("image/png"),
     }});
     return turn;
-}
-
-fn sessionTestSnapshotDir(alloc: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, "snapshots" });
-}
-
-fn writeSessionTestImage(
-    alloc: Allocator,
-    tmp: *std.testing.TmpDir,
-    name: []const u8,
-    data: []const u8,
-) ![]u8 {
-    {
-        var file = try tmp.dir.createFile(std.testing.io, name, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, data);
-    }
-    return io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-}
-
-test "legacy image snapshot repair captures available path once" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const image_a = "\x89PNG\r\n\x1a\nlegacy-a";
-    const image_b = "\x89PNG\r\n\x1a\nlegacy-b";
-    const path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_a);
-    defer alloc.free(path);
-    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
-    defer alloc.free(snapshot_dir);
-    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", path);
-    var turn_owned = true;
-    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
-    turn.assistant.user.images[0].id = 1;
-    var history = [_]HistoryTurn{turn};
-    defer freeHistoryTurn(alloc, history[0]);
-    turn_owned = false;
-
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_path != null);
-    try std.testing.expect(history[0].assistant.user.images[0].snapshot_sha256 != null);
-    const replaced_path = try writeSessionTestImage(alloc, &tmp, "legacy.png", image_b);
-    defer alloc.free(replaced_path);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    try image_attachments.writeImageFilePartJson(alloc, &out.writer, history[0].assistant.user.images[0]);
-    var expected_buf: [128]u8 = undefined;
-    const expected = std.base64.standard.Encoder.encode(&expected_buf, image_a);
-    var unexpected_buf: [128]u8 = undefined;
-    const unexpected = std.base64.standard.Encoder.encode(&unexpected_buf, image_b);
-    try std.testing.expect(std.mem.find(u8, out.written(), expected) != null);
-    try std.testing.expect(std.mem.find(u8, out.written(), unexpected) == null);
-}
-
-test "legacy image snapshot repair drops unavailable path-only images" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
-    defer alloc.free(missing_path);
-    const snapshot_dir = try sessionTestSnapshotDir(alloc, &tmp);
-    defer alloc.free(snapshot_dir);
-    var turn = try make_owned_legacy_image_turn(alloc, "legacy [Image #1]", "answer", missing_path);
-    var turn_owned = true;
-    errdefer if (turn_owned) freeHistoryTurn(alloc, turn);
-    turn.assistant.user.images[0].id = 1;
-    var history = [_]HistoryTurn{turn};
-    defer freeHistoryTurn(alloc, history[0]);
-    turn_owned = false;
-
-    try std.testing.expect(try repair_legacy_image_snapshots(alloc, &history, snapshot_dir));
-    try std.testing.expectEqual(@as(usize, 0), history[0].assistant.user.images.len);
-}
-
-test "legacy image snapshot repair propagates OOM without changing memory or disk" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const image_bytes = "\x89PNG\r\n\x1a\nlegacy-oom";
-    const path = try writeSessionTestImage(alloc, &tmp, "legacy-oom.png", image_bytes);
-    defer alloc.free(path);
-    var reached_success = false;
-    for (0..256) |fail_index| {
-        var name_buf: [64]u8 = undefined;
-        const snapshot_name = try std.fmt.bufPrint(
-            &name_buf,
-            "snapshots-{d}",
-            .{fail_index},
-        );
-        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-        defer alloc.free(root);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, snapshot_name });
-        defer alloc.free(snapshot_dir);
-        const turn = try make_owned_legacy_image_turn(
-            alloc,
-            "legacy [Image #1]",
-            "answer",
-            path,
-        );
-        var history = [_]HistoryTurn{turn};
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-
-        if (repair_legacy_images_transactionally(
-            failing.allocator(),
-            &history,
-            snapshot_dir,
-        )) |changed| {
-            try std.testing.expect(changed);
-            try std.testing.expect(!failing.has_induced_failure);
-            freeHistoryTurn(failing.allocator(), history[0]);
-            reached_success = true;
-            break;
-        } else |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            try std.testing.expect(failing.has_induced_failure);
-            try std.testing.expectEqualStrings("legacy [Image #1]", history[0].assistant.user.text);
-            try std.testing.expectEqual(@as(usize, 1), history[0].assistant.user.images.len);
-            const image = history[0].assistant.user.images[0];
-            try std.testing.expectEqual(@as(usize, 0), image.id);
-            try std.testing.expectEqualStrings(path, image.path);
-            try std.testing.expect(image.snapshot_path == null);
-            try std.testing.expect(image.snapshot_sha256 == null);
-            try std.testing.expectError(
-                error.FileNotFound,
-                std.Io.Dir.openDirAbsolute(std.testing.io, snapshot_dir, .{ .iterate = true }),
-            );
-            freeHistoryTurn(alloc, history[0]);
-        }
-    }
-    try std.testing.expect(reached_success);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
@@ -1016,7 +713,7 @@ test "legacy image repair rewrites three repeated ordinals across persisted turn
 }
 
 test "legacy image repair leaves history unchanged when text reconstruction runs out of memory" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var first_images = [_]ImageAttachment{.{
         .id = 0,
         .path = @constCast("/tmp/first.png"),
@@ -1679,8 +1376,6 @@ pub const SessionRuntime = struct {
     todo: todo_state.Session = .{},
     language_lock: std.Io.Mutex = .init,
     conversation_language: ConversationLanguage = ConversationLanguage.default(),
-    usage: session_usage.Usage = session_usage.Usage.initFresh(),
-    profile_usage: profile_usage_runtime.Runtime = .{},
     permission_state_lock: std.Io.Mutex = .init,
     permission_state: session_permission_state.State = .{},
     /// Count limit for owned model-context snapshots; canonical history is not truncated.
@@ -1694,87 +1389,30 @@ pub const SessionRuntime = struct {
     /// first agent turn of the resumed session, so no lock is required.
     has_stale_shell_handles: bool = false,
 
-    pub fn init(
-        max_history_turns: usize,
-        provider: generation_usage_provider.Provider,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProvider(provider),
-            .max_history_turns = max_history_turns,
-        };
+    pub fn init(max_history_turns: usize) SessionRuntime {
+        return .{ .max_history_turns = max_history_turns };
     }
 
-    pub fn initWithProviders(
-        max_history_turns: usize,
-        providers: generation_usage_provider.Set,
-    ) SessionRuntime {
-        return .{
-            .usage = session_usage.Usage.initFreshWithProviders(providers),
-            .max_history_turns = max_history_turns,
-        };
-    }
-
-    pub fn initIntoWithProviders(
-        self: *SessionRuntime,
-        max_history_turns: usize,
-        providers: generation_usage_provider.Set,
-    ) void {
-        inline for (std.meta.fields(SessionRuntime)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "usage") or
-                std.mem.eql(u8, field.name, "max_history_turns")) continue;
-            @field(self.*, field.name) = field.defaultValue().?;
+    /// `init` in place, for a runtime too large to build on the stack.
+    pub fn initInto(self: *SessionRuntime, max_history_turns: usize) void {
+        const session_runtime_info = @typeInfo(SessionRuntime).@"struct";
+        inline for (session_runtime_info.field_names, session_runtime_info.field_types, session_runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "max_history_turns")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
-        self.usage.initIntoFreshWithProviders(providers);
         self.max_history_turns = max_history_turns;
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.configurePublicationSink(null);
-        self.usage.configureCheckpointSink(null);
-        self.usage.deinit(alloc);
-        self.profile_usage.deinit(alloc);
         self.permission_state.deinit(alloc);
         self.todo.deinit(alloc, io_mod.getIo());
         self.agent.deinit(alloc);
         self.context_notice_hashes.deinit(alloc);
     }
 
-    pub fn initializeProfileUsage(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        self.usage.configurePublicationSink(null);
-        return self.profile_usage.initialize(alloc, home_path);
-    }
-
-    /// Attaches callbacks only after the host has placed SessionRuntime at its
-    /// final address.
-    pub fn attachProfileUsagePublisher(
-        self: *SessionRuntime,
-        alloc: Allocator,
-    ) void {
-        self.usage.configurePublicationSink(
-            if (self.profile_usage.isAvailable())
-                self.profile_usage.publisherSink(alloc)
-            else
-                null,
-        );
-    }
-
-    pub fn ensureProfileUsageReadable(
-        self: *SessionRuntime,
-        alloc: Allocator,
-        home_path: ?[]const u8,
-    ) !profile_usage_runtime.InitializeOutcome {
-        if (self.profile_usage.isAvailable()) return .available;
-        return self.initializeProfileUsage(alloc, home_path);
-    }
-
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
         self.clearWebFetchArtifacts();
-        self.usage.resetFresh(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
@@ -1785,7 +1423,6 @@ pub const SessionRuntime = struct {
 
     pub fn restore(self: *SessionRuntime, alloc: Allocator, language: ConversationLanguage, history: []const HistoryTurn) !void {
         self.clearWebFetchArtifacts();
-        self.usage.resetLegacy(alloc);
         self.clearPermissionState(alloc);
         self.clearHistory(alloc);
         self.clearContextNotices();
@@ -1873,17 +1510,8 @@ pub const SessionRuntime = struct {
         self.permission_state.deinit(alloc);
     }
 
-    pub fn configureWebFetchArtifacts(self: *SessionRuntime, alloc: Allocator, session_dir: []const u8) void {
-        self.clearWebFetchArtifacts();
-        const store = web_fetch_artifacts.Store.init(alloc, session_dir) catch |err| {
-            self.web_fetch_artifacts = .{ .unavailable = err };
-            return;
-        };
-        self.web_fetch_artifacts = .{ .store = store };
-    }
-
-    /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
-    /// are its blobs (D44, D49).
+    /// Keeps a v2 session's web-fetch downloads as its blobs (D44, D49), or
+    /// records why they can't be kept.
     pub fn configureWebFetchArtifactBlobs(
         self: *SessionRuntime,
         alloc: Allocator,
@@ -2104,16 +1732,11 @@ pub const SessionRuntime = struct {
     }
 };
 
-test "session initIntoWithProviders preserves runtime defaults without copying usage scratch arrays" {
+test "session initInto preserves runtime defaults" {
     var actual: SessionRuntime = undefined;
     @memset(std.mem.asBytes(&actual), 0xa5);
-    actual.initIntoWithProviders(17, .{});
-
-    var expected = SessionRuntime.initWithProviders(17, .{});
-    @memset(std.mem.asBytes(&expected.usage.active_sequences), 0xa5);
-    @memset(std.mem.asBytes(&expected.usage.incidents), 0xa5);
-
-    try std.testing.expectEqualDeep(expected, actual);
+    actual.initInto(17);
+    try std.testing.expectEqualDeep(SessionRuntime.init(17), actual);
 }
 
 fn appendHistoryCopies(
@@ -2184,7 +1807,7 @@ test "retained context history replacement is allocation-failure atomic" {
             try std.testing.expectEqualStrings("older reply", source[0].assistant.assistant);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Fixture.run, .{});
 }
 
 /// Frees an owned image attachment slice and each attachment field.
@@ -2200,45 +1823,7 @@ pub fn freeHistoryTurnSlice(alloc: Allocator, turns: []HistoryTurn) void {
     if (turns.len > 0) alloc.free(turns);
 }
 /// Deep-copies an image attachment slice; caller owns the returned slice and frees with freeImageAttachmentSlice.
-pub fn dupeImageAttachmentSlice(alloc: Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
-    if (attachments.len == 0) return &.{};
-    const copy = try alloc.alloc(ImageAttachment, attachments.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            core_types.freeImageAttachment(alloc, copy[i]);
-        }
-    }
-    for (attachments, 0..) |attachment, i| {
-        copy[i] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    return copy;
-}
-fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment {
-    const path = try alloc.dupe(u8, src.path);
-    errdefer alloc.free(path);
-    const media_type = try alloc.dupe(u8, src.media_type);
-    errdefer alloc.free(media_type);
-    const snapshot_path = if (src.snapshot_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    const snapshot_sha256 = if (src.snapshot_sha256) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    return .{
-        .id = src.id,
-        .path = path,
-        .media_type = media_type,
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = snapshot_sha256,
-    };
-}
+pub const dupeImageAttachmentSlice = core_types.dupeImageAttachmentSlice;
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
 pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
@@ -2255,7 +1840,7 @@ pub fn appendAssistantTurnWithExecution(
     const next = try alloc.alloc(HistoryTurn, current.len + 1);
     errdefer alloc.free(next);
 
-    std.mem.copyForwards(HistoryTurn, next[0..current.len], current);
+    @memmove(next[0..current.len], current);
     next[current.len] = .{ .assistant = .{
         .user = .{ .text = user_copy, .images = &.{} },
         .assistant = assistant_copy,
@@ -2277,129 +1862,6 @@ pub fn makeAssistantTurn(alloc: Allocator, user_text: []const u8, assistant_text
         .user = .{ .text = user_copy, .images = &.{} },
         .assistant = assistant_copy,
     } };
-}
-
-test "unavailable profile usage keeps reconciled generation pending in host runtime" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.unavailable,
-        try runtime.initializeProfileUsage(alloc, null),
-    );
-    runtime.attachProfileUsagePublisher(alloc);
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    var snapshot = try runtime.usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
-    try std.testing.expectEqual(@as(u64, 0), snapshot.input_tokens);
-    try std.testing.expectEqual(@as(usize, 1), checkpoint.calls);
-}
-
-test "readable profile usage does not attach publishers or flush recovery" {
-    const alloc = std.testing.allocator;
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.calls += 1;
-        }
-    };
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-
-    var checkpoint = Checkpoint{};
-    var runtime: SessionRuntime = .{ .max_history_turns = 8 };
-    defer runtime.deinit(alloc);
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.initializeProfileUsage(alloc, home),
-    );
-    runtime.usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-
-    const sequence = try runtime.usage.reserveInvocation();
-    try runtime.usage.finishObservedInvocation(
-        alloc,
-        sequence,
-        1,
-        .observed_generation,
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        "https://ai-gateway.vercel.sh",
-        null,
-    );
-    try runtime.usage.applyGeneration(alloc, .{
-        .id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        .created_at_ms = 1000,
-        .model = "provider/model",
-        .total_cost = 0.25,
-        .input_tokens = 10,
-        .output_tokens = 2,
-        .cache_read_tokens = 1,
-        .cache_write_tokens = 0,
-        .reasoning_tokens = 1,
-        .billable_web_search_calls = 0,
-    });
-
-    const checkpoint_calls = checkpoint.calls;
-    try std.testing.expectEqual(
-        profile_usage_runtime.InitializeOutcome.available,
-        try runtime.ensureProfileUsageReadable(alloc, home),
-    );
-    var saved = try runtime.usage.snapshot(alloc);
-    defer saved.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), saved.publication_backlog.len);
-    try std.testing.expectEqual(checkpoint_calls, checkpoint.calls);
-    try std.testing.expectError(
-        error.FileNotFound,
-        tmp.dir.access(io_mod.getIo(), ".fx/usage.jsonl", .{}),
-    );
 }
 
 test "appendAssistantTurnWithExecution transfers memory and clears the source" {
@@ -2429,7 +1891,7 @@ test "appendAssistantTurnWithExecution transfers memory and clears the source" {
 }
 
 test "appendAssistantTurnWithExecution keeps source memory on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     for (0..3) |fail_index| {
         var execution = core_types.ExecutionMemory{
@@ -2992,8 +2454,7 @@ pub fn inferConversationLanguage(text: []const u8, fallback: ConversationLanguag
 
 pub fn formatCompactedContinuationMessage(alloc: Allocator, summary: []const u8) ![]u8 {
     if (try compactor.modelText(alloc, summary)) |text| return text;
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s}{s}\n\n{s}\n{s}",
         .{ compact_continuation_preamble, summary, compact_recent_messages_note, compact_direct_resume_instruction },
     );
@@ -3074,7 +2535,7 @@ fn formatInterruptedAssistantClosedContent(alloc: Allocator, entry: InterruptedH
 }
 
 fn formatInterruptedPartialAssistantClosedContent(alloc: Allocator, assistant: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
+    return alloc.print("{s}\n\n{s}", .{ assistant, interrupted_before_completion_output });
 }
 
 test "resume-history-to-request conversion preserves user assistant ordering" {
@@ -3101,30 +2562,9 @@ test "resume-history-to-request conversion preserves user assistant ordering" {
 }
 test "appendHistoryMessages frees owned projection text when append fails" {
     const compact = [_]HistoryTurn{.{ .compacted_summary = .{ .summary = @constCast("summary"), .removed_turn_count = 1, .compaction_count = 1 } }};
-    var compact_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var compact_failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
-}
-test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    }));
-}
-test "dupeImageAttachment preserves stable image id" {
-    const alloc = std.testing.allocator;
-    const copy = try dupeImageAttachment(alloc, .{
-        .id = 41,
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    });
-    defer {
-        alloc.free(copy.path);
-        alloc.free(copy.media_type);
-    }
-
-    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 test "conversation-language inference matches script signals" {
     try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("puoi aprire la landing page", ConversationLanguage.default()));
@@ -3144,8 +2584,8 @@ test "history projection keeps system role only for leading summaries" {
             .compaction_count = 1,
         } },
         .{ .assistant = .{
-            .user = .{ .text = @constCast("old request " ++ ("u" ** 800)) },
-            .assistant = @constCast("old answer " ++ ("a" ** 800)),
+            .user = .{ .text = @constCast("old request " ++ text_utils.repeat("u", 800)) },
+            .assistant = @constCast("old answer " ++ text_utils.repeat("a", 800)),
         } },
         .{ .compacted_summary = .{
             .summary = @constCast("nonleading summary marker"),
@@ -3628,7 +3068,7 @@ test "interrupted history projects marker and aborted tool result" {
 
 test "interrupted tool diagnostics remain complete for compaction" {
     const replay_handle = "cancelled-output.bin";
-    const oversized_handle = "h" ** 129;
+    const oversized_handle = text_utils.repeat("h", 129);
     const presentations = [_]?CancelledCommandPresentation{
         null,
         .{},
@@ -4026,7 +3466,7 @@ test "SessionRuntime restore and reset clear stale shell handle state" {
 }
 
 test "SessionRuntime.restore may retain earlier restored turns after later append failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 3 });
     const alloc = failing.allocator();
     var runtime: SessionRuntime = .{ .max_history_turns = 0 };
     defer runtime.deinit(alloc);
@@ -4115,7 +3555,7 @@ test "compacted Unicode history remains conversational context" {
     const alloc = std.testing.allocator;
     const context = [_]HistoryTurn{
         .{ .compacted_summary = .{
-            .summary = @constCast(("a" ** 155) ++ "★"),
+            .summary = @constCast(text_utils.repeat("a", 155) ++ "★"),
             .removed_turn_count = 2,
             .compaction_count = 1,
         } },
@@ -4276,7 +3716,7 @@ test "legacy checkpoint keeps restored provenance conservative" {
 }
 
 test "SessionRuntime context snapshot allocation failure preserves canonical state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(alloc);
 
@@ -4510,7 +3950,7 @@ fn checkPromptHistorySnapshotAllocationFailures(alloc: Allocator) !void {
 
 test "prompt history snapshot failure preserves canonical ownership" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPromptHistorySnapshotAllocationFailures,
         .{},
     );
@@ -4610,7 +4050,7 @@ test "prompt history cleanup is independent after snapshot creation" {
     defer freeHistoryTurnSlice(alloc, prompt_history);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkPromptHistoryMessageProjectionAllocationFailures,
         .{prompt_history},
     );
@@ -4683,9 +4123,9 @@ test "SessionRuntime context projection preserves nine typed canonical turns" {
         .execution = .{ .tool_steps = steps[0..] },
     } });
     for (1..9) |index| {
-        const user = try std.fmt.allocPrint(alloc, "prompt {d}", .{index});
+        const user = try alloc.print("prompt {d}", .{index});
         defer alloc.free(user);
-        const assistant = try std.fmt.allocPrint(alloc, "reply {d}", .{index});
+        const assistant = try alloc.print("reply {d}", .{index});
         defer alloc.free(assistant);
         try runtime.appendAssistantHistoryTurn(alloc, user, assistant);
     }
@@ -4782,14 +4222,14 @@ fn checkWorkProvenanceOwnershipFailures(alloc: Allocator) !void {
 
 test "work provenance user ownership frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkWorkProvenanceOwnershipFailures,
         .{},
     );
 }
 
 test "SessionRuntime.snapshotHistory frees partial copies on allocation failure" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var runtime: SessionRuntime = .{ .max_history_turns = 8 };
     defer runtime.deinit(base);
 
@@ -4828,6 +4268,35 @@ test "active context and image catalog retain historical images" {
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
     try std.testing.expectEqual(@as(usize, 3), catalog[0].id);
     try std.testing.expectEqualStrings("/tmp/historical.png", catalog[0].path);
+}
+
+test "the image catalog keeps each image's handle and bytes, so Vision can read a resumed one (D89)" {
+    const alloc = std.testing.allocator;
+    const digest = "abababababababababababababababababababababababababababababababab";
+    var resumed = [_]ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/example/old.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(digest),
+        .blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/" ++ digest),
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old image"), .images = &resumed },
+        .assistant = @constCast("old answer"),
+    } }};
+    var unsaved_bytes = "png".*;
+    const current = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/Users/example/new.png"),
+        .media_type = @constCast("image/png"),
+        .inline_data = &unsaved_bytes,
+        .source_ref = @constCast("host:new"),
+    }};
+    const catalog = try collect_image_catalog(alloc, &history, &current);
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    try std.testing.expectEqualStrings(resumed[0].blob_path.?, catalog[0].blob_path.?);
+    try std.testing.expectEqualStrings("png", catalog[1].inline_data.?);
+    try std.testing.expectEqualStrings("host:new", catalog[1].source_ref.?);
 }
 
 test "full image catalog merges canonical history and current images" {
@@ -4875,7 +4344,7 @@ fn checkImageCatalogHistoryMergeAllocationFailures(alloc: Allocator) !void {
 
 test "image catalog history merge cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkImageCatalogHistoryMergeAllocationFailures,
         .{},
     );
@@ -4930,12 +4399,12 @@ test "full image catalog cleans up every allocation failure" {
         .media_type = @constCast("image/jpeg"),
     }};
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed = try collect_image_catalog(probe.allocator(), &history, &current);
     core_types.freeImageAttachmentSlice(probe.allocator(), probed);
     for (0..probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -5080,7 +4549,7 @@ test "SessionRuntime.appendHistoryMessages frees owned system text when append f
         .removed_turn_count = 1,
         .compaction_count = 1,
     } }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var messages: std.ArrayList(message.Message) = .empty;
 
     try std.testing.expectError(error.OutOfMemory, SessionRuntime.appendHistoryMessages(failing.allocator(), &messages, &compact));
@@ -5112,7 +4581,7 @@ test "image catalog merges a retained recovery image and rejects changed identit
         .path = @constCast("/missing/original.png"),
         .media_type = @constCast("image/png"),
         .snapshot_path = @constCast("/session/images/saved.bin"),
-        .snapshot_sha256 = @constCast("a" ** 64),
+        .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
     }};
     const turn: HistoryTurn = .{ .interrupted = .{ .user = .{ .text = @constCast("recover"), .images = &images } } };
     const catalog = try collect_image_catalog(alloc, &.{turn}, &.{});
@@ -5121,6 +4590,6 @@ test "image catalog merges a retained recovery image and rejects changed identit
     defer core_types.freeImageAttachmentSlice(alloc, merged);
     try std.testing.expectEqual(@as(usize, 1), merged.len);
     try std.testing.expectEqual(@as(usize, 7), merged[0].id);
-    images[0].snapshot_sha256 = @constCast("b" ** 64);
+    images[0].snapshot_sha256 = @constCast(text_utils.repeat("b", 64));
     try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
 }

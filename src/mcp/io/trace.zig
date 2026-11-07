@@ -1,9 +1,10 @@
-//! JSONL trace of core steps (docs/approach.md §6, format version 1).
+//! JSONL trace of core steps (format version 1).
 //!
 //! The I/O layer writes one line per `step` call when tracing is on. The Bun
-//! bridge turns a trace into a TLA+ observation and asks TLC whether it is a
-//! behavior of the machine's model. `data` carries only model projections
-//! (ids, versions, flags, counters), never tokens or user content.
+//! bridge in `tests/tla/drivers/mcp/bridge.ts` turns a trace into a TLA+
+//! observation and asks TLC whether it is a behavior of the machine's model
+//! in `tests/tla/mcp/`. `data` carries only model projections (ids, versions,
+//! flags, counters), never tokens or user content.
 
 const std = @import("std");
 
@@ -65,7 +66,7 @@ pub const Writer = struct {
         if (self.parent) |parent| {
             var buffer: [256]u8 = undefined;
             var named = step;
-            named.instance = std.fmt.bufPrint(&buffer, "{s}.{s}", .{ self.prefix, step.instance }) catch return error.WriteFailed;
+            named.instance = std.mem.print(&buffer, "{s}.{s}", .{ self.prefix, step.instance }) catch return error.WriteFailed;
             return parent.write(named);
         }
         const w = self.out;

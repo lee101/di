@@ -5,6 +5,7 @@ const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const McpTool = @import("catalog_state.zig").McpTool;
 const Allocator = std.mem.Allocator;
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const encodeScalarAlloc = model_context_encoding.scalarAlloc;
 
 pub const AlwaysLoadedTools = struct {
@@ -32,7 +33,9 @@ pub const AlwaysLoaded = struct {
     }
 
     pub fn deinit(b: *AlwaysLoaded, alloc: Allocator) void {
-        tool_mcp_runtime.freeSelectedTools(alloc, b.selected.items);
+        for (b.selected.items) |tool| tool.deinit(alloc);
+        // The list's whole capacity, not just its tools.
+        b.selected.deinit(alloc);
         b.* = undefined;
     }
 
@@ -67,8 +70,7 @@ pub const AlwaysLoaded = struct {
 
     /// Hands the tools over, with a notice when the budget left any out.
     pub fn finish(b: *AlwaysLoaded, alloc: Allocator) !AlwaysLoadedTools {
-        const notice = if (b.omitted > 0) try std.fmt.allocPrint(
-            alloc,
+        const notice = if (b.omitted > 0) try alloc.print(
             "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
             .{ b.omitted, if (b.omitted == 1) "" else "s" },
         ) else null;
@@ -116,13 +118,12 @@ fn buildToolSchemaJsonWithLimitMarker(
     defer if (encoded_instructions) |text| alloc.free(text);
     const merged_description = if (instructions != null)
         if (instructions_truncated)
-            try std.fmt.allocPrint(
-                alloc,
+            try alloc.print(
                 "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
                 .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
             )
         else
-            try std.fmt.allocPrint(alloc, "{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
+            try alloc.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
     else
         try alloc.dupe(u8, encoded_description);
     defer alloc.free(merged_description);
@@ -151,4 +152,32 @@ fn renderSchemaNotice(
         .{ action, observed_bytes, limit.effectiveBytes(), limit.source.label(), limit_name },
     );
     return try out.toOwnedSlice();
+}
+
+const testing = std.testing;
+
+/// Adds four always-loaded tools and hands them over, as
+/// `snapshotAlwaysLoadedTools` does. With four the list's capacity passes
+/// its length.
+fn loadFour(alloc: Allocator) !void {
+    var loaded: AlwaysLoaded = .init(.{});
+    errdefer loaded.deinit(alloc);
+    var names = [_][5]u8{ "srv_a".*, "srv_b".*, "srv_c".*, "srv_d".* };
+    var description = "Echoes text.".*;
+    var schema = "{\"type\":\"object\"}".*;
+    for (&names) |*name| {
+        const tool: McpTool = .{ .original_name = name[4..], .prefixed_name = name, .description = &description, .input_schema_json = &schema, .tags = &.{} };
+        // The schema's writer reports a failed allocation as WriteFailed.
+        loaded.add(alloc, tool, null, .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 }, .{}) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => err,
+        };
+    }
+    var tools = try loaded.finish(alloc);
+    defer tools.deinit(alloc);
+    try testing.expectEqual(@as(usize, 4), tools.tools.len);
+}
+
+test "always-loaded tools are freed whole when memory runs out partway" {
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, loadFour, .{});
 }

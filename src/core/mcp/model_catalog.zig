@@ -1,5 +1,5 @@
 const std = @import("std");
-const health = @import("health.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 
@@ -183,22 +183,6 @@ fn findCurrentEntry(current: []const ServerSummary, name: []const u8) ?ServerSum
     return null;
 }
 
-pub fn classifyAvailability(
-    connection: health.ConnectionState,
-    authentication: health.AuthenticationState,
-    deferred_for_ask: bool,
-) Availability {
-    return switch (health.classify(connection, authentication, deferred_for_ask)) {
-        .disabled => .disabled,
-        .connecting => .discovering,
-        .ready => .ready,
-        .needs_auth => .authentication_required,
-        .failed => .failed,
-        .unavailable => .unavailable,
-        .on_demand => .available_on_demand,
-    };
-}
-
 /// Returns an owned prompt section. The caller releases it with `deinit` unless
 /// both values are intentionally retained by the supplied request arena.
 pub fn render(alloc: Allocator, snapshot: Snapshot) Allocator.Error!PromptSection {
@@ -250,8 +234,7 @@ fn renderWithLimit(alloc: Allocator, snapshot: Snapshot, limit: usize) Allocator
     errdefer alloc.free(text);
     return .{
         .text = text,
-        .notice = try std.fmt.allocPrint(
-            alloc,
+        .notice = try alloc.print(
             "[context] omitted {d} MCP server{s} from the model catalog because the fixed {d}-byte budget was reached",
             .{ omitted_count, if (omitted_count == 1) "" else "s", limit },
         ),
@@ -279,8 +262,7 @@ fn renderEntry(alloc: Allocator, server: ServerSummary) Allocator.Error![]u8 {
 }
 
 fn truncationMarker(alloc: Allocator, omitted_count: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "  <catalog_truncated omitted_count=\"{d}\" />\n",
         .{omitted_count},
     );
@@ -347,32 +329,6 @@ fn ownedSnapshot(
         initialized += 1;
     }
     return .{ .servers = servers };
-}
-
-test "availability follows canonical connection authentication and deferred state" {
-    const Case = struct {
-        connection: health.ConnectionState,
-        authentication: health.AuthenticationState = .none,
-        deferred_for_ask: bool = false,
-        expected: Availability,
-    };
-    const cases = [_]Case{
-        .{ .connection = .ready, .expected = .ready },
-        .{ .connection = .connecting, .expected = .discovering },
-        .{ .connection = .disconnected, .deferred_for_ask = true, .expected = .available_on_demand },
-        .{ .connection = .failed, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disconnected, .authentication = .required, .expected = .authentication_required },
-        .{ .connection = .disabled, .expected = .disabled },
-        .{ .connection = .disabled, .authentication = .required, .expected = .disabled },
-        .{ .connection = .failed, .expected = .failed },
-        .{ .connection = .disconnected, .expected = .unavailable },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(
-            case.expected,
-            classifyAvailability(case.connection, case.authentication, case.deferred_for_ask),
-        );
-    }
 }
 
 test "render exposes sorted server summaries without tool metadata" {
@@ -457,7 +413,7 @@ fn checkRenderAllocationFailures(alloc: Allocator) !void {
 
 test "render cleans up every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkRenderAllocationFailures,
         .{},
     );
@@ -515,7 +471,7 @@ test "renderChangeNotice bounds the transition list and encodes names" {
     var current: [10]ServerSummary = undefined;
     var names: [10][]u8 = undefined;
     for (0..10) |index| {
-        names[index] = try std.fmt.allocPrint(alloc, "server<{d}>", .{index});
+        names[index] = try alloc.print("server<{d}>", .{index});
     }
     defer for (names) |name| alloc.free(name);
     for (0..10) |index| {

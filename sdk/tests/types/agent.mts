@@ -6,9 +6,11 @@ import {
   FxFencedError,
   FxJournalVersionError,
   memory,
+  wakeHandler,
   type Durability,
   type FxAgent,
   type FxAgentEvent,
+  type FxAgentTools,
   type FxResumeTurn,
   type FxSession,
   type FxStopReason,
@@ -87,7 +89,7 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   for await (const event of retried) {
     if (event.type === "tool_start") console.log(event.id, event.name, event.inputTruncated ? event.inputPreview : event.input);
     if (event.type === "tool_end") console.log(event.content, event.isError);
-    if (event.type === "user_message") console.log(event.text);
+    if (event.type === "user_message") console.log(event.text, event.id);
     console.log(event.epoch);
   }
 
@@ -113,6 +115,14 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   known.stream();
 
   await known.steer("Keep the public API backward compatible.");
+  const steered = await known.steer("Prefer small diffs.", { messageId: "m12" });
+  assertType<Equal<typeof steered.messageId, string>>();
+  await known.steer([
+    { type: "text", text: "Match this screenshot." },
+    { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+  ]);
+  // @ts-expect-error a durable steer carries image data as a base64 string
+  known.steer([{ type: "image", data: new Uint8Array(4), mimeType: "image/png" }]);
   await known.cancel();
   const checkpoint = await known.checkpoint();
   assertType<Equal<typeof checkpoint, Uint8Array>>();
@@ -195,6 +205,7 @@ export async function worlds(): Promise<void> {
       async write() {},
       async writeMulti() {},
       async get() { return new ReadableStream<Uint8Array>(); },
+      async getChunks() { return { data: [], cursor: null, hasMore: false }; },
       async getInfo() { return { tailIndex: -1 }; },
     },
     async queue() { return { messageId: null }; },
@@ -206,6 +217,9 @@ export async function worlds(): Promise<void> {
   world(fake);
   world(() => fake);
   world(async () => fake, { name: "postgres", pollMs: 500, maxDurationMs: 800_000, reserveMs: 30_000, leaseMs: 10_000 });
+  world(fake, { name: "queues", queueLeases: true, queueDurable: true });
+  world(fake, { queueLeases: true, runInRequest: false });
+  world(fake, { queueLeases: true, waitUntil: (work) => void work });
   world(fake, {
     livenessKnown: true,
     holderInfo: () => ({ pid: 42, host: "worker-1" }),
@@ -233,8 +247,10 @@ export function tools(): FxAgent {
   const inputSchema = { type: "object", properties: { orderId: { type: "string" } }, required: ["orderId"] };
   const effects = [
     { name: "get_order", description: "Look up an order.", idempotent: true, inputSchema, async execute(input: { orderId: string }, { executionId }: FxToolContext) { return { input, executionId }; } },
-    { name: "refund_order", description: "Refund an order.", writes: true, inputSchema, async execute(input: { orderId: string }, { executionId }: FxToolContext) { return payments.refund(input.orderId, { idempotencyKey: executionId }); } },
-  ] satisfies FxTools;
+    { name: "refund_order", description: "Refund an order.", idempotent: true, writes: true, inputSchema, async execute(input: { orderId: string }, { executionId }: FxToolContext) { return payments.refund(input.orderId, { idempotencyKey: executionId }); } },
+  ] satisfies FxAgentTools;
+  // An agent's tools are an engine's tools too.
+  const _engineTools: FxTools = effects;
 
   createFxAgent({
     apiKey,
@@ -245,6 +261,7 @@ export function tools(): FxAgent {
       {
         name: "lookup",
         description: "Look up a value.",
+        idempotent: true,
         inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] },
         async execute(input, context) {
           assertType<Equal<typeof context, FxToolContext>>();
@@ -260,20 +277,24 @@ export function tools(): FxAgent {
 
   createFxAgent({
     tools: {
-      lookup: { description: "Look up a value.", inputSchema: { type: "object" }, execute: () => "value" },
-      save: { name: "save", description: "Save.", inputSchema: { type: "object" }, execute: () => ({ type: "libfx.tool-result", text: "Saved.", images: [] }) },
+      lookup: { description: "Look up a value.", idempotent: true, inputSchema: { type: "object" }, execute: () => "value" },
+      save: { name: "save", description: "Save.", idempotent: false, inputSchema: { type: "object" }, execute: () => ({ type: "libfx.tool-result", text: "Saved.", images: [] }) },
       web_search: { providerExecuted: true },
     },
   });
 
   // @ts-expect-error a tool needs a name
-  createFxAgent({ tools: [{ description: "Look up a value.", inputSchema: { type: "object" }, execute: () => "value" }] });
+  createFxAgent({ tools: [{ description: "Look up a value.", idempotent: true, inputSchema: { type: "object" }, execute: () => "value" }] });
   // @ts-expect-error a host tool needs a description
-  createFxAgent({ tools: [{ name: "lookup", inputSchema: { type: "object" }, execute: () => "value" }] });
+  createFxAgent({ tools: [{ name: "lookup", idempotent: true, inputSchema: { type: "object" }, execute: () => "value" }] });
+  // @ts-expect-error a host tool must say whether it is idempotent
+  createFxAgent({ tools: [{ name: "lookup", description: "Look up a value.", inputSchema: { type: "object" }, execute: () => "value" }] });
+  // @ts-expect-error a keyed host tool must say so too
+  createFxAgent({ tools: { lookup: { description: "Look up a value.", inputSchema: { type: "object" }, execute: () => "value" } } });
   // @ts-expect-error a provider-executed tool must not define execute()
   createFxAgent({ tools: [{ name: "web_search", providerExecuted: true, execute: () => "value" }] });
   // @ts-expect-error a keyed descriptor's name must be a string
-  createFxAgent({ tools: { lookup: { name: 1, description: "Look up a value.", inputSchema: {}, execute: () => "value" } } });
+  createFxAgent({ tools: { lookup: { name: 1, description: "Look up a value.", idempotent: true, inputSchema: {}, execute: () => "value" } } });
 
   return createFxAgent({ apiKey, tools: effects });
 }
@@ -316,6 +337,7 @@ export function events(): void {
       if (event.type === "session.error") console.log(event.sessionId, event.error.message);
       if (event.type === "session.deadline" || event.type === "session.fenced") assertType<Equal<typeof event.epoch, number>>();
       if (event.type === "session.deadline") assertType<Equal<typeof event.cutoffs, number>>();
+      if (event.type === "session.forwarded") assertType<Equal<typeof event.agent, string>>();
       if (event.type === "checkpoint.mismatch") console.log(event.changed.includes("model"), event.current.toolSchemaHash);
       if (event.type === "transport.activity") console.log(event.attempt, event.chunkBytes, event.totalBytes);
       if (event.type === "transport.response") console.log(event.status, event.requestId);
@@ -357,6 +379,13 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export const wake: (request: Request) => Promise<Response> = agent.wakeHandler();
+
+// Several agents: each named, one route for all of them.
+export const support: FxAgent = createFxAgent({ name: "support", instructions: "Answer billing questions." });
+assertType<Equal<typeof support.name, string>>();
+export const wakeAll: (request: Request) => Promise<Response> = wakeHandler();
+// @ts-expect-error a name is text
+createFxAgent({ name: 7 });
 
 // A durable Codex agent: each process asks the host for the session's credentials.
 export const codexAgent: FxAgent = createFxAgent({

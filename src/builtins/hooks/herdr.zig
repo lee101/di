@@ -181,6 +181,7 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
     std.posix.setsockopt(
         stream.socket.handle,
         std.posix.SOL.SOCKET,

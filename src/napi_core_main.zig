@@ -4,6 +4,7 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const stream_provider = @import("core/agent/stream_provider.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
@@ -11,7 +12,7 @@ const host_attachments = @import("core/hosts/host_attachments.zig");
 const agent_checkpoint = @import("core/agent/runtime/checkpoint.zig");
 const io_mod = @import("core/shared/io.zig");
 const fetch_state = @import("napi_fetch_state.zig");
-const streamable_http = @import("core/mcp/streamable_http.zig");
+const http_config = @import("core/mcp/http_config.zig");
 const host_stream_provider = @import("gateway/host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
@@ -23,9 +24,7 @@ const oauth_transport = @import("core/auth/oauth_transport.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
-const c = @cImport({
-    @cInclude("node_api.h");
-});
+const c = @import("node_api");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
@@ -33,6 +32,24 @@ const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
+/// The largest request body a provider sends over the fetch bridge: its
+/// budget less room for the request's method, URL, and headers, which hold
+/// at most the URL and API key this addon accepts and the other headers.
+const max_bridge_request_body_bytes = max_fetch_request_bytes - (max_url_bytes + max_api_key_bytes + 64 * 1024);
+
+/// `provider` with its requests fit to the fetch bridge, so they leave out
+/// their oldest images instead of failing.
+fn bridgeBound(provider: stream_provider.Provider) stream_provider.Provider {
+    var bound = provider;
+    bound.max_request_bytes = max_bridge_request_body_bytes;
+    return bound;
+}
+
+fn configuredBridgeBundle(raw: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
+    var bundle = host_chat_completions.bundle(raw, definition);
+    if (bundle.agent_stream) |stream| bundle.agent_stream = bridgeBound(stream);
+    return bundle;
+}
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image or one kernel checkpoint, the larger.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
@@ -58,7 +75,7 @@ const ReadyNotifier = struct {
 
     fn init() error{ReadyChannelFailed}!ReadyNotifier {
         var pair: [2]c_int = undefined;
-        const flags = if (@import("builtin").os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
+        const flags = if (@import("builtin").target.os.tag == .macos) 0 else std.c.SOCK.CLOEXEC | std.c.SOCK.NONBLOCK;
         const socket_type = std.c.SOCK.STREAM | flags;
         if (std.c.socketpair(std.c.AF.UNIX, socket_type, 0, &pair) != 0) return error.ReadyChannelFailed;
         errdefer for (pair) |fd| {
@@ -140,7 +157,7 @@ const InputQueue = struct {
         const queued = self.bytes.items.len - self.offset;
         if (data.len > max_input_bytes or queued > max_input_bytes - data.len) return error.InputQueueFull;
         if (self.offset > 0) {
-            std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+            @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
             self.bytes.items.len = queued;
             self.offset = 0;
         }
@@ -174,11 +191,18 @@ const OutputQueue = struct {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        errdefer |err| if (err != error.OutputClosed) {
-            self.failed = true;
-            self.wake.broadcast(io);
-            self.ready.?.notify();
+        self.writeLocked(alloc, data) catch |err| {
+            if (err != error.OutputClosed) {
+                self.failed = true;
+                self.wake.broadcast(io);
+                self.ready.?.notify();
+            }
+            return err;
         };
+    }
+
+    fn writeLocked(self: *OutputQueue, alloc: Allocator, data: []const u8) !void {
+        const io = io_mod.getIo();
         if (data.len > max_output_message_bytes) return error.OutputMessageTooLarge;
         var written: usize = 0;
         while (written < data.len) {
@@ -190,7 +214,7 @@ const OutputQueue = struct {
                 continue;
             }
             if (self.offset > 0) {
-                std.mem.copyForwards(u8, self.bytes.items[0..queued], self.bytes.items[self.offset..]);
+                @memmove(self.bytes.items[0..queued], self.bytes.items[self.offset..]);
                 self.bytes.items.len = queued;
                 self.offset = 0;
             }
@@ -354,6 +378,10 @@ const AttachmentTable = struct {
     }
 };
 
+/// How long `FetchBridge.next` waits for response bytes before it returns
+/// `-3`, the cooperative pulse of the core's stream reader.
+const next_idle_wait: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+
 const FetchBridge = struct {
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
@@ -483,7 +511,14 @@ const FetchBridge = struct {
             self.response.clearRetainingCapacity();
             self.response_offset = 0;
             if (terminal_kind != null) return 0;
-            self.wake.waitUncancelable(io, &self.mutex);
+            // While no bytes arrive, the reader checks its request's cancel
+            // flag and deadline every pulse, so a cancel the core sets, such
+            // as a libfx steer cutting a reply short, does not wait for the
+            // model's next byte.
+            self.wake.waitTimeout(io, &self.mutex, next_idle_wait) catch |err| switch (err) {
+                error.Timeout => return -3,
+                error.Canceled => return -2,
+            };
         }
     }
 
@@ -542,7 +577,7 @@ const FetchBridge = struct {
         const queued = self.response.items.len - self.response_offset;
         if (data.len > max_fetch_response_bytes or queued > max_fetch_response_bytes - data.len) return .backpressure;
         if (self.response_offset > 0) {
-            std.mem.copyForwards(u8, self.response.items[0..queued], self.response.items[self.response_offset..]);
+            @memmove(self.response.items[0..queued], self.response.items[self.response_offset..]);
             self.response.items.len = queued;
             self.response_offset = 0;
         }
@@ -670,23 +705,23 @@ const Runtime = struct {
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .agent_stream = bridgeBound(host_stream_provider.provider(&self.stream_context)),
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         providers.codex = .{
             .presentation = provider_catalog.find(.codex),
             .auth_strategy = .chatgpt,
-            .agent_stream = host_openai_codex.provider(&self.codex_context),
+            .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),
             .model_catalog = host_openai_codex.modelCatalogProvider(&self.codex_context),
         };
         providers.grok = .{
             .presentation = provider_catalog.find(.grok),
             .auth_strategy = .grok,
-            .agent_stream = host_xai_grok.provider(&self.grok_context),
+            .agent_stream = bridgeBound(host_xai_grok.provider(&self.grok_context)),
             .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
         };
         if (self.custom_context) |*context| {
-            providers.configured_fn = host_chat_completions.bundle;
+            providers.configured_fn = configuredBridgeBundle;
             providers.configured_context = context;
         }
         acp_server.runWithTransport(
@@ -823,8 +858,9 @@ fn ensureThreadedIo() void {
     if (threaded_io_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
         threaded_io = std.Io.Threaded.init(std.heap.c_allocator, .{});
         io_mod.setIo(threaded_io.?.io());
-        const raw_environ: io_mod.RawEnviron = @ptrCast(std.c.environ);
-        io_mod.setRawEnviron(raw_environ);
+        // Node.js owns the environment and may grow it at any time, which
+        // can move and free libc's array, so it is read at each use.
+        io_mod.setLibcEnviron();
         threaded_io_state.store(2, .release);
         return;
     }
@@ -1011,7 +1047,7 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         else => return error.InvalidGatewayUrl,
     }) orelse (alloc.dupe(u8, builtin_gateway.default_chat_url) catch return error.OutOfMemory);
     errdefer alloc.free(gateway_chat_url);
-    streamable_http.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
+    http_config.validateEndpoint(gateway_chat_url) catch return error.InvalidGatewayUrl;
     if (!std.mem.eql(u8, gateway_chat_url, builtin_gateway.default_chat_url)) {
         const uri = std.Uri.parse(gateway_chat_url) catch return error.InvalidGatewayUrl;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InvalidGatewayUrl;
@@ -1189,7 +1225,7 @@ fn fetch_handle_arg(env: c.napi_env, value: c.napi_value) ?fetch_state.Handle {
 
 fn fetch_operation_value(env: c.napi_env, result: FetchOperationResult) c.napi_value {
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_uint32(env, @intFromEnum(result), &value), "could not create fetch operation result")) return null;
+    if (!statusOk(env, c.napi_create_uint32(env, @backingInt(result), &value), "could not create fetch operation result")) return null;
     return value;
 }
 
@@ -1355,7 +1391,7 @@ fn coreFetchDisposition(env: c.napi_env, info: c.napi_callback_info) callconv(.c
     defer unlockRuntime(runtime_handle);
     const disposition = runtime.fetch.disposition(fetch_handle);
     var value: c.napi_value = undefined;
-    if (!statusOk(env, c.napi_create_int32(env, @intFromEnum(disposition), &value), "could not query fetch disposition")) return null;
+    if (!statusOk(env, c.napi_create_int32(env, @backingInt(disposition), &value), "could not query fetch disposition")) return null;
     return value;
 }
 

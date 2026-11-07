@@ -20,6 +20,11 @@
 // the input to the log, takes the lease, and runs every turn the log holds
 // until none is left, or its time runs out: then it asks the queue to
 // deliver the same message again, and the next worker continues the turn.
+//
+// TLA+ models: `tests/tla/sdk/DurableSession.tla` (the log, leases and
+// takeovers), `tests/tla/sdk/AgentRouting.tla` (agent names and routing),
+// and `tests/tla/sdk/DurableSteer.tla` (where each message a user sends is
+// placed). The drivers in `tests/tla/drivers/` run this code along them.
 
 // A write the session's chain refused because another worker continued it.
 // Harnesses recognize it by its code.
@@ -49,10 +54,18 @@ const defaultReserveMs = 30_000;
 // after its last renewal, not at its function's deadline.
 const defaultLeaseMs = 15_000;
 
+// Whether the queue shows whether a worker lives, delivering the message its
+// delivery held again once it is gone, so the worker holds its lease to the
+// deadline that bounds it and renews nothing.
+const queueHeld = (backend, deadline) => !backend.livenessKnown && backend.queueLeases === true && deadline !== null;
+// Whether a worker holds its lease to its deadline and renews nothing: when
+// whether it lives is known, or the queue shows it.
+const heldToDeadline = (backend, deadline) => backend.livenessKnown || queueHeld(backend, deadline);
+
 // When a lease taken or renewed now runs out: never past the deadline its
-// worker stops at, and with liveness known, only at that deadline.
+// worker stops at, and when it is held to that deadline, only there.
 function leaseEnd(backend, deadline) {
-  if (backend.livenessKnown) return deadline;
+  if (heldToDeadline(backend, deadline)) return deadline;
   const renewed = Date.now() + backend.leaseMs;
   return deadline === null ? renewed : Math.min(renewed, deadline);
 }
@@ -62,14 +75,129 @@ const recentIdsKept = 256;
 // The longest a message waits for a live holder before it is delivered again.
 const maxBackstopSeconds = 300;
 
+// Base64 of a Uint8Array: the runtime's own encoder where it has one, and
+// otherwise four letters from the table for each three bytes. Both are fast
+// enough for a large image; btoa over String.fromCharCode is not.
+const base64Letters = encoder.encode("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
 const toBase64 = (bytes) => {
-  let text = "";
-  for (let index = 0; index < bytes.length; index += 0x8000) {
-    text += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  const letters = new Uint8Array(Math.ceil(bytes.length / 3) * 4);
+  const whole = bytes.length - (bytes.length % 3);
+  let at = 0;
+  for (let index = 0; index < whole; index += 3) {
+    const group = (bytes[index] << 16) | (bytes[index + 1] << 8) | bytes[index + 2];
+    letters[at] = base64Letters[group >> 18];
+    letters[at + 1] = base64Letters[(group >> 12) & 63];
+    letters[at + 2] = base64Letters[(group >> 6) & 63];
+    letters[at + 3] = base64Letters[group & 63];
+    at += 4;
   }
-  return btoa(text);
+  if (whole < bytes.length) {
+    // One or two bytes left: two or three letters, then "=" padding.
+    const two = whole + 1 < bytes.length;
+    const group = (bytes[whole] << 16) | (two ? bytes[whole + 1] << 8 : 0);
+    letters[at] = base64Letters[group >> 18];
+    letters[at + 1] = base64Letters[(group >> 12) & 63];
+    letters[at + 2] = two ? base64Letters[(group >> 6) & 63] : 61;
+    letters[at + 3] = 61;
+  }
+  return decoder.decode(letters);
 };
-const fromBase64 = (text) => Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+const fromBase64 = (text) => {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(text);
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+};
+
+// A session keeps each prompt image once, in its image store, named by the
+// lowercase hex SHA-256 of its bytes, as libfx's core names it; the log only
+// names it.
+async function imageName(bytes) {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  let name = "";
+  for (const byte of digest) name += byte.toString(16).padStart(2, "0");
+  return name;
+}
+const base64url = (text) => toBase64(encoder.encode(text)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+// The key a harness's store gives its image store under, `{ put, get }`:
+// `persistenceImages` in fx-sdk.js, which engines read it from.
+const persistenceImages = Symbol.for("libfx.persistenceImages");
+
+// A view of the bytes in an ArrayBuffer or typed array, or null.
+const byteView = (value) => (value instanceof ArrayBuffer ? new Uint8Array(value)
+  : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : null);
+
+// A prompt's input as the queue and the log hold it: JSON, so image data is
+// base64 text. With `named`, the session stores each image in its image
+// store and the log names it (`storePromptImages`); `images` says whether any
+// image has data to store.
+//
+// Each image block is copied once and only the copy is read, since an
+// accessor can return something else the next time it is read, and the log
+// must hold what was checked. The blocks are walked by index for the same
+// reason: an Array subclass can make map() return anything. Pure.
+function promptInputForLog(input, { named = false } = {}) {
+  let images = false;
+  const blocks = [];
+  for (let index = 0; index < input.length; index += 1) {
+    const block = input[index];
+    if (block?.type !== "image") {
+      blocks.push(block);
+      continue;
+    }
+    const image = { ...block };
+    if (image.data !== undefined && typeof image.data !== "string") throw new TypeError("a durable prompt carries image data as a base64 string");
+    if (typeof image.data === "string") images = named;
+    blocks.push(image);
+  }
+  return { input: blocks, images };
+}
+
+// Stores each image a prompt's input holds in the session's image store,
+// before the input that names it is stored, and returns the input naming
+// them: `{ type: "image", mimeType, sourceRef?, data: { sha256 } }`. An older
+// libfx refuses data it can't read, so a worker that predates names fails
+// the turn rather than run it without its images. A store that fails rejects
+// with its own error. With `images` null it only names them, for a prompt the
+// log already holds.
+async function storePromptImages(images, input) {
+  const blocks = [];
+  for (const block of input) {
+    if (block?.type !== "image" || block.data === undefined) {
+      blocks.push(block);
+      continue;
+    }
+    const { data, ...rest } = block;
+    const bytes = fromBase64(data);
+    const sha256 = await imageName(bytes);
+    if (images) await images.put(sha256, bytes);
+    blocks.push({ ...rest, data: { sha256 } });
+  }
+  return blocks;
+}
+
+// A prompt's input with each named image read back from the session's image
+// store, as base64, which is how a harness has always received image data.
+// `missing` names the first image the store does not hold.
+async function resolvePromptImages(images, input) {
+  if (!Array.isArray(input)) return { input };
+  const blocks = [];
+  for (const block of input) {
+    const name = block?.type === "image" ? block.data?.sha256 : undefined;
+    if (typeof name !== "string") {
+      blocks.push(block);
+      continue;
+    }
+    const bytes = await images.get(name);
+    if (!bytes) return { missing: name };
+    // Bytes that aren't the ones named are not the image its caller sent.
+    if (await imageName(bytes) !== name) return { missing: name, corrupt: true };
+    blocks.push({ ...block, data: toBase64(bytes) });
+  }
+  return { input: blocks };
+}
 
 /**
  * The durability that keeps sessions in this process only. Agents given the
@@ -156,12 +284,27 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   let epoch = base?.lease?.epoch ?? 0;
   const consumed = new Set(base?.recent ?? []);
   const recent = [...(base?.recent ?? [])];
+  // Which of those were steers, so a prompt and a steer cannot share an id
+  // after a checkpoint drops their inputs. A checkpoint from before this was
+  // kept does not say.
+  const baseSteers = new Set(base?.recentSteers ?? []);
+  const kindsKnown = base === null || Array.isArray(base?.recentSteers);
+  // Inputs the open turn accepted and has not placed, which a withdrawal can
+  // hand back. They count as taken until then.
+  const held = new Set(base?.held ?? []);
+  for (const id of held) consumed.add(id);
   const seenInputs = new Set();
   const inputs = [];
   const records = [];
   // A checkpoint taken where a turn yielded leaves that turn open.
-  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
+  // `from` is where the input that opened it was stored: steers stored after
+  // it join it, before it started too.
+  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, from: Number(base.openTurn.from ?? base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
+  // The agent the session belongs to: the one its first stored input, or the
+  // checkpoint it was restored from, names. A session stored before agents
+  // had names belongs to the default agent.
+  let agent = typeof base?.agent === "string" ? base.agent : base && base.through != null ? defaultAgentName : null;
   let yielded = base?.yielded === true;
   // The context each prompt's or steer's caller gave, and the settings its
   // session object set, which its turn runs with: an untaken steer becomes a
@@ -183,6 +326,13 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     consumed.add(id);
     recent.push(id);
   };
+  // A steer its turn accepted and ended without placing: the model never saw
+  // it, so it waits for a turn again.
+  const handBack = (id) => {
+    if (!consumed.delete(id)) return;
+    const index = recent.lastIndexOf(id);
+    if (index >= 0) recent.splice(index, 1);
+  };
   for (const input of base?.pending ?? []) {
     if (seenInputs.has(input.key)) continue;
     seenInputs.add(input.key);
@@ -193,6 +343,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     if (position > maxCursor) maxCursor = position;
     switch (entry?.k) {
       case "input":
+        agent ??= typeof entry.agent === "string" ? entry.agent : defaultAgentName;
         if (seenInputs.has(entry.key)) break;
         seenInputs.add(entry.key);
         inputs.push({ ...entry, cursor: position });
@@ -207,7 +358,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if ((entry.a ?? null) !== head) break;
         head = cursor;
         if (entry.k === "lease") {
-          lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, cursor };
+          lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, delivery: entry.delivery, cursor };
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
         } else if (entry.k === "release") {
           if (lease?.holder === entry.holder) lease = null;
@@ -217,17 +368,26 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
           records.push({ cursor, data: entry.data });
           for (const mark of entry.marks ?? []) {
             if (typeof mark.start === "string") {
-              openTurn = { id: mark.start, at: position, context: contexts.get(mark.start) ?? null, settings: settingsOf.get(mark.start) ?? null };
+              const opener = inputs.find((input) => input.messageId === mark.start);
+              openTurn = { id: mark.start, at: position, from: opener?.cursor ?? position, context: contexts.get(mark.start) ?? null, settings: settingsOf.get(mark.start) ?? null };
               consume(mark.start);
               yielded = false;
             } else if (mark.end === true) {
               if (openTurn) lastTurnId = openTurn.id;
               openTurn = null;
               yielded = false;
+              // A turn's unplaced inputs end with it, handed back first.
+              held.clear();
             } else if (mark.yield === true) {
               yielded = true;
             } else if (typeof mark.accepted === "string") {
               consume(mark.accepted);
+              held.add(mark.accepted);
+            } else if (typeof mark.placed === "string") {
+              held.delete(mark.placed);
+            } else if (typeof mark.withdrawn === "string") {
+              held.delete(mark.withdrawn);
+              handBack(mark.withdrawn);
             }
           }
         }
@@ -257,17 +417,36 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   for (const input of inputs) {
     if (input.type === "cancel" && typeof input.target === "string") cancelTargets.add(input.target);
   }
+  // An open turn whose harness could not start has ended for its viewers.
+  const openFailed = openTurn !== null && failed.has(openTurn.id);
+  // The turns waiting to run, each with the steers that join it when it
+  // starts, whether it waited or ran when they came, as the fx CLI's steering
+  // does: a text steer stored after the open turn's opener joins that turn,
+  // and otherwise the turn waiting before it. A steer that cannot join a
+  // turn waits as its own, and the turn it came after ends at its next safe
+  // point, at once if it has not started; the steers after it join its turn.
+  // A steer with no turn to join starts one.
   const pending = [];
   const steers = [];
+  const openOwner = openTurn !== null && !openFailed ? { joiners: steers, ends: false } : null;
   let cancelOpen = false;
+  let owner = null;
   for (const input of inputs) {
+    if (openOwner !== null && owner === null && input.cursor > openTurn.from) owner = openOwner;
     if (consumed.has(input.messageId)) continue;
     const forOpenTurn = openTurn !== null && input.cursor > openTurn.at;
-    if (input.type === "prompt") pending.push(cancelTargets.has(input.messageId) ? { ...input, cancelled: true } : input);
-    else if (input.type === "steer") {
-      // A steer its turn never took becomes the next turn.
-      if (forOpenTurn) steers.push(input);
-      else pending.push({ ...input, type: "prompt" });
+    if (input.type === "prompt") {
+      const entry = { ...input, ...(cancelTargets.has(input.messageId) ? { cancelled: true } : {}), joiners: [], ends: false };
+      pending.push(entry);
+      // While a turn runs, steers still join it: a prompt is the next turn.
+      if (owner === null || owner !== openOwner) owner = entry;
+    } else if (input.type === "steer") {
+      if (owner !== null && joinable(input.input)) owner.joiners.push(input);
+      else {
+        if (owner !== null) owner.ends = true;
+        owner = { ...input, type: "prompt", joiners: [], ends: false };
+        pending.push(owner);
+      }
     } else if (input.type === "cancel") {
       if (typeof input.target === "string") {
         if (openTurn?.id === input.target) cancelOpen = true;
@@ -279,23 +458,36 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // landed ended. Its id is kept like a turn's, so a late delivery of the
   // same message is not taken as a new cancel.
   for (const input of inputs) {
-    if (input.type !== "cancel" || consumed.has(input.messageId)) continue;
+    if (consumed.has(input.messageId)) continue;
+    // A resume only asks that its session be woken: it is spent once
+    // stored, and its id is kept so its deliveries are known.
+    if (input.type === "resume") {
+      consume(input.messageId);
+      continue;
+    }
+    if (input.type !== "cancel") continue;
     const live = typeof input.target === "string"
       ? !consumed.has(input.target) || openTurn?.id === input.target
       : openTurn !== null && input.cursor > openTurn.at;
     if (!live) consume(input.messageId);
   }
-  // An open turn whose harness could not start has ended for its viewers; a
-  // cancel it is due waits for the next prompt's engine. One whose engine
-  // stopped each time it continued it is cancelled; one whose engine stopped
-  // even then can never go on, and the session runs no more turns.
-  const openFailed = openTurn !== null && failed.has(openTurn.id);
+  // A cancel the failed open turn is due waits for the next prompt's
+  // engine. One whose engine stopped each time it continued it is
+  // cancelled; one whose engine stopped even then can never go on, and the
+  // session runs no more turns.
   const openStops = openTurn === null ? 0 : stops.get(openTurn.id) ?? 0;
   const halted = openStops >= maxHarnessStops + maxCancelStops;
   const stuck = openStops >= maxHarnessStops && !halted;
+  const kinds = new Map(inputs.map((input) => [input.messageId, input.type]));
+  const kindOf = (id) => kinds.get(id) ?? (baseSteers.has(id) ? "steer" : kindsKnown ? "prompt" : null);
   return {
-    // Inputs no turn has taken, as written: what a checkpoint keeps.
+    // Inputs no turn has taken, as written: what a checkpoint keeps, with
+    // the ones the open turn holds unplaced, which a withdrawal hands back.
     unconsumed: inputs.filter((input) => !consumed.has(input.messageId)),
+    held: inputs.filter((input) => held.has(input.messageId)),
+    heldIds: [...held],
+    // A steer that cannot join the open turn waits for it to end.
+    endOpen: openOwner?.ends === true,
     head,
     // The lease others must respect, and the chain's latest whether or not
     // it still stands: a worker checks the latter is its own.
@@ -309,11 +501,15 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     cutoffs: openTurn === null ? 0 : cut.cutoffs,
     openFailed,
     lastTurnId,
+    agent,
     yielded,
     pending,
     steers,
     cancelOpen,
     recent: recent.slice(-recentIdsKept),
+    recentSteers: recent.slice(-recentIdsKept).filter((id) => kindOf(id) === "steer"),
+    // What kind of input a taken id named, or null when no record says.
+    consumedKind: (id) => (consumed.has(id) ? kindOf(id) : null),
     consumed,
     failed,
     stops,
@@ -334,20 +530,43 @@ function leaseStands(lease, now, alive) {
   return true;
 }
 
+// Which queue message a delivery carries, by the queue's own id, and which
+// delivery of it this is, when the World reports both.
+function deliveryOf(meta) {
+  const messageId = meta?.messageId;
+  const attempt = meta?.attempt;
+  return typeof messageId === "string" && messageId.length > 0 && Number.isSafeInteger(attempt) && attempt > 0
+    ? { messageId, attempt }
+    : null;
+}
+
+// Whether `delivery`, in another process, carries the message whose delivery
+// took `lease`. A queue hands a message on only once the delivery holding it
+// let it go unacknowledged: its handler failed, or its process died or lost
+// the message. On Vercel, a function whose process exits mid-delivery runs
+// the same delivery again, attempt and all, in a new process. Either way the
+// holder no longer runs the session, or runs it replaced without knowing,
+// and its next write is fenced.
+function redelivers(delivery, lease) {
+  const held = lease?.delivery;
+  return Boolean(delivery && held && held.messageId === delivery.messageId &&
+    Number.isSafeInteger(held.attempt) && delivery.attempt >= held.attempt);
+}
+
 // ---------------------------------------------------------------------------
 // Backends. Each gives sessions a log, a stream, and a queue.
 
 function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
   const sessions = new Map();
   const holders = liveHolders;
-  // Each agent sharing the backend takes deliveries in turn.
-  const handlers = [];
-  let turnOf = 0;
+  // The agents sharing the backend, by name: an agent's copies take the
+  // deliveries for its name in turn.
+  const handlers = new Map();
   const timers = new Set();
   const sessionFor = (id) => {
     let session = sessions.get(id);
     if (!session) {
-      session = { entries: [], head: null, ui: [], uiWaiters: new Set(), watchers: new Set() };
+      session = { entries: [], head: null, ui: [], uiWaiters: new Set(), watchers: new Set(), images: new Map() };
       sessions.set(id, session);
     }
     return session;
@@ -356,20 +575,28 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
     const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms);
     timers.add(timer);
   };
-  const deliver = (message, attempt) => {
-    if (handlers.length === 0) return later(() => deliver(message, attempt), 10);
-    const handler = handlers[turnOf++ % handlers.length];
+  // A message keeps its id across its deliveries, as a queue's does.
+  const deliver = (message, attempt, messageId = newId("qmsg")) => {
+    if (handlers.size === 0) return later(() => deliver(message, attempt, messageId), 10);
+    const group = handlers.get(agentOf(message));
+    // No agent of that name here yet: tried again, as a failed delivery is.
+    if (!group) {
+      if (attempt < 48) later(() => deliver(message, attempt + 1, messageId), 1000);
+      return;
+    }
+    const handler = group.members[group.turn++ % group.members.length];
     Promise.resolve()
-      .then(() => handler(message, { attempt }))
+      .then(() => handler(message, { messageId, attempt }))
       .then((result) => {
-        if (Number.isFinite(result?.timeoutSeconds)) later(() => deliver(message, attempt + 1), result.timeoutSeconds * 1000);
+        if (Number.isFinite(result?.timeoutSeconds)) later(() => deliver(message, attempt + 1, messageId), result.timeoutSeconds * 1000);
       }, () => {
-        if (attempt < 48) later(() => deliver(message, attempt + 1), 1000);
+        if (attempt < 48) later(() => deliver(message, attempt + 1, messageId), 1000);
       });
   };
   return {
     name: "memory",
     livenessKnown: true,
+    runInRequest: false,
     queueDurable: false,
     pollMs: null,
     reserveMs: reserveMs ?? defaultReserveMs,
@@ -418,6 +645,14 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
           session.watchers.add(fn);
           return () => session.watchers.delete(fn);
         },
+        images: {
+          async put(name, bytes) {
+            if (!session.images.has(name)) session.images.set(name, bytes.slice());
+          },
+          async get(name) {
+            return session.images.get(name)?.slice();
+          },
+        },
         ui: {
           async write(lines) {
             session.ui.push(...lines);
@@ -448,12 +683,11 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
         later(() => deliver(message, 1), delaySeconds * 1000);
       },
     },
-    listen(fn) {
-      handlers.push(fn);
+    listen(fn, name = defaultAgentName) {
+      const group = joinGroup(handlers, name, fn);
       return () => {
-        const index = handlers.indexOf(fn);
-        if (index >= 0) handlers.splice(index, 1);
-        if (handlers.length > 0) return;
+        leaveGroup(handlers, name, group, fn);
+        if (handlers.size > 0) return;
         // Nobody is left to deliver to.
         for (const timer of timers) clearTimeout(timer);
         timers.clear();
@@ -469,7 +703,16 @@ const logStep = "fx.log";
 // the run's id, then `_user_` and the base64url of the namespace
 // "libfx-ui".
 const uiStreamOf = (runId) => `${runId.replace(/^wrun_/, "strm_")}_user_bGliZngtdWk`;
+// The stream that holds an image, named as the UI stream is, with the
+// namespace "libfx-image-" and the image's name.
+const imageStreamOf = (runId, name) => `${runId.replace(/^wrun_/, "strm_")}_user_${base64url(`libfx-image-${name}`)}`;
 const queuePrefix = "__libfx_wkf_workflow_";
+// The name of an agent created without one, and of whatever a message or a
+// session from before names belonged to.
+const defaultAgentName = "default";
+const agentNameRule = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// The agent a queued message is for.
+const agentOf = (message) => (typeof message?.agent === "string" ? message.agent : defaultAgentName);
 const queueName = `${queuePrefix}session`;
 const eventIdPattern = /^[a-z]+_(\d{26})$/;
 
@@ -480,6 +723,22 @@ function ulid(now = Date.now()) {
   let random = "";
   for (const byte of crypto.getRandomValues(new Uint8Array(16))) random += alphabet[byte % 32];
   return time + random;
+}
+
+// The entries that continue a session's chain of claims and records.
+function chainedKind(k) {
+  return k === "lease" || k === "release" || k === "record";
+}
+
+// A run's in-band count right after its creation, as `@workflow/world`
+// defines it (`IN_BAND_SEQ_AT_RUN_CREATION`): `run_created` counts as the
+// first in-band write.
+const inBandAtRunCreation = 1;
+
+// The World's in-band writer fence refused a write: another writer moved the
+// run's in-band count past the one the write expected.
+function inBandSuperseded(error) {
+  return error?.name === "InBandSupersededError" || error?.code === "in-band-superseded" || error?.status === 412;
 }
 
 function slotOf(event) {
@@ -503,6 +762,49 @@ const streamReadRetries = 5;
 const missingStreamPollMs = 50;
 const missingStreamFastMs = 2000;
 
+// Runs whose log views one backend keeps, and the characters of JSON they
+// may hold together, least recently read dropped first.
+const maxLogViews = 32;
+const maxLogViewChars = 32 * 1024 * 1024;
+
+// Whether a newest-first listing showed every slot from the lowest it
+// listed to the newest. Pure.
+const gapless = (read) => read.listed === 0 || read.newest - read.lowest + 1 === read.listed;
+
+// The slot of a run's first event: a World numbers each run's events densely
+// from 1.
+const firstEventSlot = 1;
+
+// Whether a newest-first listing reached slot `floor`, or the checkpoint it
+// stopped at, which stands for every slot through its `through`. Pure.
+const listedDownTo = (read, floor) => read.lowest === floor || (read.through !== null && read.lowest <= read.through);
+
+/**
+ * A run's log view extended by the entries listed after it, as a full read
+ * returns the log: every entry after the newest checkpoint's `through`.
+ * Null when that checkpoint covers less than the view starts after, which
+ * only a full read can answer. `head` is the chain's head as a full read
+ * notes it: the newest chained entry, or the checkpoint's `through`. Pure.
+ */
+export function extendLogView(view, newer) {
+  const combined = [...view.entries, ...newer];
+  let through = view.through;
+  for (let index = combined.length - 1; index >= 0; index -= 1) {
+    const entry = combined[index].entry;
+    if (entry?.k === "checkpoint") {
+      through = entry.through === null || entry.through === undefined ? 0 : Number(entry.through);
+      break;
+    }
+  }
+  if (through < view.through) return null;
+  const entries = combined.filter((item) => Number(item.cursor) > through);
+  let head = null;
+  for (let index = entries.length - 1; index >= 0 && head === null; index -= 1) {
+    if (chainedKind(entries[index].entry?.k)) head = entries[index].cursor;
+  }
+  return { entries, through, head: head ?? (through ? String(through) : "null") };
+}
+
 // Events a session-log read lists per page: the first page, then the rest.
 const firstPageEvents = 10;
 const laterPageEvents = 100;
@@ -512,9 +814,135 @@ const laterPageEvents = 100;
 // deliveries in turn, as servers sharing a queue do.
 const listenersOf = new WeakMap();
 
+// Adds `member` to the group for `name` in `groups`, a Map of name to
+// `{ members, turn }`, and returns the group; leaveGroup takes it out again.
+function joinGroup(groups, name, member) {
+  let group = groups.get(name);
+  if (!group) groups.set(name, group = { members: [], turn: 0 });
+  group.members.push(member);
+  return group;
+}
+
+function leaveGroup(groups, name, group, member) {
+  const index = group.members.indexOf(member);
+  if (index >= 0) group.members.splice(index, 1);
+  if (group.members.length === 0 && groups.get(name) === group) groups.delete(name);
+}
+
+function noAgentNamed(name) {
+  return Object.assign(new Error(`no libfx agent named ${JSON.stringify(name)} runs in this process; the queue delivers this again`), { code: "FX_NO_AGENT", agent: name });
+}
+
+// The durable agents in this process, by name, from when each is created
+// until it closes, each as `{ open, durability }`: a route delivers each
+// message to the agent it names, and a function that only receives queue
+// messages has its agents here before any of them is used. Shared by every
+// copy of this module in the process.
+const agentsByName = (globalThis[Symbol.for("libfx.durableAgents")] ??= new Map());
+
+// The backend a member opens, or null when it cannot open, as an agent
+// libfx refused to create cannot.
+const openMember = (member) => member.open().catch(() => null);
+
+// The World backend of an agent named `name` in this process whose
+// durability `matches`, the agent's copies in turn, or null.
+async function agentNamed(name, matches) {
+  const group = agentsByName.get(name);
+  if (!group) return null;
+  const { members } = group;
+  const first = group.turn++;
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[(first + index) % members.length];
+    if (!matches(await member.durability())) continue;
+    const created = await openMember(member);
+    if (typeof created?.deliverHere === "function") return created;
+  }
+  return null;
+}
+
+// Agents share sessions through the durability they were created with, so
+// one on another durability can hold other sessions.
+const agentSharing = (name, durability) => agentNamed(name, (other) => other === durability);
+
+// The store a World keeps its sessions in, as its queue messages name it:
+// its `store`, which is its name unless the app named the store.
+const worldStore = (durability) => durability?.store ?? durability?.name;
+
+// The store a durability keeps its sessions in, as libfx tells stores apart:
+// a memory() is its own, and a World's is its worldStore(). Two agents of one
+// name on one store are one agent.
+const storeOf = (durability) => (typeof durability?.create === "function" ? durability : `world:${worldStore(durability)}`);
+
+// A route takes its deployment's deliveries for every World in the process,
+// so a delivery goes to the agent its message names on the store it names,
+// and never to one of that name on another store
+// (`tests/tla/sdk/TenantIsolation.tla` RunsInSenderStore).
+const agentOnStore = (name, store) => agentNamed(name, (other) => typeof other.world === "function" && other.create === undefined && worldStore(other) === store);
+
+/**
+ * The request handler a deployment mounts for queue deliveries, for every
+ * durable agent in the process: each delivery goes to the agent its message
+ * names, on the store it names. One route and one queue trigger serve any
+ * number of agents.
+ */
+export function wakeHandler() {
+  return async (request) => {
+    for (const group of agentsByName.values()) {
+      for (const member of group.members) {
+        const created = await openMember(member);
+        if (created?.viaRoute === true) return created.queueHandler(request);
+      }
+    }
+    return new Response("no libfx agent in this process takes queue deliveries from a route", { status: 503 });
+  };
+}
+
+const nameInUse = (name) => Object.assign(
+  new Error(`an agent named ${JSON.stringify(name)} with another configuration already runs on this store in this process; give each configuration its own name, or each store its own \`store\``),
+  { code: "FX_AGENT_NAME_IN_USE", agent: name },
+);
+
+// Whether two agents' options are one configuration: the same values, and
+// the same functions and objects other than plain ones. `onEvent` only
+// watches the agent, so it is left out.
+function definitionOf(options) {
+  const { onEvent: _onEvent, ...definition } = options;
+  return definition;
+}
+function sameDefinition(a, b, depth = 0) {
+  if (Object.is(a, b)) return true;
+  if (depth > 32 || a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    if (!ArrayBuffer.isView(a) || !ArrayBuffer.isView(b) || a.byteLength !== b.byteLength) return false;
+    const left = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const right = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    for (let index = 0; index < left.length; index += 1) if (left[index] !== right[index]) return false;
+    return true;
+  }
+  const plain = (value) => Array.isArray(value) || Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null;
+  if (!plain(a) || !plain(b) || Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => Object.hasOwn(b, key) && sameDefinition(a[key], b[key], depth + 1));
+}
+
+// Refuses `member` when another agent of `name` on its store has another
+// configuration: deliveries for a name on a store go to any of its agents,
+// so they must be one agent (`tests/tla/sdk/TenantIsolation.tla`
+// RunsOnSenderAgent). Agents created without a durability share their
+// factory's default, so they are on one store even before one of them has
+// learned which store that is.
+const sameStore = (a, b) => a.store === b.store || (a.defaults !== null && a.defaults === b.defaults);
+function claimName(name, member) {
+  for (const other of agentsByName.get(name)?.members ?? []) {
+    if (other !== member && sameStore(other, member) && !sameDefinition(other.definition, member.definition)) throw nameInUse(name);
+  }
+}
+
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
-function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
+function createWorldBackend(world, durability) {
+  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -523,6 +951,35 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
   // poll.
   const watchers = new Map();
   const changed = (runId) => { for (const watcher of watchers.get(runId) ?? []) watcher(); };
+  // Each run's log as this process last read it: the entries read() returned,
+  // the newest slot seen, and the checkpoint's `through` they start after.
+  // The log only appends, so a later read lists only slots after `known`.
+  // The entries are kept as the JSON the World stores, so every read hands
+  // out its own copy, as reading the World does, and the views' size is
+  // bounded in characters as well as in runs.
+  const logViews = new Map();
+  let logViewChars = 0;
+  const forgetView = (runId) => {
+    const view = logViews.get(runId);
+    if (!view) return;
+    logViewChars -= view.text.length;
+    logViews.delete(runId);
+  };
+  const rememberView = (runId, entries, known, through) => {
+    forgetView(runId);
+    const text = JSON.stringify(entries);
+    if (text.length > maxLogViewChars) return;
+    logViews.set(runId, { text, known, through });
+    logViewChars += text.length;
+    for (const oldest of logViews.keys()) {
+      if (logViews.size <= maxLogViews && logViewChars <= maxLogViewChars) break;
+      forgetView(oldest);
+    }
+  };
+  const viewOf = (runId) => {
+    const view = logViews.get(runId);
+    return view && { entries: JSON.parse(view.text), known: view.known, through: view.through };
+  };
   let handler = null;
   const route = typeof world.registerHandler !== "function";
   const listEvents = (runId, cursor, limit) => world.events.list({
@@ -530,7 +987,8 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     pagination: { sortOrder: "desc", limit, ...(cursor ? { cursor } : {}) },
     resolveData: "all",
   });
-  const deliverTo = async (handle, message) => {
+  // `meta` says which queue message this is and which delivery of it.
+  const deliverTo = async (handle, message, meta) => {
     const input = message?.input;
     if (!input || typeof input !== "object") return undefined;
     if (!handle) {
@@ -539,14 +997,32 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       if (owned) return undefined;
       throw new Error("no libfx agent is listening; the queue delivers this again");
     }
-    const result = await handle(input);
+    const result = await handle(input, meta);
+    // The queue delivers this same message again, which takes back a lease
+    // its worker could not let go.
+    if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
     return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
   };
-  // The route a deployment mounts delivers to this agent.
-  const queueHandler = world.createQueueHandler(queuePrefix, (message) => deliverTo(handler, message));
+  const store = worldStore(durability);
+  // The route a deployment mounts delivers to the agent in this process the
+  // message names, on the store it names, whichever agent's route it is. A
+  // message from before stores were named is for this World's store.
+  const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+    const named = agentOf(message?.input);
+    const agent = await agentOnStore(named, typeof message?.input?.store === "string" ? message.input.store : store);
+    if (!agent) throw noAgentNamed(named);
+    return agent.deliverHere(message, meta);
+  });
   const backend = {
     name,
+    store,
     livenessKnown,
+    queueLeases,
+    // A prompt runs in the request that took it, held by its backstop's
+    // message, which the queue keeps until after the request's deadline.
+    runInRequest: queueLeases && runInRequest,
+    // Keeps the request alive for a turn it runs after its response.
+    waitUntil: waitUntil ?? null,
     queueDurable,
     pollMs: pollMs ?? 1000,
     reserveMs: reserveMs ?? defaultReserveMs,
@@ -557,9 +1033,14 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     validSessionId: (id) => typeof id === "string" && /^wrun_[0-9A-Za-z]{10,64}$/.test(id),
     deadline: () => null,
     holderInfo: holderInfo ?? (() => ({})),
-    alive(lease) {
+    // Whether a lease's holder still runs, as `delivery` can tell: a worker
+    // of this process runs while it holds it, and the message its delivery
+    // held, delivered to this process, means it no longer does.
+    alive(lease, delivery = null) {
+      if (liveHolders.has(lease.holder)) return true;
       const mine = holderInfo?.() ?? {};
-      if (mine.pid !== undefined && lease.pid === mine.pid && lease.host === mine.host) return liveHolders.has(lease.holder);
+      if (mine.pid !== undefined && lease.pid === mine.pid && lease.host === mine.host) return false;
+      if (redelivers(delivery, lease)) return false;
       return alive ? alive(lease) : null;
     },
     holding(holder, held) {
@@ -584,6 +1065,30 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     async session(runId) {
       // The newest slot this worker has seen.
       let known = 0;
+      // The images this worker knows the run's image store holds.
+      const storedImages = new Set();
+      // Where the World has the in-band writer fence, chained entries are
+      // written in-band, each expecting the World's count of in-band writes
+      // at the entry it continues, so the World refuses one that continues a
+      // superseded head and nothing of it lands. `inBandAt` maps a chained
+      // entry's cursor (`null` for an empty chain) to the count right after
+      // it: from the snapshot a read returns, or from the write itself. The
+      // check after a write stays, since a World may count per process.
+      const inBandAt = new Map();
+      let inBand = world.capabilities?.inBandFence === true;
+      const noteInBand = (cursor, count) => {
+        inBandAt.delete(cursor);
+        inBandAt.set(cursor, count);
+        if (inBandAt.size > 16) inBandAt.delete(inBandAt.keys().next().value);
+      };
+      // A snapshot is read before its listing, so it gives the count at the
+      // chain's head only when it covers the head's slot. It never replaces
+      // a count this worker's own write reported.
+      const noteSnapshot = (snapshot, cursor) => {
+        if (!inBand || cursor === undefined || inBandAt.has(cursor) || !Number.isSafeInteger(snapshot?.seqInBand)) return;
+        if (cursor !== "null" && !(Number(cursor) <= snapshot.seq)) return;
+        noteInBand(cursor, snapshot.seqInBand);
+      };
       const ensureRun = () => {
         if (created.has(runId)) return Promise.resolve();
         let pending = creating.get(runId);
@@ -616,6 +1121,22 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       const newestFirst = async (stopBelow, stopAtCheckpoint) => {
         const events = [];
         let through = null;
+        let snapshot;
+        // The newest chained entry read: the chain's head, unless the read
+        // stopped before reaching any.
+        let newestChained;
+        // The newest and lowest slots this read listed above `stopBelow`,
+        // entries or not, and how many. Unlike `known`, which this object's
+        // own writes also raise, these say only what the listing showed.
+        let newest = stopBelow;
+        let lowest = Infinity;
+        let listed = 0;
+        // Ends the read. `head` is where the chain's head is when the read
+        // found no chained entry, or undefined when the read does not show.
+        const done = (head) => {
+          noteSnapshot(snapshot, newestChained ?? head);
+          return { events, through, snapshot, newest, lowest, listed };
+        };
         // A session's newest checkpoint is usually among its last few
         // entries, so a read starts with a small page and fetches more only
         // while it has not reached where it stops; every page carries its
@@ -625,30 +1146,79 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
           try {
             page = await listEvents(runId, cursor, limit);
           } catch (error) {
-            if (missingRun(error)) return { events, through };
-            throw error;
+            if (!missingRun(error)) throw error;
+            // The run's creation starts its count.
+            if (stopBelow === 0) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
+            return { events, through, newest, lowest, listed, missing: true };
           }
+          snapshot ??= page.snapshot;
           for (const event of page.data) {
             const slot = slotOf(event);
             if (slot > known) known = slot;
-            if (slot <= stopBelow) return { events, through };
-            if (through !== null && slot <= through) return { events, through };
+            if (slot <= stopBelow) return done(undefined);
+            if (slot > newest) newest = slot;
+            if (slot < lowest) lowest = slot;
+            listed += 1;
+            // The checkpoint stands for the entries through its `through`,
+            // the last of them the chain's head.
+            if (through !== null && slot <= through) return done(through === 0 ? "null" : String(through));
             const entry = logEntryOf(event);
             if (!entry) continue;
             created.add(runId);
+            if (newestChained === undefined && chainedKind(entry.k)) newestChained = String(slot);
             events.push({ cursor: String(slot), entry });
             if (stopAtCheckpoint && through === null && entry.k === "checkpoint") {
               through = entry.through === null || entry.through === undefined ? 0 : Number(entry.through);
             }
           }
-          if (!page.hasMore) return { events, through };
+          if (!page.hasMore) return done(stopBelow > 0 ? undefined : through ? String(through) : "null");
           cursor = page.cursor;
         }
       };
+      // The newest slot the last read() returned every entry through, or
+      // null when that read could not show it had them all.
+      let covered = null;
+      const fullRead = async () => {
+        const read = await newestFirst(0, true);
+        const entries = read.events.reverse();
+        // A listing that skipped a slot may show a later write before an
+        // earlier one lands. The entries go back as they are, as every read
+        // returned them before, but no view keeps the gap for later reads.
+        // The listing must also reach the run's first event or the checkpoint
+        // it stopped at, so no slot below what it listed is missing.
+        if (!read.missing && listedDownTo(read, firstEventSlot) && gapless(read)) {
+          rememberView(runId, entries, read.newest, read.through ?? 0);
+          covered = read.newest;
+        } else {
+          forgetView(runId);
+          covered = null;
+        }
+        return entries;
+      };
       return {
+        newest: () => covered,
         async read() {
-          const { events } = await newestFirst(0, true);
-          return events.reverse();
+          const view = viewOf(runId);
+          if (!view) return fullRead();
+          if (view.known > known) known = view.known;
+          const since = await newestFirst(view.known, true);
+          if (since.missing) {
+            forgetView(runId);
+            covered = null;
+            return [];
+          }
+          // The newer listing must have skipped no slot and must reach the
+          // view or a checkpoint that stands for what lies between; and a
+          // checkpoint covering less than the view starts after is not one
+          // the view can stand for. Otherwise read the log whole.
+          const reaches = since.listed === 0 || listedDownTo(since, view.known + 1);
+          const next = reaches && gapless(since) ? extendLogView(view, since.events.reverse()) : null;
+          if (!next) return fullRead();
+          // The in-band count at the chain's head, as a full read notes it.
+          noteSnapshot(since.snapshot, next.head);
+          rememberView(runId, next.entries, since.newest, next.through);
+          covered = since.newest;
+          return next.entries;
         },
         async readSince(cursor) {
           const { events } = await newestFirst(Number(cursor), false);
@@ -656,17 +1226,55 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
         },
         async append(entry) {
           await ensureRun();
-          const chained = entry.k === "lease" || entry.k === "release" || entry.k === "record";
+          const chained = chainedKind(entry.k);
           // A chained entry asks the World to report every event since the
           // one it continues, so a competing continuation is seen.
           const after = chained ? (entry.a === null || entry.a === undefined ? 0 : Number(entry.a)) : known;
-          const result = await world.events.create(runId, {
+          const continues = entry.a === null || entry.a === undefined ? "null" : String(entry.a);
+          let expected = chained && inBand ? inBandAt.get(continues) : undefined;
+          const event = {
             eventType: "step_created",
             correlationId: `step_${ulid()}`,
             eventData: { stepName: logStep, input: encoder.encode(JSON.stringify(entry)) },
-          }, { eventCount: after });
+          };
+          let result;
+          for (let recounted = false; ;) {
+            try {
+              result = await world.events.create(runId, event, expected === undefined ? { eventCount: after } : { eventCount: after, inBand: true, expectedSeqInBand: expected });
+              break;
+            } catch (error) {
+              if (expected === undefined) throw error;
+              if (inBandSuperseded(error)) {
+                // The next read maps the head afresh.
+                inBandAt.delete(continues);
+                // A World counts a write after it publishes it, so a read
+                // between the two gave this head the count before its own
+                // write. When nothing else continued the head, the write goes
+                // again once at the count the World reports.
+                if (!recounted && Number.isSafeInteger(error?.seqInBand)) {
+                  const { events: since } = await newestFirst(after, false);
+                  const rivals = since.filter(({ entry: other }) => chainedKind(other.k) && (other.a ?? null) === (entry.a ?? null));
+                  // Our own earlier write of this entry landed first.
+                  const ours = rivals.find(({ entry: other }) => other.key !== undefined && other.key === entry.key && other.k === entry.k);
+                  if (ours) return ours.cursor;
+                  if (rivals.length === 0) {
+                    recounted = true;
+                    expected = error.seqInBand;
+                    continue;
+                  }
+                }
+                throw new FencedError(`another worker continued session ${runId}`);
+              }
+              // A World may refuse in-band writes on a run it stamped before
+              // it had the fence; the write goes out-of-band, as before.
+              if (!(error?.status >= 400 && error?.status < 500) || error?.status === 409) throw error;
+              inBand = false;
+              expected = undefined;
+            }
+          }
           const slot = slotOf(result.event);
           if (slot > known) known = slot;
+          if (expected !== undefined && result.allocated !== undefined) noteInBand(String(slot), expected + result.allocated);
           changed(runId);
           if (!chained || slot === after + 1) return String(slot);
           const reported = Array.isArray(result.events) ? result.events : (await newestFirst(after, false)).events.map((item) => ({ eventId: `evnt_${String(item.cursor).padStart(26, "0")}`, ...item }));
@@ -674,7 +1282,7 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
             const other = event.entry ?? logEntryOf(event);
             const otherSlot = event.entry ? Number(event.cursor) : slotOf(event);
             if (!other || otherSlot <= after || otherSlot >= slot) continue;
-            const otherChained = other.k === "lease" || other.k === "release" || other.k === "record";
+            const otherChained = chainedKind(other.k);
             if (!otherChained || (other.a ?? null) !== (entry.a ?? null)) continue;
             // Our own earlier write of this entry landed first.
             if (other.key !== undefined && other.key === entry.key && other.k === entry.k) return String(otherSlot);
@@ -687,6 +1295,44 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
           if (!set) watchers.set(runId, set = new Set());
           set.add(fn);
           return () => set.delete(fn);
+        },
+        // Each image is a stream of the run, named after it, so it is read by
+        // name wherever checkpoints fall. Two writers of one image each add
+        // its bytes once; a read takes the first chunk that matches the name.
+        images: {
+          async put(name, bytes) {
+            if (storedImages.has(name)) return;
+            // Refused here, before the prompt is stored, rather than by every
+            // worker that reads the image back.
+            if (typeof world.streams.getChunks !== "function") throw new TypeError("a World needs streams.getChunks() to keep a session's images");
+            await ensureRun();
+            const stream = imageStreamOf(runId, name);
+            let present = false;
+            try {
+              present = Number((await world.streams.getInfo(runId, stream))?.tailIndex ?? -1) >= 0;
+            } catch (error) {
+              if (!missingRun(error)) throw error;
+            }
+            if (!present) await world.streams.write(runId, stream, bytes);
+            storedImages.add(name);
+          },
+          async get(name) {
+            let page;
+            try {
+              page = await world.streams.getChunks(runId, imageStreamOf(runId, name), { limit: 8 });
+            } catch (error) {
+              if (missingRun(error)) return undefined;
+              throw error;
+            }
+            for (const chunk of page?.data ?? []) {
+              const bytes = byteView(chunk?.data);
+              if (bytes && bytes.byteLength > 0 && await imageName(bytes) === name) {
+                storedImages.add(name);
+                return bytes.slice();
+              }
+            }
+            return undefined;
+          },
         },
         ui: {
           async write(lines) {
@@ -744,33 +1390,49 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       };
     },
     queue: {
+      // Returns the queue's id for the message, when the World gives one.
       async send(message, { delaySeconds = 0, idempotencyKey } = {}) {
-        await world.queue(queueName, { runId: message.sessionId, requestId: message.messageId, input: message }, {
+        const sent = await world.queue(queueName, { runId: message.sessionId, requestId: message.messageId, input: message }, {
           ...(idempotencyKey ? { idempotencyKey } : {}),
           ...(delaySeconds > 0 ? { delaySeconds } : {}),
         });
+        return typeof sent?.messageId === "string" && sent.messageId.length > 0 ? { messageId: sent.messageId } : {};
       },
     },
     // The route a deployment mounts for queue deliveries, until the World
     // can deliver to an in-process handler itself.
     queueHandler,
-    listen(fn) {
+    durability,
+    // Whether the queue delivers to queueHandler, mounted by the deployment.
+    viaRoute: route,
+    // Delivers a routed message to this backend's agent.
+    deliverHere: (message, meta) => deliverTo(handler, message, meta),
+    listen(fn, name = defaultAgentName) {
       handler = fn;
       if (route) return () => { if (handler === fn) handler = null; };
+      // The agents on this World, by name: an agent's copies take the
+      // deliveries for its name in turn. A name none of them has goes to an
+      // agent of that name on the same durability elsewhere in the process,
+      // as each agent has a World of its own, and one the process has none
+      // of is left for the queue to deliver again.
       let listeners = listenersOf.get(world);
       if (!listeners) {
-        listeners = { handlers: [], turn: 0 };
+        listeners = new Map();
         listenersOf.set(world, listeners);
-        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, (message) => {
-          const { handlers } = listeners;
-          return deliverTo(handlers.length === 0 ? null : handlers[listeners.turn++ % handlers.length], message);
+        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, async (message, meta) => {
+          const named = agentOf(message?.input);
+          const group = listeners.get(named);
+          if (group) return deliverTo(group.members[group.turn++ % group.members.length], message, meta);
+          const agent = await agentSharing(named, durability);
+          if (agent) return agent.deliverHere(message, meta);
+          if (listeners.size === 0) return deliverTo(null, message, meta);
+          throw noAgentNamed(named);
         }));
       }
-      listeners.handlers.push(fn);
+      const group = joinGroup(listeners, name, fn);
       return () => {
         if (handler === fn) handler = null;
-        const index = listeners.handlers.indexOf(fn);
-        if (index >= 0) listeners.handlers.splice(index, 1);
+        leaveGroup(listeners, name, group, fn);
       };
     },
     // Closing is best effort: a runtime whose HTTP agent cannot close, as
@@ -824,23 +1486,74 @@ const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String
 // The harness contract: a fenced write rejects with this code.
 const isFenced = (error) => error?.code === "FX_FENCED";
 
-// What a queue message adds to its session's log: a restored agent's first
+// The kinds of message a session's queue carries.
+const messageTypes = new Set(["prompt", "steer", "cancel", "resume"]);
+
+// What the queue carries for a message: only which input of which session
+// it names, for which agent, on which store. A delivery can arrive at a
+// public route, so its body may come from anyone: a worker acts only on a
+// message its session's log already holds, and runs only what that log
+// says (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns).
+function queuedMessage(message, store) {
+  return {
+    type: message.type,
+    messageId: message.messageId,
+    sessionId: message.sessionId,
+    agent: typeof message.agent === "string" ? message.agent : defaultAgentName,
+    ...(typeof store === "string" ? { store } : {}),
+  };
+}
+
+// The message a delivery names, as queuedMessage() has it, or null for one
+// no sender could have queued on `backend`.
+function deliveredMessage(backend, delivered) {
+  if (!delivered || typeof delivered !== "object" || !messageTypes.has(delivered.type)) return null;
+  if (!validId(delivered.messageId) || !backend.validSessionId(delivered.sessionId)) return null;
+  if (delivered.agent !== undefined && typeof delivered.agent !== "string") return null;
+  return queuedMessage(delivered);
+}
+
+// Whether the session's log holds the input `message` names, or names it
+// among those a turn already took.
+const knownMessage = (state, message) => state.inputKeys.has(`${message.type}:${message.messageId}`) || state.consumed.has(message.messageId);
+
+// The most a durable input may hold: its content blocks with its caller's
+// context and its session object's settings, as JSON. The engine refuses a
+// prompt frame over 8 MiB (`maxPromptFrameBytes` in fx-sdk.js), so a larger
+// input could never run; it is refused before anything is stored.
+const maxInputBytes = 8 * 1024 * 1024;
+const jsonBytes = (value) => (value === undefined ? 0 : encoder.encode(JSON.stringify(value)).byteLength);
+// A JSON value as it stands now, so what libfx measures is what it stores,
+// however the caller changes its object later. Pure.
+const jsonSnapshot = (value) => {
+  const text = JSON.stringify(value);
+  return text === undefined ? undefined : JSON.parse(text);
+};
+const inputTooLarge = (bytes) => Object.assign(
+  new RangeError(`a durable input with its context and settings is ${bytes} bytes; the most is ${maxInputBytes}`),
+  { code: "FX_INPUT_TOO_LARGE", bytes, limit: maxInputBytes },
+);
+
+// What a message adds to its session's log: a restored agent's first
 // checkpoint and the message's input, a prompt with its caller's context and
-// its session object's settings.
-// Nothing the log already holds. Pure.
+// its session object's settings. Only the sender calls it, before it queues
+// the message, so what a turn runs and as whom comes from the app's own
+// call, never from a queue delivery. Nothing the log already holds. Pure.
 function messageEntries(state, message) {
   const entries = [];
+  const named = typeof message.agent === "string" ? { agent: message.agent } : {};
   if (message.seed && state.checkpoint === null && state.records.length === 0) {
-    entries.push({ k: "checkpoint", through: null, data: message.seed });
+    entries.push({ k: "checkpoint", through: null, data: message.seed, ...named });
   }
   const key = `${message.type}:${message.messageId}`;
-  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
-  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !known) {
+  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId) || idInUse(state, message);
+  if (messageTypes.has(message.type) && !known) {
     entries.push({
       k: "input",
       key,
       type: message.type,
       messageId: message.messageId,
+      ...named,
       ...(message.input === undefined ? {} : { input: message.input }),
       ...(typeof message.target === "string" ? { target: message.target } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.context !== undefined ? { context: message.context } : {}),
@@ -850,12 +1563,50 @@ function messageEntries(state, message) {
   return entries;
 }
 
-// Writes what a queue message adds to its session, in order, and returns how
-// many entries it wrote. The sender and the consumer can both call it.
+// Whether a steer's input can join a turn: text. One with images or
+// resources runs as its own turn, after the running one hands off to it.
+const joinable = (input) => typeof input === "string" || (Array.isArray(input) && input.every((block) => block?.type === "text"));
+
+// Whether `message` reuses the id of the session's other kind of input: one
+// id names one input, prompt or steer.
+function idInUse(state, message) {
+  const other = message.type === "prompt" ? "steer" : message.type === "steer" ? "prompt" : null;
+  if (other === null) return false;
+  return state.inputKeys.has(`${other}:${message.messageId}`) || state.consumedKind?.(message.messageId) === other;
+}
+
+const messageIdInUse = (message) => Object.assign(
+  new TypeError(`messageId ${JSON.stringify(message.messageId)} already names a ${message.type === "prompt" ? "steer" : "prompt"} in this session`),
+  { code: "FX_MESSAGE_ID_IN_USE" },
+);
+
+// Writes what a message adds to its session, in order, and returns each
+// entry it wrote with the slot it took. Only the sender calls it, before it
+// queues the message.
+// A message that reuses another input's id writes nothing and throws.
 async function recordMessage(log, state, message) {
+  if (idInUse(state, message)) throw messageIdInUse(message);
   const entries = messageEntries(state, message);
-  for (const entry of entries) await log.append(entry);
-  return entries.length;
+  const appended = [];
+  for (const entry of entries) appended.push({ cursor: await log.append(entry), entry });
+  return appended;
+}
+
+/**
+ * The log a sender read and then extended with its own entries, as the
+ * worker it starts in the same request may use it instead of reading the
+ * log again. Only when the sender's read showed every entry through slot
+ * `newestSeen`, and every entry the sender then wrote took the next slot:
+ * then nothing landed in between, so the view holds every input that comes
+ * before this message's. The sender's entries go on as the JSON the World
+ * stored, not as the objects it wrote. Null otherwise. Pure.
+ */
+export function handoffEntries(read, newestSeen, appended) {
+  if (!Number.isSafeInteger(newestSeen) || appended.length === 0) return null;
+  for (const [index, item] of appended.entries()) {
+    if (Number(item.cursor) !== newestSeen + index + 1) return null;
+  }
+  return [...read, ...appended.map(({ cursor, entry }) => ({ cursor, entry: JSON.parse(JSON.stringify(entry)) }))];
 }
 
 /**
@@ -907,6 +1658,14 @@ const durableInternals = Symbol.for("libfx.durableInternals");
 // process is delivered again, as a backstop for the running worker.
 const runningBackstopSeconds = 2;
 
+// When a delivery that starts now must stop: its function's deadline, or
+// `maxDurationMs` after now; null when nothing stops it.
+const deliveryDeadline = (backend) => backend.deadline() ?? (backend.maxDurationMs === null ? null : Date.now() + backend.maxDurationMs);
+
+// How long past the request's own deadline the queue keeps a prompt that
+// request runs itself, before it delivers it as a backstop.
+const inlineBackstopMarginSeconds = 5;
+
 class SessionWorker {
   constructor(agent, backend, sessionId) {
     this.agent = agent;
@@ -919,34 +1678,53 @@ class SessionWorker {
     this.holder = null;
   }
 
-  fold(entries) {
-    return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease) });
+  // The log folded as `delivery` judges whether a lease's holder lives.
+  fold(entries, delivery = null) {
+    return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease, delivery) });
   }
 
-  // One queue delivery. Its input reaches the log at once, even while this
-  // process runs the session, so a steer or cancel reaches the running turn.
-  // Then it runs the session when no live worker holds it. Returns
-  // `{ timeoutSeconds }` to have the same message delivered again later.
-  async consume(message) {
-    const log = await this.backend.session(this.sessionId);
+  // One queue delivery, `delivery` its message's id and attempt when the
+  // queue reports them. Its sender stored its input before queueing it, so a
+  // steer or cancel reaches the running turn even before this runs. A
+  // delivery the session's log does not hold is not from a sender and is
+  // dropped before anything is written, whether or not its session exists
+  // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). Then it runs the
+  // session when no live worker holds it. Returns `{ timeoutSeconds }` to
+  // have the same message delivered again later.
+  // `handoff` is the sender's own session object and the log it read and
+  // extended, when the request that took the prompt runs it (see
+  // handoffEntries); the worker starts from them instead of reading again.
+  async consume(message, delivery = null, handoff = null) {
+    const log = handoff?.log ?? await this.backend.session(this.sessionId);
+    let entries = handoff?.entries ?? await log.read();
+    let state = this.fold(entries, delivery);
+    if (!knownMessage(state, message)) {
+      this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "unknown message" });
+      return undefined;
+    }
     await this.backend.refreshDeadline?.();
     // When this delivery's function stops, if it does.
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
-    let entries = await log.read();
-    let state = this.fold(entries);
+    // A session runs only on the agent it belongs to, the one its first
+    // stored input names. A message that reached another agent, as one sent
+    // to another agent's session does, goes on to it.
+    const owner = state.agent ?? agentOf(message);
+    if (owner !== this.agent.name) {
+      await this.backend.queue.send(queuedMessage({ ...message, agent: owner }, this.backend.store), {
+        idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
+      });
+      this.agent.emit("session.forwarded", { sessionId: this.sessionId, agent: owner });
+      return undefined;
+    }
     for (let claims = 0; claims < 8; claims += 1) {
       // A session with no open turn starts its next prompt at once: the
-      // first model request goes out while the input and the lease are
-      // written, and nothing else is written until both land.
-      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items));
+      // first model request goes out while the lease is written, and
+      // nothing else is written until it lands.
+      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
       let outcome;
       if (early) {
-        outcome = await this.claim(log, state, deadline, early);
+        outcome = await this.claim(log, state, deadline, early, delivery);
       } else {
-        if (await recordMessage(log, state, message) > 0) {
-          entries = await log.read();
-          state = this.fold(entries);
-        }
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork) {
           if (message.type === "resume") await this.answerIdle(log, message);
@@ -958,12 +1736,15 @@ class SessionWorker {
           const left = state.lease.expiresAt ? Math.ceil((state.lease.expiresAt - Date.now()) / 1000) + 1 : 5;
           return { timeoutSeconds: Math.max(1, Math.min(maxBackstopSeconds, left)) };
         }
-        outcome = await this.claim(log, state, deadline, null);
+        outcome = await this.claim(log, state, deadline, null, delivery);
       }
       if (outcome === "yielded") return { timeoutSeconds: 0 };
       // A write that failed for any other reason: the same message runs the
-      // session again shortly.
-      if (outcome === "failed") return { timeoutSeconds: 1 };
+      // session again shortly. A lease held to the deadline, which a release
+      // that failed may leave standing, is let go only by a later delivery of
+      // this message, and a queue may send `{ timeoutSeconds }` on as a new
+      // one, so the queue is asked for this one again.
+      if (outcome === "failed") return queueHeld(this.backend, deadline) ? { redeliver: true } : { timeoutSeconds: 1 };
       if (outcome === "fenced") {
         // Another worker took the session over; this one stops.
         this.agent.emit("session.fenced", { sessionId: this.sessionId, epoch: state.lastEpoch + 1 });
@@ -972,7 +1753,7 @@ class SessionWorker {
       // The turns ran, or another worker's write came before this claim:
       // read the log again.
       entries = await log.read();
-      state = this.fold(entries);
+      state = this.fold(entries, delivery);
     }
     return { timeoutSeconds: 1 };
   }
@@ -980,9 +1761,10 @@ class SessionWorker {
   // Claims the session where `state` read it, with a lease that continues
   // the chain there, and runs it. With `early`, what `earlyStart` returned,
   // the message's input is written with the lease and the next turn starts
-  // before either lands. Returns what run() returns, or "refused" when
-  // another worker's write came before the claim.
-  async claim(log, state, deadline, early) {
+  // before either lands. The lease names `delivery`, so a later delivery of
+  // the same message can tell it lost its holder. Returns what run()
+  // returns, or "refused" when another worker's write came before the claim.
+  async claim(log, state, deadline, early, delivery = null) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
     this.running = true;
@@ -994,6 +1776,7 @@ class SessionWorker {
       epoch: state.lastEpoch + 1,
       expiresAt: leaseEnd(this.backend, deadline),
       ...this.backend.holderInfo(),
+      ...(delivery ? { delivery } : {}),
     };
     this.backend.holding(this.holder, true);
     try {
@@ -1115,6 +1898,8 @@ class SessionWorker {
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
     // When the lease runs out, as this worker last renewed it.
     let leaseExpiresAt = lease.expiresAt;
+    // An image read that threw while the engine opened.
+    let imageReadFailed = null;
     const store = {
       load: async () => ({
         ...(state.checkpoint?.data ? { checkpoint: { through: state.checkpoint.through ?? "0", data: fromBase64(state.checkpoint.data) } } : {}),
@@ -1123,27 +1908,46 @@ class SessionWorker {
         head: head ?? state.head,
       }),
       append: ({ idempotencyKey, data, marks }) => chained({ k: "record", key: idempotencyKey, data: toBase64(data), marks }).then((cursor) => ({ cursor })),
+      // The engine stores each prompt image before it sends it; a prompt
+      // from the log names images already here.
+      [persistenceImages]: {
+        put: (name, bytes) => log.images.put(name, bytes),
+        get: async (name) => {
+          try {
+            return await log.images.get(name);
+          } catch (error) {
+            // The store failed to answer, which says nothing of the image.
+            imageReadFailed = error;
+            throw error;
+          }
+        },
+      },
       saveCheckpoint: async ({ through, data }) => {
         // What a fold that starts at this checkpoint would otherwise miss:
-        // inputs before it that no turn took, the ids it ran, the turn a
-        // yield left open, and the lease.
+        // inputs before it that no turn took or that the open turn holds
+        // unplaced, the ids it ran, the turn a yield left open, and the lease.
         const now = this.fold(await log.read());
+        // In log order, so a fold from here orders turns as one from the start.
+        const kept = [...now.unconsumed, ...now.held].filter((input) => input.cursor <= Number(through)).sort((a, b) => a.cursor - b.cursor);
         await log.append({
           k: "checkpoint",
           through,
           data: toBase64(data),
-          pending: now.unconsumed.filter((input) => input.cursor <= Number(through)),
+          pending: kept,
+          ...(now.heldIds.length > 0 ? { held: now.heldIds } : {}),
           recent: now.recent,
+          recentSteers: now.recentSteers,
           lastTurnId: now.lastTurnId,
+          ...(now.agent === null ? {} : { agent: now.agent }),
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
-          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host },
+          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
         });
       },
     };
     // The turn running now, which a deadline or a lost lease cancels.
     let turnNow = null;
     let renew = null;
-    if (!this.backend.livenessKnown) {
+    if (!heldToDeadline(this.backend, deadline)) {
       // A lease nothing else shows alive is renewed while its worker runs,
       // and never after its release, which would take the session back. A
       // renewal fenced out by another worker's write stops the turn at once,
@@ -1151,7 +1955,7 @@ class SessionWorker {
       renew = setInterval(() => {
         if (released || failed || this.stopping) return;
         leaseExpiresAt = leaseEnd(this.backend, deadline);
-        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo() })
+        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo(), ...(lease.delivery ? { delivery: lease.delivery } : {}) })
           .catch((error) => { if (isFenced(error)) turnNow?.cancel({ reason: "handoff" }); });
       }, Math.max(1, Math.floor(this.backend.leaseMs / 3)));
     }
@@ -1207,6 +2011,10 @@ class SessionWorker {
         harnessRun = runOf(state.openTurn ?? state.pending[0]);
         harness = await agent.openHarness(this.sessionId, store, harnessRun, ready);
       } catch (error) {
+        // The image store failed to answer while the engine read the
+        // session's images: as when the log can't be read, the delivery
+        // fails and its message runs again; nothing failed the turn.
+        if (imageReadFailed) throw imageReadFailed;
         // A harness that cannot start fails the turn waiting on it, once:
         // the open turn, or after it failed, the next prompt.
         const waiting = state.openTurn && !state.openFailed ? state.openTurn.id : state.pending[0]?.messageId;
@@ -1284,8 +2092,21 @@ class SessionWorker {
             harness = await agent.openHarness(this.sessionId, store, wanted, ready);
             harnessRun = wanted;
           }
+          // A prompt names the images it stored; the engine gets their bytes.
+          const withImages = await resolvePromptImages(log.images, next.input);
+          if (withImages.missing) {
+            // A history without the image is not the one its caller sent.
+            await log.append({ k: "ended", messageId });
+            const message = withImages.corrupt
+              ? `the session's image store holds other bytes under image ${withImages.missing}`
+              : `the session's image store does not hold image ${withImages.missing}`;
+            ui.push({ type: "turn_end", messageId, stopReason: "error", usage: {}, error: { name: "Error", message } });
+            await ui.settle();
+            state = this.fold(await log.read());
+            continue;
+          }
           try {
-            turn = harness.prompt(next.input ?? "", { turnId: messageId, yieldAt });
+            turn = harness.prompt(withImages.input ?? "", { turnId: messageId, yieldAt });
           } catch (error) {
             await log.append({ k: "stopped", messageId });
             return unusable(error);
@@ -1296,7 +2117,9 @@ class SessionWorker {
         turnNow = turn;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
-        const outcome = await this.drive(log, harness, turn, messageId, state, ui);
+        // A new turn takes the steers sent while it waited to start.
+        const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
+        const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
         if (outcome === "yielded") {
@@ -1349,10 +2172,19 @@ class SessionWorker {
         }
         if (state.lastLease?.holder !== this.holder && !failed) return "fenced";
       }
-      await harness.close();
-      harness = null;
-      if (failed) return broken();
+      if (failed) {
+        await harness.close();
+        harness = null;
+        return broken();
+      }
+      // The last turn's records and end have landed, so the worker lets go
+      // before its engine shuts down: a prompt that lands meanwhile starts at
+      // once, here or in another process, instead of waiting for the
+      // shutdown. The engine stores nothing more; the agent waits for it on
+      // close.
       await release();
+      agent.track(harness.close().catch(() => {}));
+      harness = null;
       return failed ? broken() : "done";
     } finally {
       if (hardStop) clearTimeout(hardStop);
@@ -1378,11 +2210,31 @@ class SessionWorker {
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
   // turn that ended, whose end the caller writes.
   async drive(log, harness, turn, messageId, state, ui) {
-    const applied = new Set();
+    // The inputs `state` was folded from are placed already: the fold gave
+    // each a turn, joined it to one, or spent it. The poll applies only the
+    // inputs stored after them. After an early start, that includes this
+    // message's own input, landing past `since`.
+    const applied = new Set(state.inputKeys);
     let since = String(state.maxCursor);
     let polling = false;
     let again = false;
     let stopped = false;
+    // A text steer joins the turn. Any other ends it at its next safe point
+    // and, never taken, runs as the next turn, as the fx CLI hands off; the
+    // steers after that one join its turn.
+    let ending = false;
+    const endTurn = () => {
+      if (ending) return;
+      ending = true;
+      void Promise.resolve().then(() => turn.endForSteer?.()).catch(() => {});
+    };
+    const steerTurn = (steer) => {
+      // One id names one input, so a steer with this turn's id is its own
+      // opener or one that reused the id, which the log never runs.
+      if (steer.messageId === messageId) return;
+      if (!joinable(steer.input)) endTurn();
+      else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
+    };
     const apply = async () => {
       if (stopped) return;
       if (polling) { again = true; return; }
@@ -1395,7 +2247,7 @@ class SessionWorker {
             if (Number(cursor) > Number(since)) since = cursor;
             if (entry?.k !== "input" || applied.has(entry.key)) continue;
             applied.add(entry.key);
-            if (entry.type === "steer" && typeof entry.input === "string") void turn.steer(entry.input, entry.messageId).catch(() => {});
+            if (entry.type === "steer") steerTurn(entry);
             else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
           }
         } while (again && !stopped);
@@ -1405,8 +2257,9 @@ class SessionWorker {
     };
     for (const steer of state.steers) {
       applied.add(steer.key);
-      if (typeof steer.input === "string") void turn.steer(steer.input, steer.messageId).catch(() => {});
+      steerTurn(steer);
     }
+    if (state.endOpen) endTurn();
     // An open turn whose engine kept stopping is cancelled the way a user
     // would, so the prompts behind it can run.
     if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) turn.cancel();
@@ -1456,8 +2309,7 @@ const internalEvent = new Set(["turn_start", "turn_resume", "turn_yield", "turn_
 // replaced worker's lines carry its older lease epoch, so once its successor
 // has written, they stay hidden. The same stored stream always shows the
 // same lines, from any server and after any refresh.
-function uiRanker() {
-  let high = 0;
+function uiRanker(high = 0) {
   return (event) => {
     if (!Number.isSafeInteger(event?.epoch)) return true;
     if (event.epoch < high) return false;
@@ -1543,8 +2395,10 @@ async function turnEndIn(log, messageId, count) {
 const retryEndWaitMs = 30_000;
 
 // One turn as its viewer sees it: the session stream from `from` on, its
-// events only, until its end. `start` queues the turn and returns the
-// stream; a resume learns its turn from the first one the stream shows.
+// events only, until its end. `start` queues the turn at once and returns
+// the stream; a resume learns its turn from the first one the stream shows.
+// The stream is read only once something reads the view, its events,
+// `readable` or `result`, so a prompt nobody follows holds no read open.
 function turnView({ messageId, resumeRequest = null, start }) {
   // A retried turn reports the outcome of the turn its id already ran.
   let repeated = false;
@@ -1566,9 +2420,17 @@ function turnView({ messageId, resumeRequest = null, start }) {
     } else settle.resolve(repeated ? { ...value, repeated: true } : value);
     wake();
   };
-  void (async () => {
+  const started = start();
+  void started.catch(() => {});
+  let following = false;
+  const follow = () => {
+    if (following) return;
+    following = true;
+    void read();
+  };
+  const read = async () => {
     try {
-      const { log, from, settled, attaching, endWithinMs, unsure } = await start();
+      const { log, from, settled, attaching, endWithinMs, unsure } = await started;
       // A turn whose end this view finds after its own start may be the
       // message's first run, so only an end found before it is a repeat.
       repeated = settled?.repeated === true || (endWithinMs !== undefined && !unsure);
@@ -1629,7 +2491,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
     } catch (error) {
       finish(null, error);
     }
-  })();
+  };
   async function* iterate(raw) {
     for (let index = 0; ; index += 1) {
       while (index >= events.length) {
@@ -1649,11 +2511,18 @@ function turnView({ messageId, resumeRequest = null, start }) {
   }
   return {
     get messageId() { return id; },
-    result,
+    get result() {
+      follow();
+      return result;
+    },
     // Dropping a turn cancels nothing; `session.cancel()` does.
-    [Symbol.asyncIterator]() { return iterate(false); },
+    [Symbol.asyncIterator]() {
+      follow();
+      return iterate(false);
+    },
     // Each line is one event with the cursor `stream()` resumes after it.
     get readable() {
+      follow();
       const iterator = iterate(true);
       return new ReadableStream({
         async pull(controller) {
@@ -1687,7 +2556,9 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   `saveCheckpoint({ through, data })` stores what the records through
  *   `through` add up to. Each record's `marks` tell the core where turns
  *   start (`{ start: turnId }`), yield (`{ yield: true }`) and end
- *   (`{ end: true }`), and which inputs a turn took (`{ accepted: id }`).
+ *   (`{ end: true }`), which inputs a turn took (`{ accepted: id }`), when
+ *   its model request first carries one (`{ placed: id }`), and which it
+ *   ended without placing (`{ withdrawn: id }`), which wait for a turn again.
  *   A write another worker's write fenced out rejects with a `FX_FENCED`
  *   code. `ready`, when given, resolves true once the worker's claim on the
  *   session lands and false when it failed: the core may start a turn
@@ -1698,6 +2569,9 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   sets over the agent's options for the turns it starts, as JSON the core
  *   stores with each prompt and passes to `open()`, or undefined for none.
  *   It throws a TypeError for options it refuses.
+ * - `checkPrompt(input)` (optional): throws a TypeError or RangeError for
+ *   a prompt input the harness would refuse. A session's `prompt()` calls it
+ *   before it stores anything, so a prompt it refuses is never stored.
  *
  * A harness session has `prompt(input, { turnId, yieldAt })` and
  * `resume({ yieldAt, rerun })`, each returning a turn, where `rerun: false`
@@ -1709,10 +2583,14 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * an async iterable of the events its viewers see, with `result` resolving
  * `{ stopReason, usage? }`, `steer(text, id)`, and `cancel(options)`, where
  * `{ reason: "handoff" }` stops it at once and stores nothing more, so the
- * next worker continues it. It stops before a model request once `yieldAt`
- * has passed, with the stop reason `yielded`.
+ * next worker continues it. A turn may have `endForSteer()`, which ends it
+ * at its next safe point, at once while its model streams a reply, for a
+ * steer that cannot join it; without it, such a steer waits for the turn to
+ * end. Either way the steer runs as the next turn. A turn stops before a
+ * model request once `yieldAt` has passed, with the stop reason `yielded`.
  *
- * An input the harness refuses is a turn that ends with an error.
+ * An input the harness refuses only once a turn runs it is a turn that ends
+ * with an error.
  * `prompt()` and `resume()` throw only when the harness cannot run a turn,
  * and a turn whose harness stopped under it rejects with a
  * `FX_HARNESS_STOPPED` code; either way the same message runs the session
@@ -1720,17 +2598,22 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * once, or ends with an error when it never started; when its harness stops
  * twice more, even to cancel it, the session runs no more turns.
  *
- * `defaultDurability()` picks the durability when the caller names none,
- * `name` is the factory's name in errors, and `label` the agent's.
+ * `defaultDurability()` picks the durability when the caller names none, and
+ * `defaultShared` says it hands every such agent the same one, as Node's
+ * does, so that agents created without a durability share a store. `name` is
+ * the factory's name in errors, and `label` the agent's.
  */
-export function createDurableAgentFactory({ harness, defaultDurability, name = "createAgent", label = "agent" }) {
+export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, name = "createAgent", label = "agent" }) {
   return function createDurableAgent(options = {}) {
     if (!options || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError(`${name}() options must be an object`);
     }
-    const { durability, ...harnessOptions } = options;
+    const { durability, name: agentName = defaultAgentName, ...harnessOptions } = options;
     if (durability !== undefined && !isDurability(durability)) {
       throw new TypeError("durability must come from memory(), local(), vercel() or world()");
+    }
+    if (typeof agentName !== "string" || !agentNameRule.test(agentName)) {
+      throw new TypeError(`${name}() name must be 1 to 64 letters, digits, ".", "_" or "-", starting with a letter or digit`);
     }
     const plugged = harness(harnessOptions);
     const seed = plugged.seed === undefined ? undefined : toBase64(plugged.seed);
@@ -1738,7 +2621,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
     };
     const agent = {
+      name: agentName,
       emit,
+      // Work that outlives the delivery that started it, which close() waits
+      // for: an engine that shuts down after its worker let go.
+      track(work) {
+        active.add(work);
+        void work.finally(() => active.delete(work));
+      },
       openHarness: (sessionId, store, run, ready) => plugged.open({
         sessionId,
         store,
@@ -1749,6 +2639,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       }),
     };
     let backendPromise = null;
+    let durabilityPromise = null;
     let chosenDurability = null;
     let unlisten = null;
     let closed = false;
@@ -1757,42 +2648,96 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     const backend = () => {
       if (closed) return Promise.reject(new Error(`${label} is closed`));
       backendPromise ??= (async () => {
-        const chosen = durability ?? await defaultDurability();
+        const chosen = await durabilityOf();
+        // An agent created without a durability learns its store only now.
+        if (member.store !== storeOf(chosen)) {
+          member.store = storeOf(chosen);
+          try {
+            claimName(agentName, member);
+          } catch (error) {
+            leaveGroup(agentsByName, agentName, registered, member);
+            throw error;
+          }
+        }
         chosenDurability = chosen;
         const created = await createBackend(chosen);
         await created.start?.();
-        unlisten = created.listen((message) => {
-          let worker = workers.get(message.sessionId);
-          if (!worker) {
-            worker = new SessionWorker(agent, created, message.sessionId);
-            workers.set(message.sessionId, worker);
+        unlisten = created.listen((delivered, meta) => {
+          // Only which input a delivery names is read from it: the rest of
+          // its body, which a forged delivery would choose, is ignored.
+          const message = deliveredMessage(created, delivered);
+          if (!message) {
+            emit("session.refused", { reason: "malformed message" });
+            return undefined;
           }
-          worker.deliveries += 1;
-          const work = worker.consume(message);
-          active.add(work);
-          void work.catch((error) => {
-            // Its queue delivers the message again; the host hears why.
-            emit("session.error", { sessionId: message.sessionId, error: errorSummary(error) });
-          }).finally(() => {
-            active.delete(work);
-            worker.deliveries -= 1;
-            // A worker lives while a delivery runs it.
-            if (worker.deliveries === 0 && !worker.running && workers.get(message.sessionId) === worker) workers.delete(message.sessionId);
-          });
-          return work;
-        });
+          return receive(created, message, deliveryOf(meta));
+        }, agentName);
         return created;
       })();
       return backendPromise;
     };
+    // The durability the agent's sessions live in, chosen once.
+    const durabilityOf = () => (durabilityPromise ??= durability ? Promise.resolve(durability) : defaultDurability());
+    // In the process's agents from now, so a route that receives a message
+    // for this agent finds it before anything uses it. One created without a
+    // durability claims the default's store until it knows which that is:
+    // the store every such agent shares where the factory hands them all one
+    // durability, and a store of its own where each gets its own.
+    const unresolved = defaultShared ? defaultDurability : Symbol("default store");
+    const member = { open: backend, durability: durabilityOf, definition: definitionOf(harnessOptions), store: durability ? storeOf(durability) : unresolved, defaults: durability ? null : unresolved };
+    claimName(agentName, member);
+    const registered = joinGroup(agentsByName, agentName, member);
+    // One delivery of `message` to the session's worker here: from the
+    // queue, with `delivery` naming the queue's message and attempt, or with
+    // `inRequest` from the request that took the prompt.
+    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
+      let worker = workers.get(message.sessionId);
+      if (!worker) {
+        worker = new SessionWorker(agent, created, message.sessionId);
+        workers.set(message.sessionId, worker);
+      }
+      worker.deliveries += 1;
+      let work = worker.consume(message, delivery, handoff);
+      if (inRequest) {
+        // No queue delivered this message, so none delivers it again: a turn
+        // that must go on later continues in a fresh message. One whose
+        // write failed is left to the backstop, which takes its lease over.
+        work = work.then(async (result) => {
+          if (Number.isFinite(result?.timeoutSeconds)) {
+            await created.queue.send(message, {
+              idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:${newId("again")}`,
+              ...(result.timeoutSeconds > 0 ? { delaySeconds: result.timeoutSeconds } : {}),
+            });
+          }
+          return result;
+        });
+      }
+      active.add(work);
+      void work.catch((error) => {
+        // Its queue delivers the message again; the host hears why.
+        emit("session.error", { sessionId: message.sessionId, error: errorSummary(error) });
+      }).finally(() => {
+        active.delete(work);
+        worker.deliveries -= 1;
+        // A worker lives while a delivery runs it.
+        if (worker.deliveries === 0 && !worker.running && workers.get(message.sessionId) === worker) workers.delete(message.sessionId);
+      });
+      return work;
+    };
 
     const openSession = (requestedId, sessionOptions = {}) => {
       if (requestedId !== undefined && !validId(requestedId)) throw new TypeError(`session id must be ${idRule}`);
-      const context = sessionOptions?.context;
-      if (context !== undefined) {
-        try { JSON.stringify(context); } catch { throw new TypeError("session context must be JSON"); }
-      }
-      const settings = plugged.settings?.(sessionOptions ?? {});
+      let context;
+      try { context = jsonSnapshot(sessionOptions?.context); } catch { throw new TypeError("session context must be JSON"); }
+      const settings = jsonSnapshot(plugged.settings?.(sessionOptions ?? {}));
+      // What every input this session object sends carries besides itself.
+      const carried = jsonBytes(context) + jsonBytes(settings);
+      // Refuses an input too large to store before anything is stored
+      // (`tests/tla/sdk/TenantIsolation.tla` StoredWithinLimit).
+      const admit = (input) => {
+        const bytes = jsonBytes(input) + carried;
+        if (bytes > maxInputBytes) throw inputTooLarge(bytes);
+      };
       let id = requestedId ?? null;
       let seeded = seed === undefined || requestedId !== undefined;
       const resolved = backend().then((created) => {
@@ -1801,24 +2746,62 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         return { created, id };
       });
       void resolved.catch(() => {});
-      const send = async (message) => {
+      // With `inRequest`, a prompt runs here, in the request that took it,
+      // where the durability allows (see `runInRequest`).
+      const send = async (message, { inRequest = false } = {}) => {
         const { created, id: sessionId } = await resolved;
         const extra = {
           ...(seeded ? {} : { seed }),
           ...(context === undefined ? {} : { context }),
           ...(settings === undefined ? {} : { settings }),
         };
-        const full = { ...message, ...extra, sessionId };
-        // A queue that ends with the process could lose the message, so its
-        // input reaches the log before the caller hears it was accepted.
-        if (!created.queueDurable) {
-          const log = await created.session(sessionId);
-          await recordMessage(log, foldSessionLog(await log.read()), full);
+        const full = { ...message, ...extra, agent: agentName, sessionId };
+        // The input and its caller's context reach the log here, on the
+        // app's own call, before the caller hears it was accepted. The queue
+        // carries only which input to run, so a delivery cannot choose what
+        // a turn runs or as whom (`tests/tla/sdk/TenantIsolation.tla`
+        // OnlySentRuns), and a queue that ends with the process loses no
+        // input.
+        const log = await created.session(sessionId);
+        const read = await log.read();
+        const newestSeen = log.newest?.();
+        const appended = await recordMessage(log, foldSessionLog(read), full);
+        const queued = queuedMessage(full, created.store);
+        const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
+        if (inRequest && created.runInRequest) {
+          await created.refreshDeadline?.();
+          const deadline = deliveryDeadline(created);
+          if (deadline !== null) {
+            // This request runs the turn, and the queue keeps the message as
+            // a backstop it delivers only after the request's deadline, by
+            // when the request has stopped. The lease names the backstop, so
+            // if the request died, the backstop takes the session over and
+            // continues the turn.
+            const delaySeconds = Math.ceil(Math.max(0, deadline - Date.now()) / 1000) + inlineBackstopMarginSeconds;
+            const { messageId: backstop } = await created.queue.send(queued, { idempotencyKey, delaySeconds }) ?? {};
+            seeded = true;
+            const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
+            // receive() reports a failure to the host; the backstop retries it.
+            const entries = handoffEntries(read, newestSeen, appended);
+            const handoff = entries ? { log, entries } : null;
+            const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
+            created.waitUntil?.(work);
+            return;
+          }
         }
-        await created.queue.send(full, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}` });
+        await created.queue.send(queued, { idempotencyKey });
         seeded = true;
       };
-      const startTurn = (type, messageId, input, retried = false, aborted = false) => {
+      // Settles once the latest prompt from this session object with images
+      // to store is stored or has failed; null while none has. Each later
+      // prompt waits for it, so they are stored in the order made.
+      let storing = null;
+      // `ready`, when given, resolves the input once it can be stored; only a
+      // prompt that is stored calls it.
+      // `aborted()` says whether the prompt's signal has aborted. One that
+      // aborted before the prompt's send began never stores it; `progress.sent`
+      // is set as the send begins, after which an abort cancels the prompt.
+      const startTurn = (type, messageId, input, retried = false, aborted = () => false, ready = null, progress = null) => {
         let accept;
         const accepted = new Promise((resolve, reject) => { accept = { resolve, reject }; });
         void accepted.catch(() => {});
@@ -1827,20 +2810,27 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           resumeRequest: type === "resume" ? messageId : null,
           start: async () => {
             try {
+              const read = input === undefined || ready === null || aborted() ? input : await ready();
+              const message = { type, messageId, ...(input === undefined ? {} : { input: read }) };
+              const queue = () => {
+                if (progress) progress.sent = true;
+                return send(message, { inRequest: type === "prompt" });
+              };
               const { created, id: sessionId } = await resolved;
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
-              if (retried && !aborted) {
-                // The viewer's start is read before the message is queued, so
-                // every line this message's own turn writes comes after it,
-                // and an end for this id before it can only be from a turn
-                // this id already ran. The log, for that answer, is read
-                // alongside the one queue send.
-                from = await log.ui.length();
+              // The viewer's start is read before the message is queued, so
+              // every line this message's own turn writes comes after it, and
+              // an end for this id before it can only be from a turn this id
+              // already ran.
+              if (retried) from = await log.ui.length();
+              if (retried && !aborted()) {
+                // The log, for that answer, is read alongside the one queue
+                // send.
                 const [state] = await Promise.all([
                   log.read().then(foldSessionLog),
-                  send({ type, messageId, ...(input === undefined ? {} : { input }) }).then(() => accept.resolve({ messageId, sessionId })),
+                  queue().then(() => accept.resolve({ messageId, sessionId })),
                 ]);
                 // One the log does not know yet is this send's own. When the
                 // log says it ran and nothing shows how, either this send's
@@ -1853,9 +2843,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               }
               if (retried) {
                 // A turn this id already ran answers from the log, without
-                // queueing it again. The viewer's start is read first, so a
+                // queueing it again. The viewer's start was read first, so a
                 // turn that ends after it has its end in view.
-                from = await log.ui.length();
                 const outcome = await retryOutcome(log, foldSessionLog(await log.read()), messageId, from, { sent: false });
                 if (outcome.follow) attaching = true;
                 else if (!outcome.fresh) {
@@ -1864,15 +2853,17 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                   return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
                 }
               }
-              if (aborted && !attaching) {
-                // A new prompt whose signal had aborted is never stored.
-                accept.resolve({ messageId, sessionId });
-                return { settled: { messageId, stopReason: "cancelled", usage: {} } };
-              }
               // The viewer starts where the stream is now, before the
               // message can produce anything.
               from ??= await log.ui.length();
-              await send({ type, messageId, ...(input === undefined ? {} : { input }) });
+              if (aborted()) {
+                // A prompt whose signal aborted before its send began is never
+                // stored; a retry of one the log holds only follows its turn.
+                accept.resolve({ messageId, sessionId });
+                if (!attaching) return { settled: { messageId, stopReason: "cancelled", usage: {} } };
+                return { log, from, attaching };
+              }
+              await queue();
               accept.resolve({ messageId, sessionId });
               return { log, from, attaching };
             } catch (error) {
@@ -1889,24 +2880,83 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
          * Queues `input` as the session's next turn and returns a view of it.
          * With `messageId`, a retried call is the same turn: it continues a
          * turn still running and answers one that ended, without running it
-         * again.
+         * again. Each image is stored once in the session's image store and
+         * the log names it. A later prompt from this session object waits for
+         * an earlier one's images. An input the harness would refuse throws
+         * here and is never stored. A prompt whose signal aborts before it is
+         * stored is never stored either: it ends cancelled.
          */
         prompt(input, promptOptions = {}) {
           if (closed) throw new Error(`${label} is closed`);
           const messageId = promptOptions.messageId ?? newId("msg");
           if (!validId(messageId)) throw new TypeError(`messageId must be ${idRule}`);
           if (typeof input !== "string" && !Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of content blocks");
-          // The input travels through the queue and the log as JSON.
-          if (Array.isArray(input) && input.some((block) => block?.type === "image" && block.data !== undefined && typeof block.data !== "string")) {
-            throw new TypeError("a durable prompt carries image data as a base64 string");
-          }
           const signal = promptOptions.signal;
           if (signal !== undefined && typeof signal?.addEventListener !== "function") throw new TypeError("prompt signal must be an AbortSignal");
-          const turn = startTurn("prompt", messageId, input, promptOptions.messageId !== undefined, signal?.aborted === true);
+          const aborted = signal?.aborted === true;
+          const retried = promptOptions.messageId !== undefined;
+          // The input travels through the queue and the log as JSON. Its
+          // images go to the session's image store first and the log names
+          // them; a prompt aborted before the call stores nothing, so it
+          // keeps them as base64.
+          const named = !aborted;
+          const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, images: false };
+          // The copy the log will hold is what is checked: a getter can't
+          // show the check one value and the log another.
+          admit(stored.input);
+          plugged.checkPrompt?.(stored.input);
+          const before = storing;
+          const ready = before || stored.images ? async () => {
+            // The prompt waits for an earlier one and its image writes only
+            // until its signal aborts; what it waited for may still land, but
+            // the prompt is not stored.
+            let release = () => {};
+            const abortion = signal === undefined ? null : new Promise((resolve) => {
+              signal.addEventListener("abort", resolve, { once: true });
+              release = () => signal.removeEventListener("abort", resolve);
+            });
+            const unlessAborted = (promise) => {
+              if (abortion === null) return promise;
+              void promise.catch(() => {});
+              return Promise.race([promise, abortion]);
+            };
+            try {
+              await unlessAborted(before ?? Promise.resolve());
+              if (signal?.aborted) return null;
+              let read = stored.input;
+              if (stored.images) {
+                const { created, id: sessionId } = await resolved;
+                const log = await created.session(sessionId);
+                // A retry of a prompt the log already holds is answered from
+                // the log: its images are named, not written again.
+                const known = retried && knownMessage(foldSessionLog(await log.read()), { type: "prompt", messageId });
+                if (signal?.aborted) return null;
+                read = await unlessAborted(storePromptImages(known ? null : log.images, read));
+                if (signal?.aborted) return null;
+              }
+              // An agent closed meanwhile stores nothing more.
+              if (closed) throw new Error(`${label} is closed`);
+              return read;
+            } finally {
+              release();
+            }
+          } : null;
+          const progress = { sent: false };
+          const turn = startTurn("prompt", messageId, stored.input, retried, () => signal?.aborted === true, ready, progress);
+          if (stored.images && !aborted) {
+            // A later prompt waits for this one and every one before it: one
+            // withdrawn while it waited settles before them.
+            const settled = Promise.all([before, turn.accepted.then(() => {}, () => {})]).then(() => {});
+            storing = settled;
+            void settled.then(() => { if (storing === settled) storing = null; });
+          }
           if (signal !== undefined && !signal.aborted) {
             // The prompt's own cancel: it stops this turn whether it runs or
-            // still waits, and never a later one.
-            const stop = () => { void send({ type: "cancel", messageId: newId("cnl"), target: messageId }).catch(() => {}); };
+            // still waits, and never a later one. A prompt whose send had not
+            // begun is never stored, so it needs none.
+            const stop = () => {
+              if (progress.sent) void send({ type: "cancel", messageId: newId("cnl"), target: messageId }).catch(() => {});
+            };
             signal.addEventListener("abort", stop, { once: true });
             void turn.result.finally(() => signal.removeEventListener("abort", stop)).catch(() => {});
           }
@@ -1919,20 +2969,47 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         },
         /**
          * The session's events after `cursor`, as NDJSON, from any server.
-         * The stream is read from its start, so lines rank the same however
-         * a reader reconnects.
+         * A cursor is one a line carried, and a line shows only when no line
+         * before it outranks it, so the epoch of the line a cursor names is
+         * the rank every line after it is held to: the read starts there, not
+         * at the stream's start, and lines rank the same however a reader
+         * reconnects. After a line with no epoch it reads from the start.
          */
         stream(cursor = 0) {
           if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TypeError("stream cursor must be a non-negative integer");
           let reader = null;
           let buffered = "";
           let next = 0;
-          const shows = uiRanker();
+          let shows = uiRanker();
+          // Opens the read: at the cursor's own line, which sets the rank,
+          // or from the start when it carries none.
+          const open = async (ui) => {
+            if (cursor === 0) return ui.read(0).getReader();
+            const at = ui.read(cursor - 1).getReader();
+            let first = "";
+            for (;;) {
+              const index = first.indexOf("\n");
+              if (index >= 0) {
+                let epoch = null;
+                try { epoch = JSON.parse(first.slice(0, index))?.epoch; } catch {}
+                if (!Number.isSafeInteger(epoch)) break;
+                shows = uiRanker(epoch);
+                buffered = first.slice(index + 1);
+                next = cursor;
+                return at;
+              }
+              const { value, done } = await at.read();
+              if (done) return at;
+              first += decoder.decode(value, { stream: true });
+            }
+            void at.cancel().catch(() => {});
+            return ui.read(0).getReader();
+          };
           return new ReadableStream({
             async pull(controller) {
               if (!reader) {
                 const { created, id: sessionId } = await resolved;
-                reader = (await created.session(sessionId)).ui.read(0).getReader();
+                reader = await open((await created.session(sessionId)).ui);
               }
               for (;;) {
                 const index = buffered.indexOf("\n");
@@ -1957,10 +3034,41 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             cancel() { void reader?.cancel().catch(() => {}); },
           });
         },
-        /** Guidance for the running turn, or the next turn when none runs. */
-        async steer(text) {
-          if (typeof text !== "string" || text.length === 0) throw new TypeError("steer text must be a non-empty string");
-          await send({ type: "steer", messageId: newId("str"), input: text });
+        /**
+         * Guidance for the running turn, or the next turn when none runs: it
+         * cuts a streaming reply short, waits for a running tool, and joins a
+         * turn waiting to start. A steer with images or resources cannot
+         * join a turn: the running one ends at its next safe point and the
+         * steer runs next. With `messageId`, a retried call adds nothing;
+         * one id names one input of the session, prompt or steer: reusing a
+         * prompt's id throws `FX_MESSAGE_ID_IN_USE`, or, where the queue
+         * outlives the process and the sender reads no log, the worker drops
+         * the steer and emits a `session.error` with that code. Resolves once
+         * the steer is stored, with its id, which the stream's events for it
+         * carry.
+         */
+        async steer(input, steerOptions = {}) {
+          if (typeof input === "string" ? input.length === 0 : !Array.isArray(input) || input.length === 0) {
+            throw new TypeError("steer input must be a non-empty string or array of content blocks");
+          }
+          if (Array.isArray(input) && input.some((block) => block?.type === "image" && block.data !== undefined && typeof block.data !== "string")) {
+            throw new TypeError("a durable steer carries image data as a base64 string");
+          }
+          if (steerOptions === null || typeof steerOptions !== "object") throw new TypeError("steer options must be an object");
+          const messageId = steerOptions.messageId ?? newId("str");
+          if (!validId(messageId)) throw new TypeError(`messageId must be ${idRule}`);
+          admit(input);
+          // A steer's images go in the session's image store before the steer
+          // that names them, as a prompt's do; storing one again under its
+          // name is harmless, so a retry needs no check.
+          let named = input;
+          if (Array.isArray(input) && input.some((block) => block?.type === "image" && typeof block.data === "string")) {
+            const { created, id: sessionId } = await resolved;
+            named = await storePromptImages((await created.session(sessionId)).images, input);
+            if (closed) throw new Error(`${label} is closed`);
+          }
+          await send({ type: "steer", messageId, input: named });
+          return { messageId };
         },
         /** Cancels the running turn; dropping a turn's view does not. */
         async cancel() {
@@ -1978,6 +3086,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               head: state.head,
             }),
             append: async () => { throw new Error("a checkpoint reads the session without changing it"); },
+            // The records name the session's images; the engine reads them
+            // from its image store to export them.
+            [persistenceImages]: {
+              get: (name) => log.images.get(name),
+              put: async () => { throw new Error("a checkpoint reads the session without changing it"); },
+            },
           };
           const harness = await agent.openHarness(sessionId, readOnly, null);
           try {
@@ -1996,7 +3110,18 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       // deadline would.
       [durableInternals]: {
         stopAtDeadline: (sessionId) => workers.get(sessionId)?.stopNow?.(),
+        // Waits for what a session's running turn has written so far.
+        settled: async (sessionId) => { await workers.get(sessionId)?.settled?.(); },
+        // Delivers a queue message to this agent as its queue would.
+        deliver: async (delivered, delivery) => {
+          const created = await backend();
+          const message = deliveredMessage(created, delivered);
+          return message ? receive(created, message, delivery) : undefined;
+        },
         liveWorkers: () => workers.size,
+        // A session's log as one worker holds it, with its own view of the
+        // chain.
+        openLog: async (sessionId) => (await backend()).session(sessionId),
         // The newest lease the session's log holds, standing or not.
         lastLease: async (sessionId) => {
           const log = await (await backend()).session(sessionId);
@@ -2021,6 +3146,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       /** An id for a new session, before its first prompt. */
       async newSessionId() {
         return (await backend()).newSessionId();
+      },
+      /** The agent's name: its sessions' turns run only on agents with this name. */
+      get name() {
+        return agentName;
       },
       /** The agent's own session, for code that holds one conversation. */
       get sessionId() {
@@ -2049,6 +3178,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       async close() {
         if (closed) return;
         closed = true;
+        leaveGroup(agentsByName, agentName, registered, member);
         while (active.size > 0) await Promise.allSettled([...active]);
         if (backendPromise) {
           const created = await backendPromise.catch(() => null);

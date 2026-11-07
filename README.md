@@ -10,7 +10,7 @@ single native process with no daemon and no background index. It is
 model-agnostic, embeds as a harness in larger systems, and its interface stays
 closer to a Unix shell than an IDE in the terminal.
 
-fx is the smallest coding agent: one native binary with no runtime to install. It's written in Zig and runs the same on your laptop, in CI, or inside an agent sandbox.
+fx is a minimal coding agent CLI that still comes with batteries included. It's one native binary written in Zig, so there is no runtime to install, and it runs the same on your laptop, in CI, or inside an agent sandbox. Its output is closer to a Unix shell than an IDE, because the conversation prints into your terminal's scrollback instead of filling the screen.
 
 - **Efficient by default:** tool output is capped, parallel tool batches stay bounded, and the whole agent is one native process, so token spend and CPU/RAM use stay predictable
 - **Any model:** Vercel AI Gateway, ChatGPT or Grok subscriptions, or your own OpenAI-compatible endpoint such as Ollama or OpenRouter, including [OpenPaths](https://openpaths.io)
@@ -111,9 +111,9 @@ cd your_project
 di
 ```
 
-Type what you want done and press Enter. `/help` lists the slash commands.
+Type what you want done and press Enter. `/help` lists the slash commands. If something doesn't work, run `fx doctor` to check your setup.
 
-For a single request without the interactive shell, use `fx ask`. Add `--json` when a script needs to read the result:
+To send one request without the interactive shell, use `fx ask`. Add `--json` when a script needs to read the result:
 
 ```bash
 di ask "explain the changes in this repository"
@@ -339,9 +339,19 @@ Commands run in your login shell, zsh or bash, with your startup files applied, 
 
 ## Documentation
 
-The manual lives at [fx.sh/docs](https://fx.sh/docs). It covers models, permissions, configuration, skills, MCP, sessions, and every CLI and slash command.
+The manual at [fx.sh/docs](https://fx.sh/docs) covers models, permissions, configuration, skills, MCP, sessions, and every CLI and slash command.
 
-For agents, [fx.sh/llms.txt](https://fx.sh/llms.txt) lists every page as Markdown, and [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file. Adding `.md` to any docs URL returns that page as Markdown.
+## For coding agents
+
+To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file, and adding `.md` to any docs URL returns that page as Markdown. For the flags of the installed version, run `fx <command> --help`.
+
+To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
+
+To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for local health checks. Neither changes the setup.
+
+`fx ask` uses the user's saved permission mode, which is `auto` unless they changed it. Pass `--full-access` only when the user asks for it, because it turns off fx's permission checks.
+
+To change fx itself, read [AGENTS.md](AGENTS.md) first, then build and verify the change as described in [Contributing](#contributing).
 
 ## Feedback
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("file_mutation_contract.zig");
@@ -1000,9 +1001,9 @@ fn validatePreimage(
             const expected_identity = prepared.policy_targets.items[0].expected_identity orelse
                 break :blk .stale;
             if (!identityEql(actual_identity, expected_identity)) break :blk .stale;
-            if (stat.permissions.toMode() & 0o222 == 0) break :blk .io_failure;
+            if (io_mod.permissionsReadOnly(stat.permissions)) break :blk .io_failure;
             if (expected_permissions) |permissions| {
-                if (stat.permissions.toMode() != permissions.toMode()) break :blk .stale;
+                if (io_mod.permissionsMode(stat.permissions) != io_mod.permissionsMode(permissions)) break :blk .stale;
             }
 
             var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1486,8 +1487,7 @@ fn derivePostimage(
 }
 
 fn ambiguousMessage(alloc: Allocator, count: usize) error{OutOfMemory}![]const u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "edit_file failed: old_string is not unique (found {d} occurrences), provide more context",
         .{count},
     );
@@ -1970,7 +1970,7 @@ test "prepare derives a missing write without creating the target" {
 }
 
 test "prepare shows the canonical external target when a symlink redirects outside the workspace" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1986,7 +1986,7 @@ test "prepare shows the canonical external target when a symlink redirects outsi
     };
 
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
-    const misleading_path = try std.fs.path.join(arena, &.{ workspace, "link/new.txt" });
+    const misleading_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link/new.txt" });
     const call: types.ToolCall = .{
         .id = "write-symlink-redirect",
         .name = "write_file",
@@ -2014,7 +2014,7 @@ test "prepare retains full review separately from the bounded approval preview" 
         var line: [32]u8 = undefined;
         try content.appendSlice(
             std.testing.allocator,
-            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+            try std.mem.print(&line, "line {d}\n", .{line_number}),
         );
     }
 
@@ -2414,7 +2414,7 @@ test "prepare rejects call target and authority identity mismatches" {
 }
 
 test "prepare rejects an intermediate-directory retarget" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2627,7 +2627,7 @@ test "apply installs reviewed bytes beneath an authorized external anchor" {
         tmp.dir,
         "external",
     );
-    const target_path = try std.fs.path.join(
+    const target_path = try std.Io.Dir.path.join(
         call_alloc,
         &.{ external, "nested/new.txt" },
     );
@@ -2679,11 +2679,11 @@ test "apply rejects binding mismatches before allocation or filesystem access" {
     const prepared = try prepareForApply(owner_alloc, root, call);
 
     var failing_call = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var failing_result = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const call_alloc = failing_call.allocator();
@@ -2773,7 +2773,7 @@ test "apply allocation failure before rename leaves target unchanged" {
     };
     const prepared = try prepareForApply(call_alloc, root, call);
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 3 },
     );
     var test_state = StageTestState{};
@@ -3515,7 +3515,7 @@ test "apply returns deepest-first bounded residue when created parents are not e
 }
 
 test "apply preserves the existing destination mode" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3525,7 +3525,7 @@ test "apply preserves the existing destination mode" {
         defer file.close(std.testing.io);
         try file.setPermissions(
             std.testing.io,
-            std.Io.File.Permissions.fromMode(0o640),
+            io_mod.permissionsFromMode(0o640),
         );
     }
     var call_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3558,7 +3558,7 @@ test "apply preserves the existing destination mode" {
     );
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o640),
-        stat.permissions.toMode() & 0o777,
+        io_mod.permissionsMode(stat.permissions) & 0o777,
     );
 }
 

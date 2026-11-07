@@ -129,6 +129,16 @@ pub fn decode(input: []const u8) DecodeError!Message {
     return .{ .response = .{ .id = response_id, .body = .{ .failure = try failureOf(failure.?) } } };
 }
 
+/// The id of a line `decode` refused that is shaped like a response: an
+/// object with no `method` and an id the client could have issued. The
+/// request it names fails with it.
+pub fn responseId(input: []const u8) ?RequestId {
+    var found: [envelope_fields.len]?[]const u8 = undefined;
+    objectFields(input, &envelope_fields, &found) catch return null;
+    if (found[2] != null) return null;
+    return ownId(found[1]) catch null;
+}
+
 /// Finds the fields listed in `names` in the JSON object `object` and stores
 /// each raw value, a slice of `object`, at the same index in `out`. Other
 /// fields, and keys written with escapes, are skipped. A wanted field that
@@ -510,7 +520,7 @@ test "decodes results with numeric, string, and foreign ids" {
 
     for ([_][]const u8{ "\"abc\"", "\"012\"", "\"1_0\"", "-3", "null", "1.5", "99999999999999999999" }) |foreign| {
         var buffer: [96]u8 = undefined;
-        const input = try std.fmt.bufPrint(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{foreign});
+        const input = try std.mem.print(&buffer, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{}}}}", .{foreign});
         try testing.expectEqual(@as(?RequestId, null), (try decode(input)).response.id);
     }
     try testing.expectEqual(@as(?RequestId, null), (try decode("{\"jsonrpc\":\"2.0\",\"result\":{}}")).response.id);
@@ -538,6 +548,21 @@ test "decodes errors, including the spec's unsupported-version example" {
 
     const no_id = try decode("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}");
     try testing.expectEqual(@as(?RequestId, null), no_id.response.id);
+}
+
+test "a refused line shaped like a response still names its request" {
+    for ([_][]const u8{
+        "{\"id\":3,\"result\":{}}",
+        "{\"jsonrpc\":\"1.0\",\"id\":3,\"result\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"3\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{},\"error\":{\"code\":1,\"message\":\"x\"}}",
+    }) |line| {
+        if (decode(line)) |_| return error.TestUnexpectedResult else |_| {}
+        try testing.expectEqual(@as(?RequestId, 3), responseId(line));
+    }
+    // A request, a null or foreign id, and a line that isn't an object name none.
+    for ([_][]const u8{ "{\"id\":3,\"method\":\"ping\",\"jsonrpc\":\"1.0\"}", "{\"id\":null}", "{\"id\":-1}", "[3]", "not json" }) |line|
+        try testing.expectEqual(@as(?RequestId, null), responseId(line));
 }
 
 test "a key written with escapes never matches a field" {
@@ -597,7 +622,7 @@ test "decodes notifications and 2025 server requests" {
 }
 
 test "rejects malformed and ambiguous messages" {
-    const deep = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":" ++ "[" ** 5000 ++ "]" ** 5000 ++ "}}";
+    const deep = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":" ++ &@as([5000]u8, @splat('[')) ++ &@as([5000]u8, @splat(']')) ++ "}}";
     const cases = [_]struct { []const u8, DecodeError }{
         .{ "", error.InvalidJson },
         .{ "[{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}]", error.NotAnObject },
@@ -643,7 +668,7 @@ test "mutated messages never crash and slices stay inside the input" {
             1 => len = random.intRangeAtMost(usize, 0, len),
             else => if (len < buffer.len) {
                 const at = random.uintLessThan(usize, len + 1);
-                std.mem.copyBackwards(u8, buffer[at + 1 .. len + 1], buffer[at..len]);
+                @memmove(buffer[at + 1 .. len + 1], buffer[at..len]);
                 buffer[at] = "{}[]\",:0\\"[random.uintLessThan(usize, 10)];
                 len += 1;
             },

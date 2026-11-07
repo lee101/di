@@ -19,10 +19,25 @@ const Io = std.Io;
 pub const hooks = build_options.hooks;
 pub const Fault = if (hooks) @import("storage_fault.zig").Fault else void;
 
-pub const folder_mode: std.posix.mode_t = 0o700;
-pub const file_mode: std.posix.mode_t = 0o600;
+pub fn permsFromMode(mode: u32) std.Io.File.Permissions {
+    if (comptime @import("builtin").os.tag == .windows) return @fromBackingInt(if (mode & 0o200 == 0) 1 else 0);
+    return std.Io.File.Permissions.fromMode(@intCast(mode));
+}
+
+pub fn permsMode(permissions: std.Io.File.Permissions) u32 {
+    if (comptime @import("builtin").os.tag == .windows) return if (@backingInt(permissions) & 1 != 0) 0o444 else 0o666;
+    return @intCast(permissions.toMode());
+}
+
+pub fn permsReadOnly(permissions: std.Io.File.Permissions) bool {
+    if (comptime @import("builtin").os.tag == .windows) return @backingInt(permissions) & 1 != 0;
+    return permissions.readOnly();
+}
+
+pub const folder_mode: u32 = 0o700;
+pub const file_mode: u32 = 0o600;
 /// A blob never changes once written, and a tool may open it by path (D49).
-pub const blob_mode: std.posix.mode_t = 0o400;
+pub const blob_mode: u32 = 0o400;
 
 pub const Error = error{
     /// No file or folder by that name.
@@ -73,7 +88,7 @@ pub const Stat = struct {
     size: u64,
     kind: Kind,
     /// Permission bits only (`0o777` mask).
-    mode: std.posix.mode_t,
+    mode: u32,
     /// Last modification, milliseconds since the epoch.
     mtime_ms: i64,
 };
@@ -95,13 +110,13 @@ pub const Storage = struct {
     /// its parents may.
     pub fn openRoot(s: Storage, path: []const u8) Error!Dir {
         try s.alive();
-        const parent_path = std.fs.path.dirname(path) orelse ".";
-        const name = std.fs.path.basename(path);
+        const parent_path = std.Io.Dir.path.dirname(path) orelse ".";
+        const name = std.Io.Dir.path.basename(path);
         const cwd = Io.Dir.cwd();
         // Missing parents are the manager's own folders, so private too, for
         // example `~/.fx/sessions` on a machine that never ran v1 (D19).
         // Existing ones are left as they are.
-        _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
+        _ = cwd.createDirPathStatus(s.io, parent_path, permsFromMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
         defer parent.close(s.io);
         return s.ensureDir(.{ .handle = parent }, name);
@@ -110,13 +125,13 @@ pub const Storage = struct {
     /// Whether the sessions root exists, creating neither it nor its parents.
     pub fn rootExists(s: Storage, path: []const u8) Error!bool {
         try s.alive();
-        const parent_path = std.fs.path.dirname(path) orelse ".";
+        const parent_path = std.Io.Dir.path.dirname(path) orelse ".";
         var parent = Io.Dir.cwd().openDir(s.io, parent_path, .{}) catch |err| return switch (translate(err)) {
             error.NotFound => false,
             else => |e| e,
         };
         defer parent.close(s.io);
-        _ = s.stat(.{ .handle = parent }, std.fs.path.basename(path)) catch |err| return switch (err) {
+        _ = s.stat(.{ .handle = parent }, std.Io.Dir.path.basename(path)) catch |err| return switch (err) {
             error.NotFound => false,
             else => err,
         };
@@ -151,7 +166,7 @@ pub const Storage = struct {
         try s.alive();
         try s.mutate();
         assertComponent(name);
-        parent.handle.createDir(s.io, name, .fromMode(folder_mode)) catch |err|
+        parent.handle.createDir(s.io, name, permsFromMode(folder_mode)) catch |err|
             return translate(err);
         if (hooks) if (s.fault) |f| try f.noteCreate(s, parent, name);
     }
@@ -168,7 +183,7 @@ pub const Storage = struct {
         return s.createFileMode(dir, name, blob_mode);
     }
 
-    fn createFileMode(s: Storage, dir: Dir, name: []const u8, mode: std.posix.mode_t) Error!File {
+    fn createFileMode(s: Storage, dir: Dir, name: []const u8, mode: u32) Error!File {
         try s.alive();
         try s.mutate();
         assertComponent(name);
@@ -176,7 +191,7 @@ pub const Storage = struct {
             .read = true,
             .truncate = false,
             .exclusive = true,
-            .permissions = .fromMode(mode),
+            .permissions = permsFromMode(mode),
             .resolve_beneath = true,
         }) catch |err| return translate(err);
         if (hooks) if (s.fault) |f| {
@@ -351,7 +366,7 @@ pub const Storage = struct {
                 .directory => .directory,
                 else => .other,
             },
-            .mode = st.permissions.toMode() & 0o777,
+            .mode = permsMode(st.permissions) & 0o777,
             .mtime_ms = st.mtime.toMilliseconds(),
         };
     }
@@ -480,7 +495,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     defer testing.allocator.free(base);
     // Like `~/.fx/sessions/v2` where neither parent exists yet: all three
     // folders are created private.
-    const root_path = try std.fs.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
+    const root_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
     defer testing.allocator.free(root_path);
     const root = try s.openRoot(root_path);
     s.closeDir(root);
@@ -495,7 +510,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
 
     try tmp.dir.createDir(io, "real", .default_dir);
     try tmp.dir.symLink(io, "real", "linked", .{ .is_directory = true });
-    const linked_path = try std.fs.path.join(testing.allocator, &.{ base, "linked" });
+    const linked_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "linked" });
     defer testing.allocator.free(linked_path);
     try testing.expectError(error.Refused, s.openRoot(linked_path));
 }

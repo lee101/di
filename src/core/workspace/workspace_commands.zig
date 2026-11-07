@@ -268,7 +268,7 @@ test "shared workspace mutation owns staging persistence metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
 
@@ -310,7 +310,7 @@ test "shared workspace mutations apply stale actions to the latest durable roots
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "added", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -328,7 +328,7 @@ test "shared workspace mutations apply stale actions to the latest durable roots
     var initialized: usize = 0;
     defer for (saved[0..initialized]) |path| alloc.free(path);
     for (&saved, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "saved-{d}", .{index});
+        const name = try alloc.print("saved-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -397,7 +397,7 @@ test "workspace add rejects effective capacity before changing settings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "added", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -415,7 +415,7 @@ test "workspace add rejects effective capacity before changing settings" {
     var initialized: usize = 0;
     defer for (saved[0..initialized]) |path| alloc.free(path);
     for (&saved, 0..) |*path, index| {
-        const name = try std.fmt.allocPrint(alloc, "saved-{d}", .{index});
+        const name = try alloc.print("saved-{d}", .{index});
         defer alloc.free(name);
         try tmp.dir.createDir(std.testing.io, name, .default_dir);
         path.* = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
@@ -463,7 +463,7 @@ test "shared workspace mutation removes command line only access without a durab
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
 
@@ -559,7 +559,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "previous", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -597,8 +597,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         else => return error.TestExpectedEqual,
     }
 
-    const previous_fixture = try std.fmt.allocPrint(
-        alloc,
+    const previous_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, previous },
     );
@@ -614,8 +613,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         else => return error.TestExpectedEqual,
     }
 
-    const third_fixture = try std.fmt.allocPrint(
-        alloc,
+    const third_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, third },
     );
@@ -625,8 +623,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     defer third_result.deinit(alloc);
     try std.testing.expect(third_result == .unconfirmed);
 
-    const invalid_fixture = try std.fmt.allocPrint(
-        alloc,
+    const invalid_fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
         .{ primary, previous, previous },
     );
@@ -641,7 +638,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", std.Io.File.Permissions.fromMode(0o700));
+    _ = try tmp.dir.createDirPathStatus(std.testing.io, "home/.fx", io_mod.permissionsFromMode(0o700));
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "first", .default_dir);
     try tmp.dir.createDir(std.testing.io, "second", .default_dir);
@@ -654,7 +651,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     defer alloc.free(home);
     const primary = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary");
     defer alloc.free(primary);
-    const source = try std.fs.path.resolve(alloc, &.{ primary, "../saved-link" });
+    const source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ primary, "../saved-link" });
     defer alloc.free(source);
     var current = try workspace_access.WorkspaceAccess.init(
         alloc,
@@ -669,8 +666,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home }});
     defer env.deinit();
 
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ primary, source },
     );
@@ -720,18 +716,6 @@ test "shared workspace mutation reports the failing transaction phase" {
     try std.testing.expectEqual(FailurePhase.commit, phase);
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const EnvEntry = struct {
     key: []const u8,
     value: []const u8,
@@ -740,10 +724,10 @@ const EnvEntry = struct {
 fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !void {
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
     });
     defer file.close(io_mod.getIo());
-    try file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o600));
+    try file.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o600));
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
@@ -778,8 +762,6 @@ const TestEnv = struct {
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, entries: []const EnvEntry) !*TestEnv {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -793,7 +775,7 @@ const TestEnv = struct {
     }
 
     fn deinit(self: *TestEnv) void {
-        if (stable_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

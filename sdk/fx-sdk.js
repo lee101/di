@@ -4,6 +4,7 @@ import { customProviderDefinition, customProviderSpec } from "./custom-provider.
 import { grokSubscription } from "./grok.js";
 import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
+import { toolObservation } from "./tool-observation.js";
 
 // Providers that run on a user's plan, authorized by the host's credentials.
 const subscriptionProviders = new Set(["codex", "grok"]);
@@ -24,6 +25,9 @@ const maxModelBytes = 1024;
 // Matches the kernel's ReasoningEffort.max_name_bytes.
 const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
+// The answer a resumed turn gives a call its crash left running; matches
+// unfinished_tool_output in session_adapter.zig.
+const unfinishedToolOutput = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
@@ -33,7 +37,10 @@ const maxUnreadEvents = 256;
 // Prompt images travel as raw bytes beside the ACP frame and are base64
 // encoded only in the model request. An image may use 5 MiB of encoded
 // request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
-// The kernel still validates content and media type.
+// The kernel still validates content and media type, and holds a prompt to
+// these limits too: `max_libfx_prompt_images` and
+// `max_libfx_prompt_images_bytes` in src/core/images/image_attachments.zig
+// must match them.
 const maxPromptImages = 8;
 const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
@@ -41,6 +48,7 @@ const maxPromptImageBytes = (maxPromptImageDataBytes / 4) * 3;
 const maxPromptImagesBytes = (maxPromptImagesDataBytes / 4) * 3;
 // Matches the native attachment table: one prompt's images or one checkpoint.
 const maxPendingAttachments = 8;
+const maxPendingAttachmentBytes = 8 * 1024 * 1024;
 const maxOutboundAttachments = 4;
 // Matches the core's kernel checkpoint limit (max_checkpoint_bytes).
 const maxCheckpointBytes = 4 * 1024 * 1024;
@@ -147,6 +155,25 @@ export function normalizeAgentOptions(value) {
     throw new TypeError("createFxEngine() options must be an object");
   }
   const options = { ...value };
+  if (options.hooks !== undefined) {
+    const hooks = options.hooks;
+    if (!hooks || typeof hooks !== "object" || Array.isArray(hooks) || typeof hooks.onEvent !== "function") {
+      throw new TypeError("hooks must be an object with onEvent()");
+    }
+    if (hooks.onError !== undefined && typeof hooks.onError !== "function") throw new TypeError("hooks.onError must be a function");
+    if (hooks.captureContent !== undefined && typeof hooks.captureContent !== "boolean") throw new TypeError("hooks.captureContent must be a boolean");
+    options.hooks = {
+      captureContent: hooks.captureContent === true,
+      onEvent: hooks.onEvent.bind(hooks),
+      ...(hooks.onError === undefined ? {} : { onError: hooks.onError.bind(hooks) }),
+      ...(hooks.parent === undefined ? {} : { parent: { ...hooks.parent } }),
+    };
+    if (options.hooks.parent !== undefined) {
+      for (const name of ["rootSessionId", "sessionId", "turnId", "callId"]) {
+        if (typeof options.hooks.parent[name] !== "string" || options.hooks.parent[name].length === 0 || options.hooks.parent[name].length > 1024) throw new TypeError(`hooks.parent.${name} must be a bounded identity`);
+      }
+    }
+  }
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
@@ -176,8 +203,12 @@ export function normalizeAgentOptions(value) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
-  // fx's default model is a Gateway id; a custom provider names its own.
+  // fx's default model is a Gateway id. Codex, Grok, and a custom provider
+  // name their own models, so each needs one, as the fx CLI asks for.
   if (custom && options.model === undefined) throw new TypeError("a custom provider needs a model");
+  if (subscription && options.model === undefined) {
+    throw new TypeError(`provider "${options.provider}" needs a model; fx's default model is an AI Gateway id`);
+  }
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");
@@ -211,6 +242,14 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// A persistence's image store, `{ put(name, bytes), get(name) }`, which keeps
+// each image once, named by the SHA-256 of its bytes, so records and
+// checkpoints only name it. Durable sessions give one to the engines they
+// run; without it, images stay inline.
+export const persistenceImages = Symbol.for("libfx.persistenceImages");
+// `{ images, bytes }`: a smaller image window than the core's, the newest
+// images a session with an image store keeps, so tests can reach its edge.
+const imageWindowLimits = Symbol.for("libfx.imageWindow");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
@@ -230,7 +269,7 @@ export class FxFencedError extends Error {
   }
 }
 
-/** The journal was written by a newer libfx than this one. */
+/** The journal, or the `checkpoint` option, was written by a newer libfx. */
 export class FxJournalVersionError extends Error {
   constructor(message) {
     super(message);
@@ -256,7 +295,25 @@ const journalOpenErrorCodes = new Map([
   ["libfx journal events are out of order", "FX_JOURNAL_INVALID"],
   ["libfx journal is too large", "FX_JOURNAL_TOO_LARGE"],
   ["libfx journal holds more than 1024 turns", "FX_JOURNAL_TOO_LARGE"],
+  ["libfx journal images are too large", "FX_JOURNAL_TOO_LARGE"],
+  ["Invalid libfx journal images", "FX_JOURNAL_INVALID"],
+  ["libfx image does not match its name", "FX_JOURNAL_IMAGE_MISSING"],
 ]);
+
+// An image's name in a persistence's image store: the lowercase hex SHA-256
+// of its bytes, as the core names it.
+async function imageName(bytes) {
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  let name = "";
+  for (const byte of digest) name += byte.toString(16).padStart(2, "0");
+  return name;
+}
+
+function imageMissingError(name, cause) {
+  const error = journalLoadError(`libfx journal names an image the store does not hold: ${name}`, "FX_JOURNAL_IMAGE_MISSING", cause);
+  error.image = name;
+  return error;
+}
 
 /**
  * A persistence store that keeps a session's records and its latest
@@ -304,6 +361,11 @@ const resumeTurn = Symbol("libfx.resume");
 const followUpInput = Symbol("libfx.followUp");
 // Carries the ids of the calls a resumed turn runs again.
 const rerunCallIds = Symbol("libfx.rerun");
+// Marks a resume whose host already holds what the turn sent before it
+// stopped, as a durable session's stream does, so the turn does not send it
+// again. Any other resume runs in a host that saw none of it. Never a
+// caller-visible option; `fx-harness.js` sets it.
+export const resumeOutputShown = Symbol.for("libfx.resumeOutputShown");
 
 function journalAppendError(cause) {
   const error = new Error("libfx journal append failed", { cause });
@@ -311,17 +373,28 @@ function journalAppendError(cause) {
   return error;
 }
 
-// Restoring an open turn needs only its newest progress, so an older one's
-// state is left out of a load (data: null). A load then grows with the
-// session's committed turns, not with every step of every turn.
+// Restoring an open turn needs only its newest progress, and the ones it
+// extends when it carries only what is new back to one that carries all of
+// it, and the results of calls no progress has answered yet. So an older
+// progress's state, and an answered call's result, are left out of a load
+// (data: null). A load then grows with the session's committed turns, not
+// with every step of every turn.
 function withoutSupersededProgress(events) {
   const kept = new Array(events.length);
   let superseded = false;
+  let answered = false;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     const type = event?.type;
-    kept[index] = superseded && type === "turn_progress" && event.data != null ? { ...event, data: null } : event;
-    if (type === "turn_progress" || type === "turn_committed" || type === "turn_progress_cleared") superseded = true;
+    const dropped = event?.data != null && ((type === "turn_progress" && superseded) || (type === "tool_result" && answered));
+    kept[index] = dropped ? { ...event, data: null } : event;
+    if (type === "turn_committed" || type === "turn_progress_cleared") {
+      superseded = true;
+      answered = true;
+    } else if (type === "turn_progress") {
+      answered = true;
+      if (event.base === undefined) superseded = true;
+    }
   }
   return kept;
 }
@@ -395,6 +468,7 @@ function checkpointSeq(bytes) {
 
 // Reads what `persistence.load()` returns: the latest checkpoint, if any, and
 // the records after it, as the events the core folds after that checkpoint.
+// Modeled in `tests/tla/durable/SnapshotTail.tla`.
 async function loadPersistence(persistence) {
   const loaded = await persistence.load();
   if (!loaded || typeof loaded !== "object") {
@@ -435,20 +509,28 @@ async function loadPersistence(persistence) {
   return { checkpoint, events, head, tailBytes: bytes, lastSeq: events.at(-1)?.seq ?? covered };
 }
 
+// Events someone waits on, so the record holding one is a barrier: a steer
+// or withdrawal its caller awaits, and the end or yield a turn's result does.
+const waitedForEvents = new Set(["input_accepted", "input_withdrawn", "turn_committed", "turn_progress_cleared", "turn_yielded"]);
+
 // What a record's events say about turns, in order, for a store that tracks
 // them without reading records: a turn started, ended, or yielded, an input
-// was accepted, or the step the open turn is at, as its tool steps finished
-// and the state of its calls.
+// was accepted or handed back unplaced, or the step the open turn is at, as
+// its tool steps finished and the state of its calls.
 function journalMarks(events) {
   const marks = [];
   for (const event of events) {
     if (event?.type === "turn_progress") {
       if (typeof event.turnId === "string") marks.push({ start: event.turnId });
-      const steps = event.data?.execution?.tool_steps;
-      if (Array.isArray(steps)) marks.push({ step: `${steps.length}:${String(event.data.tool_state ?? "none")}` });
+      // The inputs its model request carries for the first time.
+      for (const id of Array.isArray(event.inputs) ? event.inputs : []) if (typeof id === "string") marks.push({ placed: id });
+      // A progress that carries only what is new counts all the turn's steps.
+      const steps = Number.isSafeInteger(event.steps) ? event.steps : event.data?.execution?.tool_steps?.length;
+      if (Number.isSafeInteger(steps)) marks.push({ step: `${steps}:${String(event.data?.tool_state ?? "none")}` });
     } else if (event?.type === "turn_committed" || event?.type === "turn_progress_cleared") marks.push({ end: true });
     else if (event?.type === "turn_yielded") marks.push({ yield: true });
     else if (event?.type === "input_accepted" && typeof event.data?.id === "string") marks.push({ accepted: event.data.id });
+    else if (event?.type === "input_withdrawn" && typeof event.data?.id === "string") marks.push({ withdrawn: event.data.id });
   }
   return marks;
 }
@@ -820,6 +902,8 @@ function createRuntime(options) {
   const steering = [];
   let steeringBytes = 0;
   let steeringOpen = false;
+  // A steer that cannot join the running turn waits to run next.
+  let steeringHandoff = false;
   // Raw payloads beside ACP frames: the core copies inbound bytes into its
   // own memory and publishes outbound bytes for the agent to take.
   const inboundAttachments = new Map();
@@ -1094,6 +1178,7 @@ function createRuntime(options) {
   function clearSteering() {
     steering.length = 0;
     steeringBytes = 0;
+    steeringHandoff = false;
   }
 
   function queueSteering(text, id = "") {
@@ -1602,6 +1687,9 @@ function createRuntime(options) {
     fx_host_tool_result_release() { pendingHostToolResult = null; },
     fx_steering_take: steeringTake,
     fx_steering_close() { steeringOpen = false; clearSteering(); },
+    // -1 once the turn takes no more steering, else twice how many steers
+    // wait, plus one when a handoff does.
+    fx_steering_state() { return steeringOpen ? steering.length * 2 + (steeringHandoff ? 1 : 0) : -1; },
     fx_attachment_size: attachmentSize,
     fx_attachment_take: attachmentTake,
     fx_attachment_put: attachmentPut,
@@ -1643,6 +1731,12 @@ function createRuntime(options) {
     openSteering() { clearSteering(); steeringOpen = true; },
     steer: queueSteering,
     withdrawSteering,
+    // Ends the running turn at its next safe point; false when none runs.
+    handOffSteering() {
+      if (!steeringOpen) return false;
+      steeringHandoff = true;
+      return true;
+    },
     closeSteering() { steeringOpen = false; clearSteering(); },
     abortHostEffects,
     abort(error) {
@@ -1926,6 +2020,62 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   return prompt;
 }
 
+// The image types libfx's core takes, each known by how its bytes start.
+const imageSignatures = [
+  ["image/png", 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ["image/jpeg", 0, [0xff, 0xd8, 0xff]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]],
+  ["image/webp", 0, [0x52, 0x49, 0x46, 0x46]],
+];
+const imageTypes = new Set(imageSignatures.map(([type]) => type));
+const webpMarker = [0x57, 0x45, 0x42, 0x50];
+
+// The image type `bytes` start as, or null.
+function imageTypeOf(bytes) {
+  const startsWith = (offset, signature) => bytes.length >= offset + signature.length && signature.every((byte, index) => bytes[offset + index] === byte);
+  for (const [type, offset, signature] of imageSignatures) {
+    if (!startsWith(offset, signature)) continue;
+    if (type === "image/webp" && !startsWith(8, webpMarker)) continue;
+    return type;
+  }
+  return null;
+}
+
+// Refuses image bytes that are not the type they declare, as libfx's core does.
+function checkImageBytesType(bytes, mimeType, index) {
+  const type = imageTypeOf(bytes);
+  if (type === null) throw new TypeError(`image prompt block ${index} is not a PNG, JPEG, GIF or WebP image`);
+  if (type !== mimeType) throw new TypeError(`image prompt block ${index} holds ${type} data, not ${mimeType}`);
+}
+
+/**
+ * Checks a prompt's input as libfx takes it and returns it normalized:
+ * every check `prompt()` makes, and the ones libfx's core makes on images,
+ * which would otherwise refuse the prompt only once it reached the core: a
+ * supported image type, and bytes or base64 that are that type. A Blob is not
+ * read, so its bytes are checked once read (`checkImageBytesType`). With
+ * `resizeImage`, image bytes are checked after it runs instead. Throws a
+ * TypeError or RangeError.
+ */
+export function checkPromptInput(input, { resizeImage } = {}) {
+  const resized = resizeImage !== undefined;
+  const normalized = normalizePromptInput(input, { deferImageLimits: resized });
+  // The core takes no prompt without text or an image; a resource adds neither.
+  if (!normalized.some((block) => block.type === "image" || (block.type === "text" && block.text.length > 0))) {
+    throw new TypeError("prompt is empty");
+  }
+  // resizeImage decides the final image sizes, so they are counted after it runs.
+  checkPromptFrameSize(normalized, !resized);
+  normalized.forEach((block, index) => {
+    if (block.type !== "image" || (resized && block.data !== undefined)) return;
+    if (!imageTypes.has(block.mimeType)) throw new TypeError(`image prompt block ${index} mimeType must be image/png, image/jpeg, image/gif or image/webp`);
+    if (block.source === "bytes") checkImageBytesType(block.data, block.mimeType, index);
+    else if (block.source === "base64") checkImageBytesType(base64ToBytes(block.data.slice(0, 16)), block.mimeType, index);
+  });
+  return normalized;
+}
+
 // Image bytes travel beside the frame as attachment references, but the model
 // request carries them base64 encoded and the native host caps that request at
 // 8 MiB. Images therefore count at their encoded size, the same budget they
@@ -2011,6 +2161,11 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
   }
   if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
   checkPromptFrameSize(prepared, true);
+  // A file's bytes, or what resizeImage made, are checked once there are
+  // some, after the size limits.
+  prepared.forEach((image, index) => {
+    if (image.type === "image" && image.bytes !== undefined) checkImageBytesType(image.bytes, image.mimeType, index);
+  });
   return prepared;
 }
 
@@ -2037,7 +2192,10 @@ function toolSchemaHash(descriptors) {
 }
 
 // `tools` is an array of descriptors, or an object of descriptors keyed by
-// name.
+// name. What `idempotent` and `writes` mean after a crash and for calls that
+// run together is modeled in `tests/tla/durable/ToolReplay.tla`, whose
+// `replay: "safe"` is an idempotent tool that does not write, and in
+// `tests/tla/durable/ParallelBatch.tla`.
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   let entries;
@@ -2052,7 +2210,6 @@ function normalizeHostTools(value) {
   } else {
     throw new TypeError("tools must be an array or an object");
   }
-  if (entries.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
   const descriptors = [];
   const executors = new Map();
   const names = new Set();
@@ -2088,8 +2245,10 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
-      // The engine does not read `idempotent`, but it stays in the shape a
-      // checkpoint records, so a change to it counts as a changed tool set.
+      // The engine reads `idempotent`: such a tool runs beside others unless
+      // it `writes`, and one that does not write starts before its intent is
+      // stored. It is also in the shape a checkpoint records, so a change to
+      // it counts as a changed tool set.
       ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
@@ -2136,7 +2295,10 @@ export function normalizeInstructions(value) {
   return instructions;
 }
 
-function hostToolContent(value) {
+// `stored` maps an image's base64 data to its name in the image store, for
+// the images stored before the result goes to the core: their blocks carry
+// the name, so the core names them too.
+function hostToolContent(value, stored = null) {
   if (value?.type === "libfx.tool-result") {
     if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
       throw new TypeError("invalid typed tool result");
@@ -2148,11 +2310,13 @@ function hostToolContent(value) {
       if ((!referenceOnly && typeof image.data !== "string") || typeof image.mimeType !== "string" || image.mimeType.length === 0 || image.mimeType.length > 128 || (image.data?.length > maxPromptImageDataBytes && sourceRef === undefined)) {
         throw new TypeError("invalid tool image");
       }
+      const data = !referenceOnly && image.data.length <= maxPromptImageDataBytes ? image.data : undefined;
       return {
         type: "image",
-        ...(!referenceOnly && image.data.length <= maxPromptImageDataBytes ? { data: image.data } : {}),
+        ...(data === undefined ? {} : { data }),
         mimeType: image.mimeType,
         ...(sourceRef === undefined ? {} : { sourceRef }),
+        ...(data !== undefined && stored?.has(data) ? { stored: stored.get(data) } : {}),
       };
     });
     if (promptImageDataBytes(images) > maxPromptImagesDataBytes) images = omitReferencedImageData(images);
@@ -2163,7 +2327,7 @@ function hostToolContent(value) {
       content = JSON.stringify({ text: value.text, images });
     }
     if (encoder.encode(content).length > maxPromptImagesDataBytes) throw new RangeError("typed tool result exceeds the result limit");
-    return { content, rich: true, isError: value.isError === true };
+    return { content, rich: true, isError: value.isError === true, images };
   }
   if (typeof value === "string") return { content: value, rich: false };
   if (value === undefined) return { content: "null", rich: false };
@@ -2213,16 +2377,51 @@ export async function createFxEngine(options = {}) {
   const pending = new Map();
   let nextId = 1;
   let sessionId = null;
+  const hookScopes = new Map();
+  // Observation never participates in effects, journal barriers, or retries.
+  // Contain both throws and rejected promises, including an error handler's.
+  const hookError = (error) => {
+    try { Promise.resolve(options.hooks?.onError?.(error)).catch(() => {}); } catch {}
+  };
+  const hook = (event) => {
+    if (!options.hooks) return;
+    if (options.hooks.parent) event = {
+      ...event, rootSessionId: options.hooks.parent.rootSessionId,
+      ...(event.sessionId === sessionId && event.parentSessionId == null ? {
+        parentSessionId: options.hooks.parent.sessionId, parentTurnId: options.hooks.parent.turnId, parentCallId: options.hooks.parent.callId,
+      } : {}),
+    };
+    if (event.type === "tool.start") {
+      const { data, type, ...scope } = event;
+      hookScopes.set(`${event.sessionId}:${data.call.callId}`, scope);
+    } else if (event.type === "tool.end") hookScopes.delete(`${event.sessionId}:${event.data.call.callId}`);
+    else if (event.type === "turn.end") {
+      for (const [key, scope] of hookScopes) if (scope.executionId === event.executionId) hookScopes.delete(key);
+    } else if (event.type === "journal.error" && event.data.fenced) hookScopes.clear();
+    try { Promise.resolve(options.hooks.onEvent(event)).catch(hookError); } catch (error) { hookError(error); }
+  };
+  const journalHook = (type, data) => hook({
+    version: 1, type, sessionId, rootSessionId: sessionId, parentSessionId: null, sourceSessionId: null, workId: null, turnId: null, executionId: null, stepIndex: 0,
+    timestamp: Date.now(), contentCaptured: false, contentTruncated: false, data,
+  });
   let activeTurn = null;
   let closing = false;
   let coreExitError = null;
   const isCurrentTurn = (turn) => turn && activeTurn === turn && !turn.cancelled && !closing;
-  // Events go to the store in the order the core sends them: events that
-  // arrive together become one record, and each record's append names the
-  // cursor of the one before it, so a store refuses a write that does not
-  // continue what it holds. The core waits for a record only before an
-  // action others can see: a model request or a tool call.
+  // Events go to the store in the order the core sends them, one append at
+  // a time: events that arrive together become one record, and so do all
+  // the events that arrive while an append is in flight. Each record's append
+  // names the cursor of the one before it, so a store refuses a write that
+  // does not continue what it holds, and says with `barrier` whether anyone
+  // waits for it: the core before an action others can see, such as a tool
+  // call with effects, or a caller for its input.
   const persistence = options.persistence ?? null;
+  // A persistence with an image store keeps each prompt image once, by
+  // name, and the core names it in records and checkpoints instead of
+  // holding its bytes.
+  const imageStorage = persistence?.[persistenceImages] ?? null;
+  const imageStore = imageStorage !== null;
+  const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
   let journalHead = null;
@@ -2232,18 +2431,21 @@ export async function createFxEngine(options = {}) {
   let appendTail = Promise.resolve();
   // One per agent, so a store can tell a repeated write from another writer's.
   const writerId = crypto.randomUUID();
+  // Pipelined appends and barriers are modeled in `tests/tla/durable/Journal.tla`,
+  // and two processes appending to one log in `tests/tla/durable/Fencing.tla`.
   const journal = persistence && {
-    append(events) {
+    append(events, barrier) {
       const data = encodeJournalRecord(events);
       const lastSeq = events.at(-1)?.seq;
       // A store that tracks turns without reading records asks for marks.
-      const marks = persistence[journalMarksWanted] === true ? { marks: journalMarks(events) } : {};
+      const marks = wantsMarks ? { marks: journalMarks(events) } : {};
       const appended = appendTail.then(async () => {
-        const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, ...marks });
+        const result = await persistence.append({ expected: journalHead, idempotencyKey: `${writerId}:${events[0]?.seq}`, data, barrier, ...marks });
         if (!validCursor(result?.cursor)) throw new TypeError("persistence.append() must resolve to { cursor }");
         journalHead = result.cursor;
         if (Number.isSafeInteger(lastSeq)) appendedSeq = lastSeq;
         bytesSinceCheckpoint += data.byteLength;
+        journalHook("journal.commit", { cursor: result.cursor, firstSeq: Number.isSafeInteger(events[0]?.seq) ? events[0].seq : null, lastSeq: Number.isSafeInteger(lastSeq) ? lastSeq : null, eventCount: events.length });
       });
       // A failed append fails every later one: they would not continue it.
       appendTail = appended;
@@ -2255,17 +2457,27 @@ export async function createFxEngine(options = {}) {
   // ended, so a retried prompt continues or skips its turn.
   let openTurnId = null;
   let lastTurnId = null;
-  // The calls the open turn left running: `{ id, name, arguments }`.
+  // The calls the open turn left running: `{ id, name, arguments }`, and
+  // what the resume tells the model about each one it does not run again.
   let ambiguousCalls = [];
-  // Asks `onAmbiguous` about each of them, once, and returns the ids of the
-  // calls to run again; the resume answers the rest as possibly run.
-  const rerunIds = (onAmbiguous) => {
+  // Asks `onAmbiguous` about each of them, once. Returns the ids of the
+  // calls to run again, and the rest, which the resume answers as possibly
+  // run.
+  const settleAmbiguous = (onAmbiguous) => {
     const calls = ambiguousCalls;
     ambiguousCalls = [];
-    if (onAmbiguous === undefined) return [];
-    return calls
-      .filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun")
-      .map((call) => call.id);
+    const rerun = onAmbiguous === undefined
+      ? []
+      : calls.filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun").map((call) => call.id);
+    return { rerun, answered: calls.filter((call) => !rerun.includes(call.id)) };
+  };
+  // Continues the open turn: the calls it left running run again or are
+  // answered as possibly run, and each answered one ends for the turn's
+  // viewers as it does for the model. Modeled in
+  // `tests/tla/durable/Resumption.tla`.
+  const resumeOpenTurn = (promptOptions) => {
+    const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
+    return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
   };
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
@@ -2289,13 +2501,18 @@ export async function createFxEngine(options = {}) {
   let journalQueue = [];
   let journalFlushScheduled = false;
   const journalPending = new Set();
+  // The append in flight, and whether anyone waits for the events queued
+  // behind it.
+  let journalInFlight = null;
+  let journalBarrier = false;
   let journalFailure = null;
   // Set by `turn.cancel({ reason: "handoff" })`: the journal keeps the open
   // turn for another agent, so this one stores nothing more.
   let handedOff = false;
   const handedOffError = () => new Error("this agent handed its session off; open it again to continue");
   // Input events (`accepted:<id>`, `withdrawn:<id>`) once stored, and the
-  // steer and withdraw calls waiting for them.
+  // steer and withdraw calls waiting for them, which resolve only then
+  // (`tests/tla/durable/Inbox.tla`).
   const durableInputs = new Set();
   const inputWaiters = new Map();
   const waitForInput = (key) => {
@@ -2328,7 +2545,8 @@ export async function createFxEngine(options = {}) {
     journalFailureReported = true;
     return journalFailure;
   };
-  const queueJournalEvents = (events) => {
+  // `barrier`: the core waits for these events before it goes on.
+  const queueJournalEvents = (events, barrier = false) => {
     if (journalFailure || !Array.isArray(events) || events.length === 0) return;
     if (handedOff) {
       // The agent that opens the session next decides about these inputs.
@@ -2339,6 +2557,9 @@ export async function createFxEngine(options = {}) {
       return;
     }
     journalQueue.push(...events);
+    // A caller waits for its steer or withdrawal to be stored, and a turn's
+    // result for the turn's end or yield.
+    if (barrier || events.some((event) => waitedForEvents.has(event?.type))) journalBarrier = true;
     // A turn notes a new config right before its first progress, a barrier:
     // the two go out in one write instead of two in a row.
     if (events.every((event) => event?.type === "session_config")) return;
@@ -2346,15 +2567,20 @@ export async function createFxEngine(options = {}) {
     journalFlushScheduled = true;
     queueMicrotask(flushJournal);
   };
+  // Sends the queued events as one record, unless an append is in flight:
+  // then they wait for it, with any that arrive meanwhile, and go out
+  // together once it lands.
   function flushJournal() {
     journalFlushScheduled = false;
-    if (journalFailure || journalQueue.length === 0) return;
+    if (journalFailure || journalInFlight || journalQueue.length === 0) return;
     const batch = journalQueue;
     journalQueue = [];
-    emit("journal.append", { events: batch.length });
+    const barrier = journalBarrier;
+    journalBarrier = false;
+    emit("journal.append", { events: batch.length, barrier });
     let appended;
     try {
-      appended = Promise.resolve(journal.append(batch));
+      appended = Promise.resolve(journal.append(batch, barrier));
     } catch (error) {
       appended = Promise.reject(error);
     }
@@ -2366,11 +2592,17 @@ export async function createFxEngine(options = {}) {
       if (journalFailure) return;
       journalFailure = journalAppendError(error);
       emit("journal.error", { error: error instanceof Error ? error.name : "Error" });
+      journalHook("journal.error", { error: error instanceof Error ? error.name : "Error", fenced: error?.code === "FX_FENCED" || error?.cause?.code === "FX_FENCED" });
       rejectInputWaiters([...inputWaiters.keys()], journalFailure);
       // Nothing the turn does from here can be saved, and after a fence the
       // session has another owner: stop the turn and its effects now.
       activeTurn?.cancel();
-    }).finally(() => journalPending.delete(settled));
+    }).finally(() => {
+      journalPending.delete(settled);
+      journalInFlight = null;
+      flushJournal();
+    });
+    journalInFlight = settled;
     journalPending.add(settled);
   }
   // The journal's own work, such as a heartbeat, ends with the agent: once,
@@ -2382,6 +2614,8 @@ export async function createFxEngine(options = {}) {
   }
   async function journalSettled() {
     for (;;) {
+      // This caller waits for every event queued so far.
+      if (journalQueue.length > 0) journalBarrier = true;
       if (journalFlushScheduled || journalQueue.length > 0) flushJournal();
       if (journalPending.size === 0) break;
       await Promise.all([...journalPending]);
@@ -2495,9 +2729,36 @@ export async function createFxEngine(options = {}) {
     }
     throw new Error("transport retry exhausted");
   };
+  // A typed tool result's images go in the image store by name before the
+  // result reaches the core, as a prompt's do, so the session's records name
+  // them. The tool has already run, so an image the store refuses is not
+  // lost: it stays in the result, and the records hold it inline.
+  const storedToolContent = async (value) => {
+    const normalized = hostToolContent(value);
+    if (!imageStore || !normalized.images?.some((image) => image.data !== undefined)) return normalized;
+    const stored = new Map();
+    for (const image of normalized.images) {
+      if (image.data === undefined || stored.has(image.data)) continue;
+      let bytes;
+      // Data that is not base64 is the core's to refuse.
+      try { bytes = base64ToBytes(image.data); } catch { continue; }
+      const name = await imageName(bytes);
+      try {
+        await imageStorage.put(name, bytes);
+        stored.set(image.data, name);
+      } catch {
+        // Not stored: the result keeps the image, and the records hold it
+        // inline.
+      }
+    }
+    return stored.size ? hostToolContent(value, stored) : normalized;
+  };
   const executeHostTool = async (name, input, requestedSessionId, toolCallId) => {
     const execute = hostTools.executors.get(name);
-    const turn = requestedSessionId === undefined || requestedSessionId === sessionId
+    const issuerSessionId = requestedSessionId ?? sessionId;
+    const scope = hookScopes.get(`${issuerSessionId}:${toolCallId}`);
+    // Hook metadata is not authority to execute a foreign session's tool.
+    const turn = issuerSessionId === sessionId
       ? activeTurn
       : null;
     if (!isCurrentTurn(turn)) return { content: "", isError: true, cancelled: true };
@@ -2518,13 +2779,14 @@ export async function createFxEngine(options = {}) {
         return execute(input, {
           signal: controller.signal,
           executionId: String(toolCallId ?? ""),
-          sessionId,
+          sessionId: issuerSessionId,
+          ...(options.hooks && scope ? { observation: toolObservation(scope, String(toolCallId), options.hooks, hook, controller.signal) } : {}),
           ...(options.toolContext === undefined ? {} : { context: options.toolContext }),
         });
       });
       const value = await Promise.race([execution, aborted]);
       if (!controller.signal.aborted) {
-        const normalized = hostToolContent(value);
+        const normalized = await storedToolContent(value);
         content = normalized.content;
         rich = normalized.rich;
         isError = normalized.isError === true;
@@ -2533,7 +2795,7 @@ export async function createFxEngine(options = {}) {
       isError = true;
       if (error?.toolResult?.type === "libfx.tool-result") {
         try {
-          const normalized = hostToolContent(error.toolResult);
+          const normalized = await storedToolContent(error.toolResult);
           content = normalized.content;
           rich = normalized.rich;
         } catch {
@@ -2612,12 +2874,31 @@ export async function createFxEngine(options = {}) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
-  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined) => {
+  // Stores each prompt image in the persistence's image store, by name,
+  // before the prompt that carries it is sent: nothing the core writes may
+  // name an image the store does not hold. Returns the blocks with their
+  // names, or null when the prompt stopped meanwhile.
+  async function storePromptImages(blocks, stopped) {
+    const named = [];
+    for (const block of blocks) {
+      if (block.type !== "image" || block.bytes === undefined) {
+        named.push(block);
+        continue;
+      }
+      const name = await imageName(block.bytes);
+      if (stopped()) return null;
+      await imageStorage.put(name, block.bytes);
+      if (stopped()) return null;
+      named.push({ ...block, stored: name });
+    }
+    return named;
+  }
+  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
     const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
     if (resuming) {
-      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(rerun.length ? { rerun } : {}), ...stopAt } } });
+      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(outputShown ? {} : { freshOutput: true }), ...(rerun.length ? { rerun } : {}), ...stopAt } } });
     }
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
@@ -2626,18 +2907,20 @@ export async function createFxEngine(options = {}) {
       type: "image",
       mimeType: block.mimeType,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
-      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++] } } }),
+      // An image the store holds carries its name, so the core names it too.
+      ...(block.bytes === undefined ? {} : { _meta: { fx: { attachment: ids[next++], ...(block.stored === undefined ? {} : { stored: block.stored }) } } }),
     });
     // A follow-up's turn places it; the core records it as accepted first
     // when the host could not. A journaled turn's first progress records its id.
     const fx = {
       ...(followUp ? { inputId: followUp.id, inputAccepted: followUp.accepted } : {}),
-      ...(journal && turnId ? { turnId } : {}),
+      ...((journal || options.hooks) && turnId ? { turnId } : {}),
       ...stopAt,
     };
     return request("session/prompt", { sessionId, prompt, ...(Object.keys(fx).length ? { _meta: { fx } } : {}) });
   };
   runtime.exited.then((code) => {
+    hookScopes.clear();
     closing = true;
     // An agent whose core exited writes nothing more.
     if (journal) void closeJournal().catch(() => {});
@@ -2649,10 +2932,17 @@ export async function createFxEngine(options = {}) {
     emit("runtime.exit", { code });
   });
   runtime.setLineHandler((message, size) => {
+    if (message.method === "libfx/hook") {
+      if (message.params?.rootSessionId === sessionId && message.params?.version === 1) {
+        if (message.params.type === "turn.end" && handedOff) message.params.data.handoff = true;
+        hook(message.params);
+      }
+      return;
+    }
     emit("acp.receive", { message });
     if (message.method === "libfx/journal_append") {
       if (journal && message.params?.sessionId === sessionId) {
-        queueJournalEvents(message.params.events);
+        queueJournalEvents(message.params.events, message.params.barrier === true);
       }
       return;
     }
@@ -2720,33 +3010,78 @@ export async function createFxEngine(options = {}) {
 
     const loaded = persistence ? await loadPersistence(persistence) : null;
     const requestedSessionId = options.sessionId ?? null;
-    const sessionResult = await request("libfx/new", requestedSessionId === null ? {} : { sessionId: requestedSessionId });
+    const sessionResult = await request("libfx/new", {
+      ...(requestedSessionId === null ? {} : { sessionId: requestedSessionId }),
+      ...(options.hooks ? { hooks: { captureContent: options.hooks.captureContent === true } } : {}),
+    });
     sessionId = sessionResult.sessionId;
+    if (options.hooks && sessionResult?._meta?.fx?.hooksVersion !== 1) throw new Error("Semantic hooks require a matching libfx core with hooks version 1");
     if (initialCheckpoint) {
       const [checkpointAttachment] = attachBytes([initialCheckpoint]);
-      const restored = await request("libfx/restore", { sessionId, checkpointAttachment });
+      const restored = await request("libfx/restore", { sessionId, checkpointAttachment }).catch((error) => {
+        if (/newer fx/.test(error?.message ?? "")) throw new FxJournalVersionError(error.message);
+        throw error;
+      });
       compareCheckpointMeta(restored?.checkpointMeta);
     }
     if (journal) {
       const { events, checkpoint } = loaded;
-      const params = { sessionId, ...(options.inputsDurable === true ? { inputsDurable: true } : {}) };
-      // One call: attaching again would drop the first attachment.
-      const attachments = [];
-      if (events.length > 0) {
-        const bytes = encoder.encode(JSON.stringify(withoutSupersededProgress(events)));
-        if (bytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
-        attachments.push(["journalAttachment", bytes]);
-      }
-      if (checkpoint) attachments.push(["snapshotAttachment", checkpoint]);
-      const ids = attachments.length ? attachBytes(attachments.map(([, bytes]) => bytes)) : [];
-      attachments.forEach(([name], index) => { params[name] = ids[index]; });
-      const opened = await request("libfx/journal_open", params).catch((error) => {
+      const journalBytes = events.length > 0 ? encoder.encode(JSON.stringify(withoutSupersededProgress(events))) : null;
+      if (journalBytes && journalBytes.byteLength > maxJournalBytes) throw journalLoadError("libfx journal is too large", "FX_JOURNAL_TOO_LARGE");
+      const openFailed = (error) => {
         const message = error?.message ?? "";
         if (/newer fx/.test(message)) throw new FxJournalVersionError(message);
         const code = journalOpenErrorCodes.get(message);
         if (code) throw journalLoadError(message, code, error);
         throw error;
-      });
+      };
+      const openOnce = () => {
+        const params = {
+          sessionId,
+          ...(options.inputsDurable === true ? { inputsDurable: true } : {}),
+          ...(imageStore ? { imageStore: true } : {}),
+          ...(imageStore && options[imageWindowLimits] ? { imageWindow: options[imageWindowLimits] } : {}),
+        };
+        // One call: attaching again would drop the first attachment.
+        const attachments = [];
+        if (journalBytes) attachments.push(["journalAttachment", journalBytes]);
+        if (checkpoint) attachments.push(["snapshotAttachment", checkpoint]);
+        const ids = attachments.length ? attachBytes(attachments.map(([, bytes]) => bytes)) : [];
+        attachments.forEach(([name], index) => { params[name] = ids[index]; });
+        return request("libfx/journal_open", params).catch(openFailed);
+      };
+      // Stages the images a history names, read from the store, in batches
+      // the attachment table holds. A store that lacks one fails the open:
+      // the history without it is not the one saved.
+      const stageImages = async (names) => {
+        let batch = [];
+        let batchBytes = 0;
+        const flush = async () => {
+          if (batch.length === 0) return;
+          const ids = attachBytes(batch.map(({ bytes }) => bytes));
+          const images = batch.map(({ name }, index) => ({ name, attachment: ids[index] }));
+          batch = [];
+          batchBytes = 0;
+          await request("libfx/journal_images", { sessionId, images }).catch(openFailed);
+        };
+        for (const name of new Set(names.map(String))) {
+          const stored = imageStore ? await imageStorage.get(name) : undefined;
+          if (stored === undefined || stored === null) throw imageMissingError(name);
+          const bytes = persistenceBytes(stored, "an image the image store returns");
+          if (batch.length === maxPendingAttachments || batchBytes + bytes.byteLength > maxPendingAttachmentBytes) await flush();
+          batch.push({ name, bytes });
+          batchBytes += bytes.byteLength;
+        }
+        await flush();
+      };
+      // A history that names images opens once they are staged from the
+      // store: the core answers with the names it needs, all at once.
+      let opened = await openOnce();
+      if (Array.isArray(opened?.imagesNeeded)) {
+        await stageImages(opened.imagesNeeded);
+        opened = await openOnce();
+        if (Array.isArray(opened?.imagesNeeded)) throw imageMissingError(String(opened.imagesNeeded[0]));
+      }
       compareCheckpointMeta(opened?.checkpointMeta);
       resumable = opened?.resumable === true;
       openTurnId = resumable && validTurnId(opened?.openTurnId) ? opened.openTurnId : null;
@@ -2762,6 +3097,7 @@ export async function createFxEngine(options = {}) {
         followUps.push({ id: held.id, text: held.text, accepted: true, held: true });
       }
       emit("journal.open", { events: events.length, checkpoint: checkpoint !== null, turns: opened?.turns, resumable });
+      journalHook("journal.restore", { cursor: loaded.head, lastSeq: loaded.lastSeq, resumable, openTurnId, lastTurnId });
     }
   } catch (error) {
     closing = true;
@@ -2816,7 +3152,7 @@ export async function createFxEngine(options = {}) {
       if (turnId !== undefined && journal) {
         if (resumable && turnId === openTurnId) {
           resumable = false;
-          return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+          return resumeOpenTurn(promptOptions);
         }
         if (turnId === lastTurnId) return endedTurn(turnId);
       }
@@ -2840,7 +3176,7 @@ export async function createFxEngine(options = {}) {
       checkOnAmbiguous(promptOptions.onAmbiguous);
       if (resumable) {
         resumable = false;
-        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+        return resumeOpenTurn(promptOptions);
       }
       // With no open turn, the follow-ups the journal held are the work left.
       const next = followUps.find((entry) => entry.held);
@@ -2914,6 +3250,7 @@ export async function createFxEngine(options = {}) {
       return run;
     },
     async close() {
+      hookScopes.clear();
       if (closing) {
         await runtime.exited;
         if (journal) await closeJournal();
@@ -2944,7 +3281,9 @@ export async function createFxEngine(options = {}) {
   };
   return agent;
 
-  function normalizeTurn(rawTurn) {
+  // `answered`: calls a resumed turn answers as possibly run before it goes
+  // on, whose `tool_end` comes first.
+  function normalizeTurn(rawTurn, answered = []) {
     const toolNames = new Map();
     const started = new Set();
     const eventFor = (update) => {
@@ -2958,7 +3297,9 @@ export async function createFxEngine(options = {}) {
         return delta ? { type: "reasoning_delta", delta } : null;
       }
       if (update.sessionUpdate === "user_message_chunk" && update.content?.type === "text") {
-        return { type: "user_message", text: update.content.text };
+        // A steer shows where it joined the turn, with the id it was sent with.
+        const id = update._meta?.fx?.steering?.inputId;
+        return { type: "user_message", text: update.content.text, ...(typeof id === "string" ? { id } : {}) };
       }
       if (update.sessionUpdate === "tool_call") {
         toolNames.set(update.toolCallId, update.name || update.toolName || update.title || "tool");
@@ -2997,8 +3338,12 @@ export async function createFxEngine(options = {}) {
         return rawTurn.steer(normalizeSteeringInput(input), id);
       },
       withdraw(id) { return rawTurn.withdraw(id); },
+      [engineInternals]: rawTurn[engineInternals],
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
+          for (const call of answered) {
+            yield { type: "tool_end", id: call.id, name: call.name, content: unfinishedToolOutput, isError: true };
+          }
           for await (const update of rawTurn) {
             const event = eventFor(update);
             if (event) yield event;
@@ -3052,13 +3397,12 @@ export async function createFxEngine(options = {}) {
     const resizeImage = options.resizeImage;
     const resuming = promptOptions[resumeTurn] === true;
     const followUp = promptOptions[followUpInput] ?? null;
-    const normalized = resuming ? [] : normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const normalized = resuming ? [] : checkPromptInput(input, { resizeImage });
     const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
-    // Blob reads and resizeImage run before the prompt frame is sent.
-    const asyncImages = hasPixels && (resizeImage !== undefined ||
+    // Blob reads, resizeImage and storing images run before the prompt
+    // frame is sent.
+    const asyncImages = hasPixels && (resizeImage !== undefined || imageStore ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    // resizeImage decides the final image sizes, so they are counted after it runs.
-    checkPromptFrameSize(normalized, resizeImage === undefined);
     // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)
@@ -3102,11 +3446,8 @@ export async function createFxEngine(options = {}) {
           const accepted = () => (journal ? waitForInput(`accepted:${id}`) : Promise.resolve());
           if (typeof runtime.steer === "function") {
             runtime.steer(text, id);
-            void turn.push({
-              sessionUpdate: "user_message_chunk",
-              content: { type: "text", text },
-            });
-            // The web core accepts it when it takes it at the next boundary.
+            // The web core accepts it when it takes it at the next boundary,
+            // and shows where it joined the turn then.
             return accepted().then(() => ({ id }), (error) => (error?.code === "FX_STEER_WITHDRAWN" ? { id, withdrawn: true } : Promise.reject(error)));
           }
           return request("libfx/steer", { sessionId, text, id }).then(accepted).then(() => ({ id }));
@@ -3189,6 +3530,23 @@ export async function createFxEngine(options = {}) {
           return "withdrawn";
         });
       },
+      // For libfx's session worker: a steer that cannot join the turn, such
+      // as one with images, ends the turn at its next safe point, at once
+      // while the model streams a reply, so that steer can run next.
+      [engineInternals]: {
+        endForSteer() {
+          const send = () => {
+            if (finished || cancelled || activeTurn !== turn || closing) return undefined;
+            if (typeof runtime.handOffSteering === "function") {
+              runtime.handOffSteering();
+              return undefined;
+            }
+            return request("libfx/handoff", { sessionId }).then(() => undefined);
+          };
+          const sent = promptStarted && resolvePromptStart ? promptStarted.then((started) => (started === true ? send() : undefined)) : Promise.resolve().then(send);
+          return sent.catch(() => {});
+        },
+      },
       cancel(cancelOptions = {}) {
         const reason = cancelOptions?.reason;
         if (reason !== undefined && reason !== "handoff") throw new TypeError('cancel() reason must be "handoff" when given');
@@ -3249,8 +3607,11 @@ export async function createFxEngine(options = {}) {
     }) : null;
     let response;
     if (asyncImages) {
+      const stopped = () => cancelled || closing;
       response = Promise.race([
-        Promise.resolve().then(() => materializePromptImages(prompt, () => cancelled || closing, resizeImage)),
+        Promise.resolve()
+          .then(() => materializePromptImages(prompt, stopped, resizeImage))
+          .then((prepared) => prepared && imageStore ? storePromptImages(prepared, stopped) : prepared),
         imagePrepCancelled,
       ]).then((prepared) => {
         cancelImagePrep = null;
@@ -3264,12 +3625,15 @@ export async function createFxEngine(options = {}) {
         return sendPrompt(prepared, false, followUp, turn.id, [], yieldAt);
       });
     } else {
-      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt, promptOptions[resumeOutputShown] === true); } catch (error) { response = Promise.reject(error); }
     }
-    // Appends after a turn's first progress are lazy, so the result does not
-    // wait for them; `close()` does. A failure already seen fails the turn.
+    // Appends after a turn's first progress are lazy, so the turn runs ahead
+    // of them, but its result waits until every record it wrote is stored:
+    // a turn counts as done only once its end is durable, and a failure
+    // among those records fails the turn.
     turn.result = response
-      .then((value) => {
+      .then(async (value) => {
+        if (journal) await journalSettled().catch(() => {});
         if (journalFailure) throw reportJournalFailure();
         if (value.stopReason === "yielded" && !cancelled) {
           // The core keeps the turn open: `resume()` continues it here, or

@@ -39,6 +39,7 @@ import {
   type FooterBlock,
 } from "./tui-render-assertions";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import { logLines, onlySessionId, sessionDir } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -1992,7 +1993,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
-      await session.sendText("/status");
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 10_000);
       await session.waitForStableComposer(10_000);
       await assertRows(tailCount);
       await session.sendText("/quit");
@@ -2168,11 +2170,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const traceOffset = readFileSync(tracePath, "utf8").length;
           writeFileSync(releasePath, "go");
           if (viewerCols) {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
+            const eventsPath = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
             // The main composer and text tail are hidden. Wait for the actual saved
             // assistant and its following completion record, not a viewer repaint.
             await session.waitForPane((pane) => {
@@ -2182,10 +2180,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
               // A concurrent append may end mid-record; only parse terminated lines.
               const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
               const assistantIndex = records.findIndex(record =>
-                record.event.assistant?.text === laterResponse
+                record.kind === "item" && record.type === "assistant" && record.data?.text === laterResponse
               );
               const completed = assistantIndex >= 0 && records.slice(assistantIndex + 1)
-                .some(record => record.event.turn_completed !== undefined);
+                .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
                 existsSync(join(workspace, "sibling-finished")) &&
@@ -2237,11 +2235,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expect(gateway.requests).toHaveLength(4);
           });
           check("native history after output", () => expectHistory(afterOutput, true));
-          await session.sendText("/status");
-          await session.waitForText("agent_step_limit=", 10_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 10_000);
           await session.waitForStableComposer(10_000);
-          const afterStatus = await capture("after-status");
-          check("native history after status", () => expectHistory(afterStatus, true));
+          const afterNotice = await capture("after-notice");
+          check("native history after a local notice", () => expectHistory(afterNotice, true));
           if (!pressure) check("control never prunes", () => {
             expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
           });
@@ -2252,14 +2250,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expectEmptyStderr(stderrPath);
           });
           check("persisted assistant paragraphs", () => {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const events = readFileSync(join(sessionsRoot, ids[0]!, "events.jsonl"), "utf8")
-              .trim().split("\n").map(line => JSON.parse(line));
-            const responses = events.filter(record => record.event.assistant !== undefined)
-              .map(record => record.event.assistant.text);
+            const responses = logLines(home, onlySessionId(home))
+              .filter((line: any) => line.kind === "item" && line.type === "assistant")
+              .map((line: any) => line.data.text);
             expect(responses).toEqual([oldResponse, laterResponse]);
           });
           check("recording replay", () => {
@@ -3192,7 +3185,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 36 · type to filter");
+      expect(shrinkStage).toContain("Commands 38 · type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -3371,14 +3364,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     },
     {
       issue: "FXC-125",
-      label: "cost",
+      label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "not signed in to AI Gateway",
       editedInput: "x",
       async openSurface(active) {
-        await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.sendText("/usage");
+        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -4169,11 +4162,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 38", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 36");
+      expect(grid.join("\n")).toContain("Commands 38");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -4191,7 +4184,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 38", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -4199,7 +4192,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 36");
+        expect(grid.join("\n")).toContain("Commands 38");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -4217,7 +4210,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/di v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 36");
+      expect(restored).not.toContain("Commands 38");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -4749,7 +4742,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 36", 5_000);
+        await session.waitForText("Commands 38", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4763,7 +4756,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 36");
+        expect(scrollback).not.toContain("Commands 38");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 
@@ -4893,8 +4886,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const lightReplayStart = stdoutAfterLightTheme.lastIndexOf("\x1b[3J");
       expect(lightReplayStart).toBeGreaterThanOrEqual(0);
       const lightReplayAndTail = stdoutAfterLightTheme.slice(lightReplayStart);
-      expect(lightReplayAndTail).toContain("\x1b[38;5;247m");
-      expect(lightReplayAndTail).not.toContain("\x1b[38;5;245m");
+      expect(lightReplayAndTail).toContain(`\x1b[38;5;235m${inlineMarker}`);
+      expect(lightReplayAndTail).not.toContain(`\x1b[38;5;255m${inlineMarker}`);
       const resetCountAfter = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
         "\x1b[3J",

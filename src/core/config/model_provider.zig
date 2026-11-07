@@ -102,11 +102,8 @@ pub const NameKey = struct {
 };
 
 /// Default model served when the OpenPaths provider is active and the user has
-/// not chosen one. The stealth route is only served to a caller that
-/// authenticated with `OPENROUTER_API_KEY`; an OpenPaths key resolves to a
-/// catalog without this id, so the route is chosen by the credential rather
-/// than by the provider name.
-pub const openpaths_default_model = "stealth/space-bunny-alpha";
+/// not chosen one. The retired stealth routes are no longer the default.
+pub const openpaths_default_model = "deepseek/deepseek-v4-flash";
 
 pub fn openpathsDefaultModel() []const u8 {
     return openpaths_default_model;
@@ -234,9 +231,9 @@ fn hasNonEmptyEnv(name: []const u8) bool {
     const value = io_mod.getenv(name) orelse return false;
     return std.mem.trim(u8, value, " \t\r\n").len != 0;
 }
-test "the compiled default model is the stealth space bunny id" {
-    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpaths_default_model);
-    try std.testing.expectEqualStrings("stealth/space-bunny-alpha", openpathsDefaultModel());
+test "the compiled default model is deepseek flash" {
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", openpaths_default_model);
+    try std.testing.expectEqualStrings("deepseek/deepseek-v4-flash", openpathsDefaultModel());
 }
 
 test "an unconfigured provider falls back to the compiled default" {

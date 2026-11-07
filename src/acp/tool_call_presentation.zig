@@ -10,7 +10,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const builtin_tools = @import("../builtins/tools.zig");
 const host_target = @import("../core/hosts/target.zig");
 const types = @import("../core/shared/types.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -40,8 +40,13 @@ pub fn mapToolKind(tool_name: []const u8) acp_types.ToolCallKind {
 }
 
 pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, call: ToolCall) ![]const u8 {
-    if (registry.lookup(call.name) != null) {
+    if (registry.lookup(call.name)) |tool| {
         if (try tool_presentation.formatSubagentPlainAction(arena, call, .identity)) |title| return title;
+        // A read's input is an opaque handle, so its verb alone says nothing
+        // about what it reads.
+        if (tool.executor_kind == .read_tool_result) {
+            return tool_presentation.formatPlainAction(arena, .{ .tool_registry = registry, .call = call });
+        }
     }
     if (tool_presentation.isProviderSearchAlias(call.name)) {
         return tool_presentation.formatPlainAction(arena, .{
@@ -50,9 +55,9 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         });
     }
     if (tool_dispatch.toolCallPresentation(arena, registry, call)) |presentation| {
-        return std.fmt.allocPrint(arena, "{s}", .{presentation.action_label});
+        return arena.print("{s}", .{presentation.action_label});
     }
-    return std.fmt.allocPrint(arena, "{s}", .{call.name});
+    return arena.print("{s}", .{call.name});
 }
 
 pub const ToolCallPresentation = struct {
@@ -67,7 +72,7 @@ pub fn describeToolCall(
     registry: tool_dispatch.Registry,
     arena: Allocator,
     call: ToolCall,
-    mcp_identity: ?mcp_runtime.McpRuntime.ToolIdentity,
+    mcp_identity: ?catalog_state.ToolIdentity,
 ) ToolCallPresentation {
     if (registry.lookup(call.name)) |tool| {
         return .{
@@ -94,20 +99,54 @@ pub fn activeToolRegistry(state: *const server.ServerState) tool_dispatch.Regist
     return activeToolSet(state).registry;
 }
 
-/// Returns the shell snapshot fallback notice that a shell result carries as
-/// its last field, unescaped into `buffer`. Command output is a JSON string,
-/// so an unescaped `,"notice":` key can only be the result's own field.
-pub fn shellResultNotice(output: []const u8, buffer: []u8) ?[]const u8 {
-    const key = ",\"notice\":";
-    if (output.len == 0 or output[output.len - 1] != '}') return null;
-    const start = std.mem.findLast(u8, output, key) orelse return null;
-    var fixed: std.heap.FixedBufferAllocator = .init(buffer);
-    return std.json.parseFromSliceLeaky(
-        []const u8,
-        fixed.allocator(),
-        output[start + key.len .. output.len - 1],
-        .{},
-    ) catch null;
+/// The fields of a shell result (`formatSnapshotRaw` in
+/// src/tools/shell/shell.zig) that a finished call's update shows.
+const ShellResultView = struct {
+    state: []const u8,
+    output_delta: []const u8,
+    output_truncated: bool = false,
+    notice: ?[]const u8 = null,
+};
+
+const shell_output_cut_marker = "... output truncated ...";
+
+/// Content for a finished `shell` call's tool_call_update, live or replayed.
+/// The model receives a JSON result, but the client is shown what the command
+/// printed: the snapshot fallback notice on its own line when the result
+/// carries one, then the output under the same preview contract as other
+/// tools, marked when the preview or the shell cut it. Returns null unless
+/// `tool_name` is `shell` and `output` is a shell result, so the caller keeps
+/// the generic preview. Caller owns the returned text.
+pub fn shellUpdateContentText(
+    alloc: Allocator,
+    tool_name: []const u8,
+    output: []const u8,
+) Allocator.Error!?[]u8 {
+    if (!std.mem.eql(u8, tool_name, "shell")) return null;
+    const parsed = std.json.parseFromSlice(
+        ShellResultView,
+        alloc,
+        output,
+        .{ .ignore_unknown_fields = true },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+    const view = parsed.value;
+    const preview = toolUpdateContentText(false, view.output_delta);
+    // The preview is a prefix of the output unless the output was replaced by
+    // the unsafe-bytes notice, which is never marked as cut.
+    const cut = preview.ptr == view.output_delta.ptr and
+        (view.output_truncated or preview.len < view.output_delta.len);
+    const marker_break: []const u8 = if (cut and preview.len > 0 and preview[preview.len - 1] != '\n') "\n" else "";
+    return try std.mem.concat(alloc, u8, &.{
+        view.notice orelse "",
+        if (view.notice != null) "\n" else "",
+        preview,
+        marker_break,
+        if (cut) shell_output_cut_marker else "",
+    });
 }
 
 /// Applies the live path's tool_call_update content contract: unsafe bytes are
@@ -163,8 +202,27 @@ test "describeToolCall flags internal discovery and names MCP identity" {
     try std.testing.expect(!titled.meta.internal);
 }
 
+test "read titles say what they read while other tools keep their verb" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const registry = builtin_tools.registry;
+    const read: ToolCall = .{
+        .id = "read",
+        .name = "read_tool_result",
+        .arguments_json = "{\"request\":{\"handle\":\"fx-command-replay-0123.bin\",\"query\":\"error:\"}}",
+        .resolved_display_target = "zig build test output for \"error:\"",
+    };
+    try std.testing.expectEqualStrings("Searching zig build test output for \"error:\"", describeToolCall(registry, arena, read, null).title);
+    var unresolved = read;
+    unresolved.resolved_display_target = null;
+    try std.testing.expectEqualStrings("Searching command output", describeToolCall(registry, arena, unresolved, null).title);
+    const file: ToolCall = .{ .id = "file", .name = "read_file", .arguments_json = "{\"path\":\"a.txt\"}" };
+    try std.testing.expectEqualStrings("Reading", describeToolCall(registry, arena, file, null).title);
+}
+
 test "toolUpdateContentText clips long output and guards unsafe bytes" {
-    const long = "x" ** 500;
+    const long = text_utils.repeat("x", 500);
     const clipped = toolUpdateContentText(false, long);
     try std.testing.expectEqual(@as(usize, 200), clipped.len);
 
@@ -176,19 +234,69 @@ test "toolUpdateContentText clips long output and guards unsafe bytes" {
     try std.testing.expectEqualStrings(denied_json, denied);
 }
 
-test "shell result notice is read only from the result's own field" {
-    var buffer: [512]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "shell snapshot unavailable (x); startup files run for every command",
-        shellResultNotice(
-            "{\"state\":\"completed\",\"notice\":\"shell snapshot unavailable (x); startup files run for every command\"}",
-            &buffer,
-        ).?,
+fn expectShellUpdateContent(expected: ?[]const u8, tool_name: []const u8, output: []const u8) !void {
+    const actual = try shellUpdateContentText(std.testing.allocator, tool_name, output);
+    defer if (actual) |text| std.testing.allocator.free(text);
+    if (expected) |text| {
+        try std.testing.expectEqualStrings(text, actual orelse return error.TestExpectedShellContent);
+    } else {
+        try std.testing.expect(actual == null);
+    }
+}
+
+test "shell update content shows the command output instead of the result JSON" {
+    try expectShellUpdateContent(
+        "hello-42\n",
+        "shell",
+        "{\"session_id\":null,\"state\":\"completed\",\"output_truncated\":false,\"full_output_handle\":\"fx-command-replay-1.bin\",\"exit_code\":0,\"error\":null,\"output_delta\":\"hello-42\\n\"}",
     );
-    // Output that merely prints the key stays escaped inside its string.
-    try std.testing.expect(shellResultNotice(
-        "{\"output_delta\":\",\\\"notice\\\":\\\"x\\\"\"}",
-        &buffer,
-    ) == null);
-    try std.testing.expect(shellResultNotice("shell result is unavailable", &buffer) == null);
+    try expectShellUpdateContent(
+        "",
+        "shell",
+        "{\"state\":\"completed\",\"output_truncated\":false,\"exit_code\":4,\"output_delta\":\"\"}",
+    );
+    try expectShellUpdateContent(
+        "shell snapshot unavailable (x); startup files run for every command\nhello\n",
+        "shell",
+        "{\"state\":\"completed\",\"output_delta\":\"hello\\n\",\"notice\":\"shell snapshot unavailable (x); startup files run for every command\"}",
+    );
+    // Output that merely prints the notice key is output, not a notice.
+    try expectShellUpdateContent(
+        ",\"notice\":\"x\"",
+        "shell",
+        "{\"state\":\"completed\",\"output_delta\":\",\\\"notice\\\":\\\"x\\\"\"}",
+    );
+}
+
+test "shell update content keeps the preview bound and marks cut output" {
+    const long = text_utils.repeat("x", 500);
+    try expectShellUpdateContent(
+        text_utils.repeat("x", 200) ++ "\n" ++ shell_output_cut_marker,
+        "shell",
+        "{\"state\":\"completed\",\"output_truncated\":false,\"output_delta\":\"" ++ long ++ "\"}",
+    );
+    // The shell already cut the output before the model saw it.
+    try expectShellUpdateContent(
+        "tail\n" ++ shell_output_cut_marker,
+        "shell",
+        "{\"state\":\"completed\",\"output_truncated\":true,\"output_delta\":\"tail\\n\"}",
+    );
+    try expectShellUpdateContent(
+        "binary or non-utf8 tool output omitted",
+        "shell",
+        "{\"state\":\"completed\",\"output_truncated\":true,\"output_delta\":\"ok\\u0000binary\"}",
+    );
+}
+
+test "shell update content leaves other results to the generic preview" {
+    const result = "{\"state\":\"completed\",\"output_delta\":\"hello\\n\"}";
+    try expectShellUpdateContent(null, "read_file", result);
+    try expectShellUpdateContent(null, "shell", "{\"exit_code\":0}");
+    try expectShellUpdateContent(
+        null,
+        "shell",
+        "{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":\"shell\",\"message\":\"Permission denied by user\"}}",
+    );
+    try expectShellUpdateContent(null, "shell", "{\"state\":\"completed\",\"output_delta\":\"cut mid-str");
+    try expectShellUpdateContent(null, "shell", "shell result is unavailable");
 }

@@ -254,7 +254,7 @@ pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLeas
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| blk: {
-            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
@@ -307,10 +307,13 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, null, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -322,7 +325,9 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -338,7 +343,12 @@ pub fn streamPrepared(
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    return completeFromStream(alloc, request, response.reader(&transfer_buffer));
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
 }
 
 /// Parses one successful Codex event stream into a completion with its
@@ -347,9 +357,10 @@ pub fn completeFromStream(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
 ) !stream_provider.Result {
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
@@ -360,6 +371,7 @@ pub fn completeFromStream(
         request.cancel_flag,
         request.content_capture_limit,
         .{},
+        progress,
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -368,22 +380,8 @@ pub fn completeFromStream(
         } };
         owned.deinit(alloc);
     }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .codex,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .codex };
-    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
 }
@@ -436,10 +434,11 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: CodexLimits,
+    progress: ?sse_stream.Progress,
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -782,6 +781,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         .{},
+        null,
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -818,6 +818,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         &cancelled,
         null,
         limits,
+        null,
     );
 }
 
@@ -944,4 +945,79 @@ test "OpenAI Codex rejects a 129th streamed tool call" {
     } else |err| {
         try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
     }
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    // Each output item has its own index. Its closing `output_item.done`
+    // event is optional, and when sent it repeats the complete text.
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    var index: usize = 0;
+    if (reasoning.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"reasoning\"}}}}\n\n", .{index});
+        for (try reasoning.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}}}\n\n", .{index});
+        }
+        index += 1;
+    }
+    if (content.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"message\"}}}}\n\n", .{index});
+        for (try content.pieces(arena)) |piece| {
+            if (smith.boolWeighted(1, 7)) try wire.writeAll(": ping\n\n");
+            try wire.print("data: {{\"type\":\"response.output_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{f}}}]}}}}\n\n", .{ index, std.json.fmt(content.text.items, .{}) });
+        }
+        index += 1;
+    }
+    if (with_tool) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}}}\n\n", .{index});
+        for (try arguments.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":{f}}}}}\n\n", .{ index, std.json.fmt(arguments.text.items, .{}) });
+        }
+    }
+    try wire.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n");
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null);
+    defer {
+        if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+        if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+    }
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call_1", arguments.text.items);
+}
+
+test "Responses streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
+    });
 }

@@ -68,7 +68,7 @@ fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
     if (stage.tokens.items.len == 0 or stage.tokens.items[0].span.raw_start != prefix_len) return false;
 
     const remaining = stage.replacement.items.len - prefix_len;
-    std.mem.copyForwards(u8, stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
+    @memmove(stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
     stage.replacement.items.len = remaining;
     for (stage.tokens.items) |*token| {
         token.span.raw_start -= prefix_len;
@@ -166,33 +166,44 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn settlePasteDeliveryEpoch(app: *App, max_input_len: usize) !bool {
-            switch (app.input_runtime.paste.settleDeliveryEpoch()) {
+            const finish = switch (app.input_runtime.paste.settleDeliveryEpoch()) {
                 .none => return false,
-                .finish => {
-                    debug_trace.logf(
-                        "input",
-                        "paste end owner={s} bytes={d}",
-                        .{ @tagName(app.input_runtime.paste.owner), app.input_runtime.paste.byteCount() },
-                    );
-                    try finishPaste(app, max_input_len);
-                },
-                .reject => {
-                    const owner = app.input_runtime.paste.owner;
-                    const render_reason: render_request.Reason = switch (owner) {
-                        .composer => .footer,
-                        .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none, .auth_code => .footer,
-                    };
-                    app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
-                    app.shell.render_requests.request(render_reason);
-                    try app.writeDomainNotice(.{
-                        .topic = "input",
-                        .tone = .@"error",
-                        .body = "Paste was not applied because extra input followed its end marker.",
-                    }, true);
-                },
+                .finish => |finish| finish,
+            };
+            const owner = app.input_runtime.paste.owner;
+            debug_trace.logf(
+                "input",
+                "paste end owner={s} bytes={d}",
+                .{ @tagName(owner), app.input_runtime.paste.byteCount() },
+            );
+            // The paste is kept, but input that followed its end marker in the
+            // same delivery never runs: it may be clipboard content after an
+            // end marker embedded in the paste.
+            if (finish.dropped_suffix_bytes > 0) {
+                debug_trace.logf(
+                    "input",
+                    "paste suffix dropped owner={s} bytes={d} reason=same_delivery_as_end_marker",
+                    .{ @tagName(owner), finish.dropped_suffix_bytes },
+                );
+            }
+            try finishPaste(app, max_input_len);
+            if (finish.dropped_suffix_bytes > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "input",
+                    .tone = .warning,
+                    .body = "Input that arrived right after the paste was ignored.",
+                }, true);
             }
             return true;
+        }
+
+        /// Resets the paste after `owner` failed to take it and returns `err`.
+        fn failPaste(app: *App, owner: paste_framing.Owner, err: anytype) @TypeOf(err) {
+            app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
+                .owner = owner,
+                .error_name = @errorName(err),
+            } });
+            return err;
         }
 
         pub fn finishPaste(app: *App, max_input_len: usize) !void {
@@ -259,15 +270,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .decision_prompt => app.input_runtime.paste.resetWithTrace(.decision_prompt_active),
                 .question_freeform => {
                     if (comptime @hasField(App, "question_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .question_freeform,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.question_prompt.insertFreeformSlice(
+                        const outcome = app.question_prompt.insertFreeformSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .question_freeform, err);
+                        switch (outcome) {
                             .inserted => {
                                 app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                                 app.input_runtime.paste.finishHandled();
@@ -277,7 +285,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .question_freeform });
-                                try input_limit_feedback.report(App, app, .question_freeform, attempted_bytes);
+                                input_limit_feedback.report(App, app, .question_freeform, attempted_bytes) catch |err|
+                                    return failPaste(app, .question_freeform, err);
                             },
                         }
                     } else {
@@ -298,15 +307,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 },
                 .approval_amendment => {
                     if (comptime @hasField(App, "approval_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .approval_amendment,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.approval_prompt.decision.insertAmendmentSlice(
+                        const outcome = app.approval_prompt.decision.insertAmendmentSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .approval_amendment, err);
+                        switch (outcome) {
                             .inserted => app.input_runtime.input_limit_rejection = input_limit_rejection.clear(),
                             .inactive => {
                                 app.input_runtime.paste.resetWithTrace(.session_reset);
@@ -315,7 +321,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .approval_amendment });
-                                try input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes);
+                                input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes) catch |err|
+                                    return failPaste(app, .approval_amendment, err);
                                 return;
                             },
                         }

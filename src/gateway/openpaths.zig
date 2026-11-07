@@ -8,10 +8,9 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const gateway_sse = @import("sse.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
-const credential_authority = @import("../core/auth/credential_authority.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const generation_usage = @import("../core/session/generation_usage_provider.zig");
 const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -33,10 +32,6 @@ const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
-const max_generation_bytes: usize = 256 * 1024;
-const max_generation_id_bytes: usize = 256;
-const created_at_seconds_cutoff: i64 = 100_000_000_000;
-const unknown_model_label = "unknown";
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
@@ -392,10 +387,14 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .timeout_ms = 120_000,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+    if (watch.armHead()) |err| return err;
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -407,7 +406,8 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -431,7 +431,7 @@ pub fn streamPrepared(
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     const reader = response.reader(&transfer_buffer);
     var events = request.events;
-    const completion = try consumeSse(
+    const completion = consumeSse(
         alloc,
         reader,
         &events,
@@ -441,8 +441,10 @@ pub fn streamPrepared(
         EventBridge.toolInput,
         request.cancel_flag,
         request.content_capture_limit,
-    );
-    var completed = completion;
+        watch.progress(),
+    ) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| return err;
+    const completed = completion;
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
             .completion = completed,
@@ -450,19 +452,10 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-    completed.billing = try billingFromUsage(alloc, request.model, completion.usage);
-    const selection = try usageOutcomeFor(
-        alloc,
-        request.credential,
-        completed.billing != null,
-        completed.generation_id,
-    );
     return .{
         .completed = .{
             .completion = completed,
-            .usage = selection.outcome,
             .ownership = .owned,
-            .usage_ownership = selection.ownership,
         },
     };
 }
@@ -521,6 +514,7 @@ const ToolAccumulator = struct {
 const SseReader = struct {
     pending_line: std.ArrayList(u8) = .empty,
     aggregate_bytes: usize = 0,
+    progress: ?gateway_sse.Progress = null,
 
     const Line = struct {
         bytes: []const u8,
@@ -538,6 +532,7 @@ const SseReader = struct {
     fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
         while (true) {
             const line = try self.readLine(alloc, reader) orelse return null;
+            if (self.progress) |progress| progress.mark_fn(progress.context);
             self.aggregate_bytes = try checkedAccumulatedSize(
                 self.aggregate_bytes,
                 line.wire_bytes,
@@ -609,6 +604,7 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    progress: ?gateway_sse.Progress,
 ) !types.ModelCompletion {
     var content: std.ArrayList(u8) = .empty;
     errdefer content.deinit(alloc);
@@ -617,7 +613,7 @@ fn consumeSse(
         for (tools.items) |*tool| tool.deinit(alloc);
         tools.deinit(alloc);
     }
-    var sse: SseReader = .{};
+    var sse: SseReader = .{ .progress = progress };
     defer sse.deinit(alloc);
     var finish_reason: ?types.ProviderFinishReason = null;
     var usage: types.Usage = .{};
@@ -862,86 +858,6 @@ fn costField(object: std.json.ObjectMap, key: []const u8) ?f64 {
     };
     if (!std.math.isFinite(cost) or cost < 0) return null;
     return cost;
-}
-
-/// Builds the exact-usage billing record when the provider settled the charge.
-/// Without a provider-reported cost the billing window must stay incomplete,
-/// so this returns null instead of guessing zero.
-fn billingFromUsage(
-    alloc: Allocator,
-    model: []const u8,
-    usage: types.Usage,
-) !?types.ProviderBilling {
-    const cost = usage.cost orelse return null;
-    const owned_model = try alloc.dupe(u8, model);
-    errdefer alloc.free(owned_model);
-    return .{
-        .created_at_ms = io_mod.milliTimestamp(),
-        .model = owned_model,
-        .total_cost = cost,
-        .input_tokens = usage.input_tokens orelse 0,
-        .output_tokens = usage.output_tokens orelse 0,
-        .cache_read_tokens = usage.cache_read_tokens orelse 0,
-        .cache_write_tokens = usage.cache_write_tokens orelse 0,
-        .reasoning_tokens = usage.reasoning_tokens,
-        .billable_web_search_calls = 0,
-    };
-}
-
-const UsageSelection = struct {
-    outcome: stream_provider.UsageOutcome,
-    ownership: stream_provider.ResultOwnership,
-};
-
-fn usageOutcomeFor(
-    alloc: Allocator,
-    credential: types.CredentialLease,
-    billing_present: bool,
-    generation_id: ?[]const u8,
-) Allocator.Error!UsageSelection {
-    if (billing_present) return .{
-        .outcome = .{ .exact = .openpaths },
-        .ownership = .borrowed,
-    };
-    const id = generation_id orelse return .{
-        .outcome = .{ .unavailable = .possibly_billed },
-        .ownership = .borrowed,
-    };
-    const source = credential.credentialSource() orelse return .{
-        .outcome = .{ .unavailable = .possibly_billed },
-        .ownership = .borrowed,
-    };
-    const scope = generationBase(source) orelse return .{
-        .outcome = .{ .unavailable = .possibly_billed },
-        .ownership = .borrowed,
-    };
-    const account_id = credential.accountId();
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const owned_scope = try alloc.dupe(u8, scope);
-    errdefer alloc.free(owned_scope);
-    const owned_account = if (account_id) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_account) |value| alloc.free(value);
-    return .{
-        .outcome = .{ .deferred = .{
-            .provider = .openpaths,
-            .generation_id = owned_id,
-            .scope = owned_scope,
-            .tenant = null,
-            .account_id = owned_account,
-            .credential_source = source,
-            .credential_identity = credential_authority.derive(source, account_id),
-        } },
-        .ownership = .owned,
-    };
-}
-
-fn generationBase(source: types.CredentialSource) ?[]const u8 {
-    return switch (source) {
-        .openpaths_api_key => openpaths_base_url,
-        .openrouter_api_key => openrouter_base_url,
-        else => null,
-    };
 }
 
 fn appendToolArguments(
@@ -1275,204 +1191,6 @@ fn imageInputClaim(object: std.json.ObjectMap) ?bool {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Generation usage lookup: OpenRouter-compatible GET /generation?id=<id>
-// ---------------------------------------------------------------------------
-
-pub const generation_usage_provider = generation_usage.Provider{
-    .context = null,
-    .lookup_fn = lookupGenerationUsage,
-};
-
-fn lookupGenerationUsage(
-    _: ?*anyopaque,
-    alloc: Allocator,
-    input: generation_usage.LookupInput,
-) generation_usage.LookupError!generation_usage.LookupOutcome {
-    if (input.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (!isTrustedGenerationOrigin(input.origin)) return .reject;
-    const credential = input.credential orelse return .preserve_pending;
-    if (credential.len == 0) return .preserve_pending;
-    if (input.generation_id.len == 0 or input.generation_id.len > max_generation_id_bytes) {
-        return .reject;
-    }
-    const url = try generationLookupUrl(alloc, input.origin, input.generation_id);
-    defer alloc.free(url);
-    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(fetch_timeout_ms),
-    });
-    var response = fetchBoundedGet(
-        alloc,
-        url,
-        credential,
-        input.cancel_flag,
-        deadline,
-        max_generation_bytes,
-    ) catch |err| switch (err) {
-        error.Cancelled => return error.Cancelled,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            debug_trace.logf(
-                "openpaths",
-                "generation usage lookup failed reason={s}",
-                .{@errorName(err)},
-            );
-            return .retry;
-        },
-    };
-    defer response.deinit(alloc);
-    if (response.status != .ok) {
-        const outcome = classifyGenerationStatus(response.status);
-        debug_trace.logf(
-            "openpaths",
-            "generation usage lookup status={d} outcome={s}",
-            .{ @intFromEnum(response.status), @tagName(outcome) },
-        );
-        return outcome;
-    }
-    return parseLookupOutcome(alloc, response.body, input.generation_id);
-}
-
-fn isTrustedGenerationOrigin(origin: []const u8) bool {
-    return std.mem.eql(u8, origin, openpaths_base_url) or
-        std.mem.eql(u8, origin, openrouter_base_url) or
-        gateway_client.isLoopbackHttpUrl(origin);
-}
-
-fn generationLookupUrl(alloc: Allocator, origin: []const u8, generation_id: []const u8) ![]u8 {
-    const encoded = try encodeQueryComponent(alloc, generation_id);
-    defer alloc.free(encoded);
-    return std.fmt.allocPrint(alloc, "{s}/generation?id={s}", .{ origin, encoded });
-}
-
-fn encodeQueryComponent(alloc: Allocator, value: []const u8) ![]u8 {
-    const digits = "0123456789ABCDEF";
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    for (value) |byte| {
-        if (isUnreservedByte(byte)) {
-            try out.append(alloc, byte);
-        } else {
-            try out.append(alloc, '%');
-            try out.append(alloc, digits[byte >> 4]);
-            try out.append(alloc, digits[byte & 0x0f]);
-        }
-    }
-    return out.toOwnedSlice(alloc);
-}
-
-fn isUnreservedByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or
-        byte == '-' or byte == '.' or byte == '_' or byte == '~';
-}
-
-fn classifyGenerationStatus(status: std.http.Status) generation_usage.LookupOutcome {
-    const code = @intFromEnum(status);
-    if (code == 404) return .reject;
-    if (code == 408 or code == 425 or code == 429 or code >= 500) return .retry;
-    if (status == .unauthorized or status == .forbidden) return .preserve_pending;
-    return .reject;
-}
-
-fn parseLookupOutcome(
-    alloc: Allocator,
-    body: []const u8,
-    expected_id: []const u8,
-) Allocator.Error!generation_usage.LookupOutcome {
-    const record = parseGenerationRecord(alloc, body, expected_id, unknown_model_label) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.UnknownGeneration => return .reject,
-        error.InvalidGenerationRecord => return .preserve_pending,
-    };
-    return .{ .found = record };
-}
-
-const GenerationRecordError = Allocator.Error || error{
-    UnknownGeneration,
-    InvalidGenerationRecord,
-};
-
-/// Parses one authoritative `GET /generation` response leniently: identity and
-/// `total_cost` are required, token and timestamp fields degrade to zero. A
-/// successful record transfers its strings to `LookupOutcome.found`; callers
-/// release them with `LookupOutcome.deinit`.
-fn parseGenerationRecord(
-    alloc: Allocator,
-    body: []const u8,
-    expected_id: []const u8,
-    requested_model: []const u8,
-) GenerationRecordError!generation_usage.Record {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidGenerationRecord,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidGenerationRecord;
-    const data = parsed.value.object.get("data") orelse return error.InvalidGenerationRecord;
-    if (data == .null) return error.UnknownGeneration;
-    if (data != .object) return error.InvalidGenerationRecord;
-
-    const id_value = data.object.get("id") orelse return error.InvalidGenerationRecord;
-    if (id_value != .string) return error.InvalidGenerationRecord;
-    if (!std.mem.eql(u8, id_value.string, expected_id)) return error.UnknownGeneration;
-
-    const total_cost = costField(data.object, "total_cost") orelse
-        return error.InvalidGenerationRecord;
-
-    const model_source: []const u8 = blk: {
-        if (stringField(data.object, "model")) |candidate| {
-            validateModel(candidate) catch break :blk requested_model;
-            break :blk candidate;
-        }
-        break :blk requested_model;
-    };
-    validateModel(model_source) catch return error.InvalidGenerationRecord;
-
-    const details = objectMapField(data.object, "usage_details");
-    const created_at_ms = try normalizeCreatedAtMs(integerField(data.object, "created_at"));
-    const id = try alloc.dupe(u8, expected_id);
-    errdefer alloc.free(id);
-    const model = try alloc.dupe(u8, model_source);
-    return .{
-        .id = id,
-        .created_at_ms = created_at_ms,
-        .model = model,
-        .total_cost = total_cost,
-        .input_tokens = usageCount(data.object, details, "native_tokens_prompt", "prompt_tokens") orelse 0,
-        .output_tokens = usageCount(data.object, details, "native_tokens_completion", "completion_tokens") orelse 0,
-        .cache_read_tokens = usageCount(data.object, details, "native_tokens_cached", "cached_tokens") orelse 0,
-        .cache_write_tokens = usageCount(data.object, details, "native_tokens_cache_creation", "cache_creation_tokens") orelse 0,
-        .reasoning_tokens = usageCount(data.object, details, "native_tokens_reasoning", "reasoning_tokens"),
-        .billable_web_search_calls = 0,
-    };
-}
-
-fn usageCount(
-    data: std.json.ObjectMap,
-    details: ?std.json.ObjectMap,
-    top_key: []const u8,
-    nested_key: []const u8,
-) ?u64 {
-    const value = data.get(top_key) orelse blk: {
-        const map = details orelse return null;
-        break :blk map.get(nested_key) orelse return null;
-    };
-    return switch (value) {
-        .integer => |integer| std.math.cast(u64, integer),
-        else => null,
-    };
-}
-
-fn normalizeCreatedAtMs(raw: ?i64) error{InvalidGenerationRecord}!i64 {
-    const value = raw orelse return 0;
-    if (value < 0) return error.InvalidGenerationRecord;
-    if (value < created_at_seconds_cutoff) {
-        return std.math.mul(i64, value, 1000) catch return error.InvalidGenerationRecord;
-    }
-    return value;
-}
-
 test "parse catalog keeps every chat id the models endpoint returns" {
     const body =
         \\{"data":[{"id":"xiaomi/mimo-v2.6-pro"},{"id":"xiaomi/mimo-v2.6-flash"},{"id":"brand-new/vendor-model"},{"id":"zai/glm-5.2"}]}
@@ -1587,133 +1305,6 @@ test "models url follows the credential source" {
     const openrouter_url = try modelsUrl(alloc, .openrouter_api_key);
     defer alloc.free(openrouter_url);
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", openrouter_url);
-}
-
-fn expectOutcomeTag(
-    comptime Union: type,
-    expected: std.meta.Tag(Union),
-    actual: Union,
-) !void {
-    try std.testing.expectEqual(expected, std.meta.activeTag(actual));
-}
-
-test "openpaths generation record parses documented cost and token shapes" {
-    const alloc = std.testing.allocator;
-    const numeric_cost =
-        "{\"data\":{\"id\":\"gen_1\",\"total_cost\":0.95,\"native_tokens_prompt\":194,\"native_tokens_completion\":2,\"created_at\":1758000000}}";
-    var first: generation_usage.LookupOutcome = .{
-        .found = try parseGenerationRecord(alloc, numeric_cost, "gen_1", "xiaomi/mimo-v2.6-pro"),
-    };
-    defer first.deinit(alloc);
-    const record = switch (first) {
-        .found => |found| found,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("gen_1", record.id);
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", record.model);
-    try std.testing.expectEqual(@as(f64, 0.95), record.total_cost);
-    try std.testing.expectEqual(@as(u64, 194), record.input_tokens);
-    try std.testing.expectEqual(@as(u64, 2), record.output_tokens);
-    try std.testing.expectEqual(@as(i64, 1758000000 * 1000), record.created_at_ms);
-    try std.testing.expectEqual(@as(u64, 0), record.billable_web_search_calls);
-
-    const string_cost =
-        "{\"data\":{\"id\":\"gen_2\",\"model\":\"xiaomi/mimo-v2.6-flash\",\"total_cost\":\"0.25\",\"usage_details\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"reasoning_tokens\":3},\"created_at\":1758000000123}}";
-    var second: generation_usage.LookupOutcome = .{
-        .found = try parseGenerationRecord(alloc, string_cost, "gen_2", "xiaomi/mimo-v2.6-pro"),
-    };
-    defer second.deinit(alloc);
-    const flash = switch (second) {
-        .found => |found| found,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-flash", flash.model);
-    try std.testing.expectEqual(@as(f64, 0.25), flash.total_cost);
-    try std.testing.expectEqual(@as(u64, 10), flash.input_tokens);
-    try std.testing.expectEqual(@as(u64, 5), flash.output_tokens);
-    try std.testing.expectEqual(@as(?u64, 3), flash.reasoning_tokens);
-    try std.testing.expectEqual(@as(i64, 1758000000123), flash.created_at_ms);
-}
-
-test "openpaths generation lookup classifies parse and status outcomes" {
-    const alloc = std.testing.allocator;
-    try std.testing.expectError(error.UnknownGeneration, parseGenerationRecord(
-        alloc,
-        "{\"data\":{\"id\":\"other\",\"total_cost\":1}}",
-        "gen_1",
-        "xiaomi/mimo-v2.6-pro",
-    ));
-    try std.testing.expectError(error.UnknownGeneration, parseGenerationRecord(
-        alloc,
-        "{\"data\":null}",
-        "gen_1",
-        "xiaomi/mimo-v2.6-pro",
-    ));
-    try std.testing.expectError(error.InvalidGenerationRecord, parseGenerationRecord(
-        alloc,
-        "garbage",
-        "gen_1",
-        "xiaomi/mimo-v2.6-pro",
-    ));
-    try std.testing.expectError(error.InvalidGenerationRecord, parseGenerationRecord(
-        alloc,
-        "{\"data\":{\"id\":\"gen_1\"}}",
-        "gen_1",
-        "xiaomi/mimo-v2.6-pro",
-    ));
-
-    try expectOutcomeTag(generation_usage.LookupOutcome, .reject, classifyGenerationStatus(.not_found));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .reject, classifyGenerationStatus(.bad_request));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .retry, classifyGenerationStatus(.too_many_requests));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .retry, classifyGenerationStatus(.request_timeout));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .retry, classifyGenerationStatus(.internal_server_error));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .preserve_pending, classifyGenerationStatus(.unauthorized));
-    try expectOutcomeTag(generation_usage.LookupOutcome, .preserve_pending, classifyGenerationStatus(.forbidden));
-}
-
-test "usage outcome selection prefers exact billing then deferred lookup" {
-    const alloc = std.testing.allocator;
-    const lease = types.CredentialLease{ .direct = .{
-        .secret_bytes = "key",
-        .source = .openpaths_api_key,
-        .account_id = null,
-        .tenant_context = null,
-    } };
-
-    const exact = try usageOutcomeFor(alloc, lease, true, "gen_1");
-    try expectOutcomeTag(stream_provider.UsageOutcome, .exact, exact.outcome);
-    try std.testing.expectEqual(stream_provider.ResultOwnership.borrowed, exact.ownership);
-
-    const deferred = try usageOutcomeFor(alloc, lease, false, "gen_1");
-    defer switch (deferred.outcome) {
-        .deferred => |reference| {
-            alloc.free(@constCast(reference.generation_id));
-            alloc.free(@constCast(reference.scope));
-            if (reference.account_id) |value| alloc.free(@constCast(value));
-        },
-        else => {},
-    };
-    try expectOutcomeTag(stream_provider.UsageOutcome, .deferred, deferred.outcome);
-    try std.testing.expectEqual(stream_provider.ResultOwnership.owned, deferred.ownership);
-    switch (deferred.outcome) {
-        .deferred => |reference| {
-            try std.testing.expectEqual(
-                @as(std.meta.Tag(@TypeOf(reference.provider)), .openpaths),
-                std.meta.activeTag(reference.provider),
-            );
-            try std.testing.expectEqualStrings("gen_1", reference.generation_id);
-            try std.testing.expectEqualStrings(openpaths_base_url, reference.scope);
-            try std.testing.expectEqual(@as(?types.CredentialSource, .openpaths_api_key), reference.credential_source);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    const without_id = try usageOutcomeFor(alloc, lease, false, null);
-    try expectOutcomeTag(stream_provider.UsageOutcome, .unavailable, without_id.outcome);
-    try std.testing.expectEqual(stream_provider.ResultOwnership.borrowed, without_id.ownership);
-
-    const host_managed = try usageOutcomeFor(alloc, .host_managed, false, "gen_1");
-    try expectOutcomeTag(stream_provider.UsageOutcome, .unavailable, host_managed.outcome);
 }
 
 test "chat completions request uses OpenAI wire shape" {
@@ -1898,6 +1489,7 @@ test "openpaths usage parsing captures cost and cache details" {
         null,
         &cancelled,
         null,
+        null,
     );
     var owned = stream_provider.Result{ .completed = .{ .completion = completion, .ownership = .owned } };
     defer owned.deinit(std.testing.allocator);
@@ -1908,22 +1500,9 @@ test "openpaths usage parsing captures cost and cache details" {
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 7), completion.usage.reasoning_tokens);
     try std.testing.expectEqual(@as(?f64, 0.95), completion.usage.cost.?);
-
-    const billing = (try billingFromUsage(std.testing.allocator, "xiaomi/mimo-v2.6-pro", completion.usage)).?;
-    defer std.testing.allocator.free(@constCast(billing.model));
-    try std.testing.expectEqualStrings("xiaomi/mimo-v2.6-pro", billing.model);
-    try std.testing.expectEqual(@as(f64, 0.95), billing.total_cost);
-    try std.testing.expectEqual(@as(u64, 194), billing.input_tokens);
-    try std.testing.expectEqual(@as(u64, 2), billing.output_tokens);
-    try std.testing.expectEqual(@as(u64, 100), billing.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 10), billing.cache_write_tokens);
-    try std.testing.expectEqual(@as(?u64, 7), billing.reasoning_tokens);
 }
 
-test "openpaths billing stays unset without provider-reported cost" {
-    const usage = types.Usage{ .input_tokens = 3, .output_tokens = 4 };
-    try std.testing.expect((try billingFromUsage(std.testing.allocator, "xiaomi/mimo-v2.6-pro", usage)) == null);
-
+test "openpaths cost parsing rejects negative values and accepts numeric strings" {
     const negative = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"cost\":-1.0}", .{});
     defer negative.deinit();
     try std.testing.expect(costField(negative.value.object, "cost") == null);
@@ -2011,6 +1590,7 @@ test "chat completions SSE stream yields deltas tool calls and usage" {
         null,
         Capture.appendToolInput,
         &cancelled,
+        null,
         null,
     );
 

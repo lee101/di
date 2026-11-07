@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_data = @import("../images/image_data.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -293,7 +294,7 @@ pub fn storeToolImages(alloc: Allocator, capability: *session_child_store.Sessio
     if (out.written().len > image_data.max_result_frame_bytes) return error.ResultTooLarge;
     const base = try handleFor(alloc, capability, call_id, tool_name, out.written());
     defer alloc.free(base);
-    const handle = try std.fmt.allocPrint(alloc, "image-{s}", .{base});
+    const handle = try alloc.print("image-{s}", .{base});
     errdefer alloc.free(handle);
     try storeLargeResultAtHandleManaged(alloc, capability, handle, out.written());
     return handle;
@@ -338,7 +339,7 @@ pub fn storeLargeResultManaged(
 /// Bound on one serialized diff content pack (previous + after snapshots of
 /// a committed file edit). Oversized packs stay inline and the enclosing
 /// record's own size guard covers them.
-pub const diff_content_max_bytes: usize = 2 * stored_text_max_bytes;
+const diff_content_max_bytes: usize = 2 * stored_text_max_bytes;
 
 /// Restored previous/after contents of a committed file presentation.
 /// The caller owns both slices; release with deinit.
@@ -367,7 +368,7 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-pub fn isDiffContentHandle(handle: []const u8) bool {
+fn isDiffContentHandle(handle: []const u8) bool {
     if (handle.len != diff_content_handle_bytes or
         !std.mem.startsWith(u8, handle, diff_content_handle_prefix) or
         !std.mem.endsWith(u8, handle, diff_content_handle_suffix))
@@ -383,7 +384,7 @@ pub fn isDiffContentHandle(handle: []const u8) bool {
         isLowerHex(handle[content_start..content_end]);
 }
 
-pub fn diffContentHandleMatchesCall(
+fn diffContentHandleMatchesCall(
     handle: []const u8,
     tool_call_id: []const u8,
 ) bool {
@@ -399,7 +400,7 @@ pub fn diffContentHandleMatchesCall(
     );
 }
 
-pub fn diffContentHandleMatchesContentDigest(
+fn diffContentHandleMatchesContentDigest(
     handle: []const u8,
     digest: [32]u8,
 ) bool {
@@ -411,26 +412,7 @@ pub fn diffContentHandleMatchesContentDigest(
         );
 }
 
-/// Persists one edit's previous/after snapshots as a single content-addressed
-/// artifact in the session result store and returns its handle. Keeping the
-/// snapshots out of the event log and recovery checkpoint keeps those records
-/// small; readers resolve the handle on demand.
-pub fn storeDiffContent(
-    alloc: Allocator,
-    result_dir: []const u8,
-    tool_call_id: []const u8,
-    previous_content: ?[]const u8,
-    after_content: ?[]const u8,
-) ![]u8 {
-    const pack = try encodeDiffContentPack(alloc, previous_content, after_content);
-    defer alloc.free(pack);
-    const handle = try makeDiffContentHandle(alloc, tool_call_id, pack);
-    errdefer alloc.free(handle);
-    try storeLargeResultAtHandle(alloc, result_dir, handle, pack);
-    return handle;
-}
-
-/// Loads and digest-verifies a pack written by storeDiffContent.
+/// Loads and digest-verifies a pack v1 wrote.
 pub fn loadDiffContentManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -473,44 +455,6 @@ pub fn loadDiffContentManaged(
     return pack;
 }
 
-fn encodeDiffContentPack(
-    alloc: Allocator,
-    previous_content: ?[]const u8,
-    after_content: ?[]const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll("{\"previous_content\":") catch return error.OutOfMemory;
-    writeOptionalPackString(&out.writer, previous_content) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"after_content\":") catch return error.OutOfMemory;
-    writeOptionalPackString(&out.writer, after_content) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    if (out.written().len > diff_content_max_bytes) return error.DiffContentTooLarge;
-    return try out.toOwnedSlice();
-}
-
-fn writeOptionalPackString(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |text| {
-        try std.json.Stringify.value(text, .{}, writer);
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-fn makeDiffContentHandle(alloc: Allocator, tool_call_id: []const u8, pack: []const u8) ![]u8 {
-    var content_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(pack, &content_digest, .{});
-    const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
-    var call_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(tool_call_id, &call_digest, .{});
-    const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
-    return std.fmt.allocPrint(
-        alloc,
-        "diff-{s}-{s}.json",
-        .{ &call_hex, &content_hex },
-    );
-}
-
 fn storeLargeResultAtHandleManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -533,8 +477,7 @@ fn storeLargeResultAtHandleManaged(
 }
 
 pub fn formatStoredResultOutput(alloc: Allocator, handle: []const u8, preview: []const u8, stored_bytes: usize) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<tool_result_preview handle=\"{s}\" stored_bytes=\"{d}\">\n{s}\n</tool_result_preview>\n" ++
             "<tool_result_handle>{s}</tool_result_handle>\n" ++
             "Full result is stored outside session JSON. Use read_tool_result with this handle to inspect a byte range or literal query.",
@@ -574,8 +517,7 @@ pub fn readByRangeManaged(
     const end = @min(text.len, start + requested);
     const safe_start = text_utils.utf8ForwardBoundary(text, start);
     const safe_end = text_utils.utf8BackwardBoundary(text, end);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "<tool_result handle=\"{s}\" start_byte=\"{d}\" end_byte=\"{d}\" total_bytes=\"{d}\">\n{s}\n</tool_result>",
         .{ handle, safe_start + 1, safe_end, text.len, text[safe_start..safe_end] },
     );
@@ -700,8 +642,7 @@ pub fn deleteManaged(
 }
 
 fn cappedInlineOutput(alloc: Allocator, tool_name: []const u8, text: []const u8, max_bytes: usize) ![]u8 {
-    const marker = try std.fmt.allocPrint(
-        alloc,
+    const marker = try alloc.print(
         "\n... [tool result truncated for {s}: original {d} bytes; cap is {d} bytes]\n",
         .{ tool_name, text.len, max_bytes },
     );
@@ -728,8 +669,7 @@ pub fn makeHandle(alloc: Allocator, tool_call_id: []const u8, tool_name: []const
     const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
     const safe_tool = try safeHandlePart(alloc, tool_name);
     defer alloc.free(safe_tool);
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "result-{s}-{s}-{s}.txt",
         .{ safe_tool, &call_hex, &content_hex },
     );
@@ -769,7 +709,7 @@ fn targetHandle(
     };
 }
 
-pub fn isStoredTextHandle(handle: []const u8) bool {
+fn isStoredTextHandle(handle: []const u8) bool {
     return std.mem.startsWith(u8, handle, "result-") and
         std.mem.endsWith(u8, handle, ".txt");
 }
@@ -915,7 +855,7 @@ test "large result storage creates stable handle and bounded preview" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     const prepared = try prepare(alloc, dir, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
     defer alloc.free(prepared.model_output);
     defer alloc.free(@constCast(prepared.memory.output_handle.?));
@@ -939,7 +879,7 @@ test "a v2 session stores results and images as blobs named by their hash (D44)"
     var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, memory.blobs(), "", .writable);
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     bytes[3] = '\n';
     const prepared = try prepareManaged(alloc, &capability, "call/1", "run_command", bytes.len, bytes[0..], 64 * 1024);
     defer alloc.free(prepared.model_output);
@@ -1074,128 +1014,6 @@ test "a v2 session's compactor records are blobs, replaced and listed by name (D
     try std.testing.expectError(error.StoreFailed, compactorStore(&read_only).write(alloc, "compacted-T2.txt", "x"));
 }
 
-test "diff content packs reuse identical artifacts and repair tampering" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-    const handle = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
-    defer alloc.free(handle);
-    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(alloc, dir, .tool_results, .writable);
-    defer capability.deinit();
-    const before = try capability.stat(.tool_results, handle);
-    for (0..32) |_| {
-        const repeated = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
-        defer alloc.free(repeated);
-        try std.testing.expectEqualStrings(handle, repeated);
-    }
-    const after = try capability.stat(.tool_results, handle);
-    try std.testing.expectEqual(before.modified_at_ns, after.modified_at_ns);
-    var damaged = try capability.atomicReplace(alloc, .tool_results, handle, "corrupted");
-    damaged.deinit(alloc);
-    const repaired = try storeDiffContent(alloc, dir, "call", "before" ** 3000, "after" ** 3000);
-    defer alloc.free(repaired);
-    var pack = try loadDiffContentManaged(alloc, &capability, "call", repaired);
-    defer pack.deinit(alloc);
-    try std.testing.expectEqualStrings("before" ** 3000, pack.previous_content.?);
-    try std.testing.expectEqualStrings("after" ** 3000, pack.after_content.?);
-}
-
-test "diff content packs round trip, bound, and reject tampering" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-
-    const handle = try storeDiffContent(alloc, dir, "call-edit-1", "line one\nline two\n", "line one\nline 2\n");
-    defer alloc.free(handle);
-    try std.testing.expect(isDiffContentHandle(handle));
-    try std.testing.expect(!isDiffContentHandle("result-shell.txt"));
-
-    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
-        alloc,
-        dir,
-        .tool_results,
-        .writable,
-    );
-    defer capability.deinit();
-    var pack = try loadDiffContentManaged(
-        alloc,
-        &capability,
-        "call-edit-1",
-        handle,
-    );
-    defer pack.deinit(alloc);
-    try std.testing.expectEqualStrings("line one\nline two\n", pack.previous_content.?);
-    try std.testing.expectEqualStrings("line one\nline 2\n", pack.after_content.?);
-    try std.testing.expectError(
-        error.InvalidResultHandle,
-        loadDiffContentManaged(alloc, &capability, "call-edit-2", handle),
-    );
-
-    // Null snapshots survive the round trip.
-    const partial = try storeDiffContent(alloc, dir, "call-edit-2", null, "created\n");
-    defer alloc.free(partial);
-    var partial_pack = try loadDiffContentManaged(
-        alloc,
-        &capability,
-        "call-edit-2",
-        partial,
-    );
-    defer partial_pack.deinit(alloc);
-    try std.testing.expect(partial_pack.previous_content == null);
-    try std.testing.expectEqualStrings("created\n", partial_pack.after_content.?);
-
-    // A tampered artifact fails the content digest check.
-    var rewritten = try capability.atomicReplace(alloc, .tool_results, handle, "{\"previous_content\":\"forged\",\"after_content\":null}");
-    rewritten.deinit(alloc);
-    try std.testing.expectError(
-        error.DiffContentArtifactChanged,
-        loadDiffContentManaged(alloc, &capability, "call-edit-1", handle),
-    );
-
-    // Handles from other artifact families are rejected before any read.
-    try std.testing.expectError(
-        error.InvalidResultHandle,
-        loadDiffContentManaged(
-            alloc,
-            &capability,
-            "call-edit-1",
-            "result-shell.txt",
-        ),
-    );
-}
-
-test "diff content encoding propagates every allocation failure" {
-    const backing = std.testing.allocator;
-    const previous = "before\n" ** 800;
-    const after = "after\n" ** 800;
-    var probe = std.testing.FailingAllocator.init(backing, .{});
-    const encoded = try encodeDiffContentPack(
-        probe.allocator(),
-        previous,
-        after,
-    );
-    probe.allocator().free(encoded);
-    const allocation_count = probe.alloc_index;
-    try std.testing.expect(allocation_count > 1);
-
-    for (0..allocation_count) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            backing,
-            .{ .fail_index = fail_index },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            encodeDiffContentPack(failing.allocator(), previous, after),
-        );
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-    }
-}
-
 test "saved preparation externalizes small results" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1232,7 +1050,7 @@ test "saved preparation externalizes small results" {
 test "inline cap and stored preview keep complete codepoints" {
     const alloc = std.testing.allocator;
 
-    const inline_text = "x" ++ ("\xc3\xa9" ** 300);
+    const inline_text = "x" ++ text_utils.repeat("\xc3\xa9", 300);
     for ([_]usize{ 128, 129 }) |cap| {
         const prepared = try prepare(alloc, null, "call/2", "grep_files", inline_text.len, inline_text, cap);
         defer alloc.free(prepared.model_output);
@@ -1246,7 +1064,7 @@ test "inline cap and stored preview keep complete codepoints" {
     defer tmp.cleanup();
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
-    const stored_text = "x" ++ ("\xc3\xa9" ** 8200);
+    const stored_text = "x" ++ text_utils.repeat("\xc3\xa9", 8200);
     const stored = try prepare(alloc, dir, "call/3", "run_command", stored_text.len, stored_text, 64 * 1024);
     defer alloc.free(stored.model_output);
     defer alloc.free(@constCast(stored.memory.output_handle.?));
@@ -1263,7 +1081,7 @@ test "large result handles never expose token-shaped call ids" {
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(dir);
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 1);
+    var bytes: [large_result_threshold_bytes + 1]u8 = @splat('x');
     const secret_id = "sk-abcdefghijklmnop";
     const prepared = try prepare(
         alloc,
@@ -1292,7 +1110,7 @@ const PrepareRoute = enum {
 };
 
 fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "results");
@@ -1306,7 +1124,7 @@ fn expectLargeResultPreparationLeavesNoOrphan(route: PrepareRoute) !void {
     );
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     var reached_success = false;
     var fail_index: usize = 0;
     while (fail_index < 128) : (fail_index += 1) {
@@ -1368,7 +1186,7 @@ test "managed large result preparation removes committed files on later allocati
 fn expectExistingLargeResultSurvivesPreparationFailure(
     route: PrepareRoute,
 ) !void {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "results");
@@ -1382,7 +1200,7 @@ fn expectExistingLargeResultSurvivesPreparationFailure(
     );
     defer capability.deinit();
 
-    var bytes = [_]u8{'x'} ** (large_result_threshold_bytes + 128);
+    var bytes: [large_result_threshold_bytes + 128]u8 = @splat('x');
     const seeded_handle = try storeLargeResultManaged(
         base,
         &capability,
@@ -1535,7 +1353,7 @@ test "managed result reader reaches head middle and tail through bounded pages" 
     const middle = try reader.readPage(alloc, reader.size / 2, full_read_chunk_bytes);
     defer alloc.free(middle);
     try std.testing.expectEqual(@as(usize, full_read_chunk_bytes), middle.len);
-    try std.testing.expect(std.mem.indexOfScalar(u8, middle, 'x') != null);
+    try std.testing.expect(std.mem.findScalar(u8, middle, 'x') != null);
 
     const tail_offset = reader.size - "\nFULL_READER_TAIL\n".len;
     const tail = try reader.readPage(alloc, tail_offset, full_read_chunk_bytes);
@@ -1648,7 +1466,7 @@ test "managed result create read stat delete remains contained after route swap"
     );
     defer alloc.free(ranged);
     try std.testing.expect(std.mem.find(u8, ranged, "alpha") != null);
-    const outside_path = try std.fs.path.join(
+    const outside_path = try std.Io.Dir.path.join(
         alloc,
         &.{ "outside", handle },
     );
@@ -1672,7 +1490,7 @@ test "managed result read only absence does not create route" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

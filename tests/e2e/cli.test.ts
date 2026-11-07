@@ -32,6 +32,23 @@ import {
   fakeGatewaySse,
   startFakeGateway,
 } from "./tmux-helpers";
+import { savedSession, sessionDir } from "./saved-sessions";
+import {
+  codexBreakdownBody,
+  codexProfileBody,
+  codexUsageBody,
+  DAY_MS,
+  grokBillingBody,
+  grokSettingsBody,
+  type ReportRow,
+  USAGE_NOW_MS,
+  usageEnv,
+  usageFake,
+  utcDate,
+  writeChatGptLogin,
+  writeGrokLogin,
+  writeUsageClock,
+} from "./usage-fakes";
 
 const TIMEOUT = 15_000;
 const NO_GATEWAY_AUTH = {
@@ -383,7 +400,7 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  di ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--sessions-v2] [--no-color] [--resume <last|id>|--resume-id <id>] [--continue-recovery] [--] <prompt>
+  di ask [--auto|--full-access] [--auto-next-steps] [--auto-next-idea] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>
 
 Options:
   --auto                      Automatically review unresolved permission requests
@@ -406,11 +423,9 @@ Options:
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
   --no-save                   Do not save the session; incompatible with --resume and --resume-id
-  --sessions-v2               Use the experimental v2 session store, also set by FX_SESSIONS_V2=1; its sessions resume only with it
   --no-color                  Render TTY output without colors or hyperlinks
   --resume <last|id>          Continue the last session or a session by id
   --resume-id <id>            Continue a session by exact id
-  --continue-recovery         Resume the paused model response in the selected session
   --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
@@ -433,7 +448,7 @@ Autonomous flags keep the saved session running until interrupted; they cannot b
   );
 
   test(
-    "fx session help documents inspect resume migrate and recover",
+    "fx session help documents inspect resume and recover",
     async () => {
       for (const args of [
         ["session", "--help"],
@@ -442,11 +457,13 @@ Autonomous flags keep the saved session running until interrupted; they cannot b
         const r = await runFx(args);
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
-        expect(r.stdout).toContain("Inspect, resume, migrate, or recover saved sessions");
+        expect(r.stdout).toContain("Inspect, resume, or recover saved sessions");
         expect(r.stdout).toContain("session <last|id>|--id <id>");
         expect(r.stdout).toContain("session resume [last|<id>]");
-        expect(r.stdout).toContain("session migrate <id>|--id <id>");
         expect(r.stdout).toContain("session recover <id>|--id <id>");
+        // Sessions convert on open; there is nothing to migrate by hand.
+        expect(r.stdout).not.toContain("migrate");
+        expect(r.stdout).not.toContain("--allow-large");
       }
     },
     TIMEOUT,
@@ -1287,331 +1304,279 @@ describe("cli: status", () => {
 });
 
 describe("cli: usage", () => {
-  test(
-    "fx usage reads rolling local facts without credentials or profile mutation",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 60 * 60 * 1000,
-              model: "provider/a",
-              input_tokens: 15,
-              output_tokens: 3,
-              cache_read_tokens: 5,
-              cache_write_tokens: 1,
-              reasoning_tokens: 2,
-              total_cost: 0.25,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              created_at_ms: now - 2 * 24 * 60 * 60 * 1000,
-              model: "provider/b",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: null,
-              total_cost: 0.1,
-            },
-          },
-        ];
-        const usagePath = join(fxDir, "usage.jsonl");
-        writeFileSync(
-          usagePath,
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        chmodSync(usagePath, 0o600);
-        const before = readFileSync(usagePath, "utf8");
-        const entriesBefore = readdirSync(fxDir).sort();
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
+  const today = utcDate(USAGE_NOW_MS);
+  const reportRow = (start: string, end: string): ReportRow[] => {
+    if (start === today) {
+      return [{ model: "provider/a", request_count: 2, input_tokens: 10, output_tokens: 5, total_cost: 0.5 }];
+    }
+    if (end !== utcDate(USAGE_NOW_MS - DAY_MS)) return [];
+    // The month's finished days add a second model on top of the week's.
+    return start === "2026-10-01"
+      ? [
+        { model: "provider/b", request_count: 4, input_tokens: 40, output_tokens: 8, total_cost: 2 },
+        { model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 },
+      ]
+      : [{ model: "provider/a", request_count: 1, input_tokens: 4, output_tokens: 1, total_cost: 0.25 }];
+  };
 
+  function usageFixture(prefix: string, options: Parameters<typeof usageFake>[0] = {}) {
+    const root = mkdtempSync(join(tmpdir(), prefix));
+    const home = join(root, "home");
+    mkdirSync(home);
+    const clock = join(root, "clock");
+    writeUsageClock(clock, USAGE_NOW_MS);
+    const fake = usageFake({ report: reportRow, ...options });
+    const gateway = startFakeGateway([], { usage: fake.handler });
+    const env = {
+      ...NO_GATEWAY_AUTH,
+      ...usageEnv(gateway.baseUrl, clock),
+      HOME: realpathSync(home),
+    };
+    return {
+      root,
+      home,
+      clock,
+      fake,
+      gateway,
+      env,
+      stop() {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      },
+    };
+  }
+
+  test(
+    "fx usage without a sign-in says so, reads nothing, and leaves the profile alone",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-none-");
+      try {
+        const text = await runFx(["usage"], { env: fixture.env });
+        expect(text.code).toBe(1);
+        expect(text.stdout).toContain("Usage needs an AI Gateway sign-in: run fx login or set an API key.");
+        const json = await runFx(["usage", "--json"], { env: fixture.env });
+        expect(json.code).toBe(1);
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          kind: "usage",
+          schema_version: 2,
+          source: "ai_gateway",
+          status: "unavailable",
+          reason: "no_gateway_sign_in",
+        });
+        expect(fixture.fake.requests).toEqual([]);
+        expect(readdirSync(fixture.home)).toEqual([]);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage reads an API key's spend from AI Gateway and fetches finished days once a day",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-key-");
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        const month = await runFx(["usage", "--json"], { env });
+        expect(month.code).toBe(0);
+        expect(month.stderr).toBe("");
+        const report = JSON.parse(month.stdout);
+        expect(report).toMatchObject({
+          source: "ai_gateway",
+          period: "month",
+          status: "ready",
+          reason: null,
+          budget: null,
+          totals: { request_count: 7, input_tokens: 54, output_tokens: 14 },
+        });
+        expect(report.totals.spend).toBeCloseTo(2.75, 6);
+        expect(report.models.map((row: { model: string }) => row.model)).toEqual(["provider/b", "provider/a"]);
+        expect(fixture.fake.reportRanges()).toEqual([
+          `${today}..${today}`,
+          "2026-10-06..2026-10-11",
+          "2026-10-01..2026-10-11",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.authorization).toBe("Bearer e2e-usage-key");
+          expect(request.query.get("api_key_id")).toBe("self");
+          expect(request.query.get("group_by")).toBe("model");
+        }
+
+        // Later the same day only today is read again; the cache answers the rest.
+        const week = await runFx(["usage", "--period", "7d"], { env });
+        expect(week.code).toBe(0);
+        expect(week.stderr).toBe("");
+        expect(week.stdout).toContain("Usage (7d, UTC) from AI Gateway");
+        expect(week.stdout).toContain("Requests      3");
+        expect(week.stdout).toContain("- provider/a  $0.7500  3 requests  20 tokens");
+        expect(fixture.fake.reportRanges().slice(3)).toEqual([`${today}..${today}`]);
+
+        // A new UTC day reads its finished days again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + DAY_MS);
+        const next = await runFx(["usage", "--json", "--period", "today"], { env });
+        expect(next.code).toBe(0);
+        expect(fixture.fake.reportRanges().slice(4)).toEqual([
+          "2026-10-13..2026-10-13",
+          "2026-10-07..2026-10-12",
+          "2026-10-01..2026-10-12",
+        ]);
+        const output = month.stdout + week.stdout + next.stdout;
+        expect(output).not.toContain("e2e-usage-key");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with fx login reads the member's team spend and budget",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-member-", {
+        budget: {
+          users: [{ budget: { limitAmount: 50, currentSpend: 12, refreshPeriod: "monthly" } }],
+        },
+      });
+      writeSeededFxAuth(fixture.home, "team_e2e", fixture.gateway.baseUrl);
+      const env = { ...fixture.env, FX_E2E_OAUTH_ISSUER_URL: fixture.gateway.baseUrl };
+      try {
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(json.stderr).toBe("");
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          status: "ready",
+          budget: { limit: 50, spent: 12, period: "monthly" },
+        });
+        const reports = fixture.fake.requests.filter((request) => request.path === "/v1/report");
+        expect(reports).toHaveLength(3);
+        for (const request of reports) {
+          expect(request.authorization).toBe(`Bearer ${SEEDED_GATEWAY_TOKEN}`);
+          expect(request.team).toBe("team_e2e");
+          expect(request.query.get("metered_scope")).toBe("user");
+        }
+        const budget = fixture.fake.requests.find((request) => request.path === "/ai-gateway/usage-report");
+        expect(budget?.query.get("teamId")).toBe("team_e2e");
+        expect(budget?.query.get("scope")).toBe("user");
+
+        const text = await runFx(["usage"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stdout).toContain("Budget        $12.00 of $50.00 this month");
+        expect(text.stdout).not.toContain(SEEDED_GATEWAY_TOKEN);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage keeps the last numbers when AI Gateway refuses the sign-in",
+    async () => {
+      let refuse = false;
+      const fixture = usageFixture("fx-e2e-usage-refused-", {
+        report: (start, end) =>
+          refuse ? new Response("unauthorized", { status: 401 }) : reportRow(start, end),
+      });
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key" };
+      try {
+        expect((await runFx(["usage", "--json"], { env })).code).toBe(0);
+        refuse = true;
+        // Past the one-minute floor, so the second process fetches again.
+        writeUsageClock(fixture.clock, USAGE_NOW_MS + 2 * 60 * 1000);
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(1);
+        const report = JSON.parse(json.stdout);
+        expect(report).toMatchObject({ status: "failed", reason: "refused" });
+        expect(report.totals.request_count).toBe(7);
+        const text = await runFx(["usage"], { env });
+        expect(text.stdout).toContain("Refresh failed: AI Gateway refused this sign-in.");
+        expect(text.stdout).toContain("Requests      7");
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Codex reads the ChatGPT plan's limits and activity",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-codex-", {
+        codex: {
+          usage: codexUsageBody(),
+          profile: codexProfileBody(),
+          breakdown: codexBreakdownBody(),
+        },
+      });
+      writeChatGptLogin(fixture.home, "acct_e2e");
+      // Times show in the local zone, fixed here at five and a half hours east of UTC.
+      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "codex-e2e-model", TZ: "IST-5:30" };
+      try {
+        const text = await runFx(["usage", "--period", "today"], { env });
+        expect(text.code).toBe(0);
+        expect(text.stderr).toBe("");
+        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 21:00 IST");
+        expect(text.stdout).toContain("Tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
+        expect(text.stdout).toContain("Share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
+        expect(text.stdout).toContain("Plan          pro");
+        expect(text.stdout).toContain("Credits       12.40");
+        expect(text.stdout).toContain("- codex (5h window): 42% used, resets 23:00 IST");
+        expect(text.stdout).toContain("- codex (168h window): 18% used");
+        const paths = fixture.fake.requests.map((request) => request.path).sort();
+        expect(paths).toEqual([
+          "/backend-api/wham/profiles/me",
+          "/backend-api/wham/usage",
+          "/backend-api/wham/usage/daily-token-usage-breakdown",
+        ]);
+        for (const request of fixture.fake.requests) {
+          expect(request.chatgptAccount).toBe("acct_e2e");
+          expect(request.authorization?.startsWith("Bearer header.")).toBe(true);
+        }
+        expect(fixture.fake.reportRanges()).toEqual([]);
+
+        const json = await runFx(["usage", "--json"], { env });
+        expect(JSON.parse(json.stdout)).toMatchObject({
+          source: "chatgpt",
+          status: "ready",
+          codex: { plan: "pro" },
+        });
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage with Grok reads the plan's allowance and credits",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-grok-", {
+        grok: { billing: grokBillingBody(), settings: grokSettingsBody() },
+      });
+      writeGrokLogin(fixture.home, "acct_grok_e2e");
+      // Times show in the local zone; five and a half hours east, the reset moves to the next day.
+      const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20", TZ: "IST-5:30" };
+      try {
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Usage (30 days)");
-        expect(text.stdout).toContain("Total tokens  30");
-        expect(text.stdout.indexOf("provider/a")).toBeLessThan(
-          text.stdout.indexOf("provider/b"),
-        );
-
-        const json = await runFx(
-          ["usage", "--json", "--period", "24h"],
-          { env },
-        );
-        expect(json.code).toBe(0);
-        expect(json.stderr).toBe("");
-        const report = JSON.parse(json.stdout);
-        expect(report).toMatchObject({
-          kind: "usage",
-          schema_version: 1,
-          period: "24h",
-          completeness: "complete",
-          totals: {
-            total_tokens: 18,
-            input_tokens: 15,
-            output_tokens: 3,
-            request_count: 1,
-          },
-        });
-        expect(report.models.map((model: { model: string }) => model.model))
-          .toEqual(["provider/a"]);
-        expect(readFileSync(usagePath, "utf8")).toBe(before);
-        expect(readdirSync(fxDir).sort()).toEqual(entriesBefore);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals when the ledger is incomplete",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-incomplete-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        const now = Date.now();
-        const records = [
-          {
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          },
-          {
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 2,
-              model: "provider/model",
-              input_tokens: 4,
-              output_tokens: 2,
-              cache_read_tokens: 0,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.01,
-            },
-          },
-          {
-            schema_version: 1,
-            kind: "incident",
-            occurred_at_ms: now - 1,
-            completeness: "incomplete",
-          },
-        ];
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          records.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const env = {
-          ...NO_GATEWAY_AUTH,
-          HOME: realpathSync(home),
-          FX_DISABLE_KEYCHAIN: "1",
-        };
-
-        const text = await runFx(["usage"], { env });
-        expect(text.code).toBe(0);
-        expect(text.stdout).toContain("Known totals may be incomplete.");
-        expect(text.stdout).toContain("Total tokens  6");
+        expect(text.stdout).toContain("Grok usage from xAI, updated 21:00 IST");
+        expect(text.stdout).toContain("Plan          SuperGrok Heavy");
+        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 15, 2026 02:00 IST");
+        expect(text.stdout).toContain("Credits       $12.50");
+        expect(text.stdout).toContain("Pay as you go $3.00 of $100.00 this month");
+        expect(fixture.fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
+        for (const request of fixture.fake.requests) {
+          expect(request.grokUser).toBe("acct_grok_e2e");
+        }
+        expect(fixture.fake.requests.find((request) => request.path === "/billing")?.query.get("format"))
+          .toBe("credits");
 
         const json = await runFx(["usage", "--json"], { env });
-        expect(json.code).toBe(0);
-        expect(JSON.parse(json.stdout)).toMatchObject({
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
+        expect(JSON.parse(json.stdout)).toMatchObject({ source: "grok", status: "ready" });
       } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage distinguishes empty, invalid, corrupt, and unsafe local state",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-states-"));
-      try {
-        const home = realpathSync(root);
-        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
-        const empty = await runFx(["usage", "--json"], { env });
-        expect(empty.code).toBe(0);
-        expect(JSON.parse(empty.stdout)).toMatchObject({
-          coverage: { status: "not_started" },
-          totals: null,
-        });
-        expect(existsSync(join(home, ".fx"))).toBe(false);
-
-        const invalid = await runFx(
-          ["usage", "--period", "session", "--json"],
-          { env },
-        );
-        expect(invalid.code).toBe(1);
-        expect(JSON.parse(invalid.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageArgs",
-        });
-
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          `${JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: Date.now() - 1,
-          })}\n`,
-          { mode: 0o600 },
-        );
-        if (platform() !== "win32") {
-          chmodSync(fxDir, 0o755);
-          const entries = readdirSync(fxDir);
-          const unsafeDirectory = await runFx(["usage", "--json"], { env });
-          expect(unsafeDirectory.code).toBe(1);
-          expect(JSON.parse(unsafeDirectory.stdout)).toMatchObject({
-            kind: "usage",
-            code: "PrivateStatePermissionsUnsupported",
-          });
-          expect(lstatSync(fxDir).mode & 0o777).toBe(0o755);
-          expect(readdirSync(fxDir)).toEqual(entries);
-          chmodSync(fxDir, 0o700);
-        }
-        writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-          mode: 0o600,
-        });
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const corrupt = await runFx(["usage", "--json"], { env });
-        expect(corrupt.code).toBe(1);
-        expect(JSON.parse(corrupt.stdout)).toMatchObject({
-          kind: "usage",
-          code: "InvalidUsageStore",
-        });
-
-        if (platform() !== "win32") {
-          rmSync(join(fxDir, "usage.jsonl"));
-          const fifo = spawnSync("mkfifo", [join(fxDir, "usage.jsonl")]);
-          expect(fifo.status).toBe(0);
-          const special = await runFx(["usage", "--json"], { env });
-          expect(special.code).toBe(1);
-          expect(JSON.parse(special.stdout)).toMatchObject({
-            kind: "usage",
-            code: "DurablePathUnsafe",
-          });
-
-          rmSync(join(fxDir, "usage.jsonl"));
-          const socketPath = join(fxDir, "usage.jsonl");
-          const server = createServer();
-          await new Promise<void>((resolve, reject) => {
-            server.once("error", reject);
-            server.listen(socketPath, () => {
-              server.off("error", reject);
-              resolve();
-            });
-          });
-          try {
-            const socket = await runFx(["usage", "--json"], { env });
-            expect(socket.code).toBe(1);
-            expect(JSON.parse(socket.stdout)).toMatchObject({
-              kind: "usage",
-              code: "DurablePathUnsafe",
-            });
-          } finally {
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-          }
-        }
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "fx usage preserves known totals but fails closed when recovery storage is unsafe",
-    async () => {
-      const root = mkdtempSync(join(tmpdir(), "fx-e2e-usage-recovery-"));
-      try {
-        const home = join(root, "home");
-        const fxDir = join(home, ".fx");
-        mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-        chmodSync(fxDir, 0o700);
-        writeFileSync(
-          join(fxDir, "usage.jsonl"),
-          [
-            {
-              schema_version: 1,
-              kind: "coverage",
-              started_at_ms: Date.now() - 40 * 24 * 60 * 60 * 1000,
-            },
-            {
-              schema_version: 1,
-              kind: "generation",
-              fact: {
-                id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                created_at_ms: Date.now() - 1,
-                model: "provider/model",
-                input_tokens: 4,
-                output_tokens: 2,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                reasoning_tokens: 1,
-                total_cost: 0.01,
-              },
-            },
-          ].map((record) => JSON.stringify(record)).join("\n") + "\n",
-          { mode: 0o600 },
-        );
-        writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-        const outside = join(root, "outside");
-        writeFileSync(outside, "not a session directory");
-        symlinkSync(outside, join(fxDir, "sessions"));
-
-        const result = await runFx(["usage", "--json"], {
-          env: {
-            ...NO_GATEWAY_AUTH,
-            HOME: realpathSync(home),
-            FX_DISABLE_KEYCHAIN: "1",
-          },
-        });
-        expect(result.code).toBe(0);
-        expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout)).toMatchObject({
-          kind: "usage",
-          coverage: { status: "full" },
-          completeness: "incomplete",
-          totals: { total_tokens: 6, spend: 0.01 },
-        });
-      } finally {
-        rmSync(root, { recursive: true, force: true });
+        fixture.stop();
       }
     },
     TIMEOUT,
@@ -1762,8 +1727,10 @@ describe("cli: doctor", () => {
             expect.objectContaining({
               name: "sessions",
               status: "ok",
+              // Sessions an older fx saved, each converted when first
+              // opened (D73).
               detail: expect.stringContaining(
-                `${sessionCount} saved session(s)`,
+                `${sessionCount} session(s) saved by an older fx`,
               ),
             }),
           ]),
@@ -2506,7 +2473,6 @@ describe("cli: missing durable home", () => {
           ["sessions", "--json"],
           ["session", "last", "--json"],
           ["session", "--id", "missing.valid-id", "--json"],
-          ["session", "migrate", "--id", "missing.valid-id", "--json"],
         ]) {
           const result = await runFx(args, { cwd, env, timeoutMs: TIMEOUT });
           expect(result.code).toBe(1);
@@ -2587,21 +2553,22 @@ describe("cli: sessions", () => {
           turns: ["review the landing page"],
         });
 
+        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
-          env: { HOME: home, ...NO_GATEWAY_AUTH },
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
           timeoutMs: TIMEOUT,
         });
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         expect(first.stdout).toContain(
-          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 00:00:00.003 UTC",
+          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 05:30:00.003 IST",
         );
         expect(first.stdout).toContain(
-          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 00:00:00.002 UTC",
+          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 05:30:00.002 IST",
         );
         expect(first.stdout).toContain(
-          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-14 22:13:20.123 UTC",
+          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-15 03:43:20.123 IST",
         );
         expect(first.stdout).not.toContain("updated_at_ms");
         expect(first.stdout).not.toContain("language=");
@@ -2636,6 +2603,46 @@ describe("cli: sessions", () => {
           " - Investigate cache hits\n   id=named-session | 2 turns | English",
         );
         expect(renamed.stdout).not.toContain("Investigate cache misses");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx sessions text applies daylight saving time for each session's own date",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-dst-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        // 2023-07-10 14:40:00 UTC, during daylight saving time.
+        writeConversationSession(home, workspaceRoot, "summer-session", {
+          title: "Summer session",
+          updatedAtMs: 1_689_000_000_000,
+        });
+        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
+        writeConversationSession(home, workspaceRoot, "winter-session", {
+          title: "Winter session",
+          updatedAtMs: 1_700_000_000_123,
+        });
+
+        const listed = await runFx(["sessions"], {
+          cwd: workspaceRoot,
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "EST5EDT,M3.2.0,M11.1.0" },
+          timeoutMs: TIMEOUT,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(listed.stdout).toContain(
+          " - Summer session\n   id=summer-session | 0 turns | English | updated 2023-07-10 10:40:00.000 EDT",
+        );
+        expect(listed.stdout).toContain(
+          " - Winter session\n   id=winter-session | 0 turns | English | updated 2023-11-14 17:13:20.123 EST",
+        );
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
@@ -2826,7 +2833,12 @@ describe("cli: sessions", () => {
           },
         );
         expect(detail.code).not.toBe(0);
-        expect(detail.stderr).toContain("AccessDenied");
+        expect(detail.stderr).toBe("");
+        // The damage is named, and doctor says what can be done (D78).
+        const failure = JSON.parse(detail.stdout);
+        expect(failure.code).toBe("InvalidSessionFormat");
+        expect(failure.error).toContain("AccessDenied");
+        expect(failure.error).toContain("run `fx doctor`");
         expect(snapshotTree(join(home, ".fx"))).toEqual(before);
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -4506,11 +4518,7 @@ describe("cli: ask success", () => {
         expect(
           gateway.requests[0]?.headers.get("x-vercel-gateway-extended-time"),
         ).toBe("true");
-        expect(
-          existsSync(
-            join(savedHome, ".fx", "sessions", firstJson.session_id),
-          ),
-        ).toBe(true);
+        expect(existsSync(sessionDir(savedHome, firstJson.session_id))).toBe(true);
 
         const resumed = await runFx(
           [
@@ -4608,8 +4616,8 @@ describe("cli: ask success", () => {
         const workspaceRoot = realpathSync(workspace);
         const sessionId = "legacy-ask-convert";
         writeLegacySession(home, workspaceRoot, sessionId);
-        const sessionDir = join(home, ".fx", "sessions", sessionId);
-        const legacyPath = join(sessionDir, "session.json");
+        const legacyDir = join(home, ".fx", "sessions", sessionId);
+        const legacyPath = join(legacyDir, "session.json");
         const legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
         const legacyOutput = "LEGACY_AVAILABLE_RESULT_BYTES";
         const legacySummary = "LEGACY_ONLY_EARLIER_CONTEXT: deploy to eu-west-1.";
@@ -4664,12 +4672,9 @@ describe("cli: ask success", () => {
           final_output: "LEGACY_CONVERTED_OK",
         });
 
-        const metadata = JSON.parse(readFileSync(join(sessionDir, "session.json"), "utf8"));
-        expect(metadata.schema_version).toBe(4);
-        expect(Object.hasOwn(metadata, "history")).toBe(false);
-        expect(existsSync(join(sessionDir, "authority.json"))).toBe(false);
-        expect(existsSync(join(sessionDir, "checkpoint.json"))).toBe(false);
-        expect(existsSync(join(sessionDir, "events.v3.backup"))).toBe(false);
+        // Converted once: the new store holds it, and v1's folder is gone.
+        expect(existsSync(sessionDir(home, sessionId))).toBe(true);
+        expect(existsSync(legacyDir)).toBe(false);
 
         const second = await runFx(
           ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after restart."],
@@ -4681,24 +4686,12 @@ describe("cli: ask success", () => {
           session_id: sessionId,
           final_output: "LEGACY_RESTART_OK",
         });
-        const records = readFileSync(join(sessionDir, "events.jsonl"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line));
-        const events = records.map((record) => Object.keys(record.event)[0]);
-        expect(events).toEqual([
-          "context_checkpoint",
-          "user",
-          "tool_call",
-          "tool_result",
+        const history = (await savedSession(home, sessionId)).history;
+        expect(history.map((turn: { kind: string }) => turn.kind)).toEqual([
+          "compacted_summary",
           "assistant",
-          "turn_completed",
-          "user",
           "assistant",
-          "turn_completed",
-          "user",
           "assistant",
-          "turn_completed",
         ]);
         expect(gateway.requests).toHaveLength(2);
         for (const request of gateway.requests) {
@@ -4707,12 +4700,15 @@ describe("cli: ask success", () => {
           expect(request.body).toContain("LEGACY_ORIGINAL_ANSWER");
           expect(request.body).toContain(legacyOutput);
         }
-        const preserved = records.find((record) => record.event.tool_result)?.event.tool_result;
-        expect(preserved.call_id).toBe("legacy-read");
-        expect(preserved.completeness).not.toBe("complete");
-        expect(readFileSync(join(sessionDir, "tool-results", preserved.artifact_ref), "utf8")).toBe(legacyOutput);
-        const files = records.find((record) => record.event.turn_completed)?.event.turn_completed.files;
-        expect(files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
+        // The old inline result keeps its bytes, but not the claim that it is
+        // complete.
+        const preserved = history[1].execution.tool_steps[0].tool_results[0];
+        expect(preserved.tool_call_id).toBe("legacy-read");
+        expect(preserved.truncated).toBe(true);
+        expect(preserved.stored_output_bytes).toBe(legacyOutput.length);
+        const blobs = join(sessionDir(home, sessionId), "blobs");
+        expect(readdirSync(blobs).some((hash) => readFileSync(join(blobs, hash), "utf8") === legacyOutput)).toBe(true);
+        expect(history[1].execution.files.map((file: { path: string }) => file.path)).toEqual(["past.txt"]);
       } finally {
         gateway.stop();
         rmSync(root, { recursive: true, force: true });
@@ -5371,8 +5367,8 @@ describe("cli: workspace access", () => {
   );
 });
 
-describe("cli: MCP profile add", () => {
-  test("status and doctor inspect MCP without transport while list --connect discovers it", async () => {
+describe("cli: MCP profile", () => {
+  test("status, doctor, and list start no MCP server, and show connects one", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -5387,7 +5383,7 @@ describe("cli: MCP profile add", () => {
           fixture: {
             type: "local",
             command: [process.execPath, MODERN_MCP_FIXTURE],
-            environment: { FX_MCP_PID_PATH: pidPath, FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+            environment: { FX_MCP_PID_PATH: pidPath },
           },
         },
       }),
@@ -5415,229 +5411,59 @@ describe("cli: MCP profile add", () => {
       );
       expect(existsSync(pidPath)).toBe(false);
 
-      const passive = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(passive.code).toBe(0);
-      expect(passive.stdout).toContain("state=disconnected");
+      const listed = await runFx(["mcp", "list"], { cwd: workspace, env });
+      expect(listed.code).toBe(0);
+      expect(listed.stdout).toMatch(/fixture +~\/\.fx\/mcp\.json +stdio +not started/);
       expect(existsSync(pidPath)).toBe(false);
 
-      const connected = await runFx(
-        ["mcp", "list", "--connect"],
+      const shown = await runFx(
+        ["mcp", "show", "fixture"],
         { cwd: workspace, env, timeoutMs: TIMEOUT },
       );
-      expect(connected.code).toBe(0);
-      expect(connected.stderr).toBe("");
-      expect(connected.stdout).toContain("state=ready");
-      expect(connected.stdout).toContain("tools=1");
+      expect(shown.code).toBe(0);
+      expect(shown.stderr).toBe("");
+      expect(shown.stdout).toContain("ready, 1 tool");
       expect(existsSync(pidPath)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("lists paths and removes profile servers without launching MCP transport", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-manage-")));
+  test("add refuses a profile with both mcp and mcpServers and leaves it as it was", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-keys-")));
     const home = join(root, "home");
-    const workspace = join(root, "workspace");
-    const profileMarker = join(root, "profile-launched");
-    const workspaceMarker = join(root, "workspace-launched");
-    mkdirSync(join(home, ".fx"), { recursive: true });
-    mkdirSync(workspace, { recursive: true });
-    writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({}));
-    writeFileSync(
-      join(home, ".fx", "mcp.json"),
-      JSON.stringify({
-        mcp: {
-          shared: {
-            command: ["/bin/sh", "-c", `touch ${profileMarker}`],
-          },
-        },
-      }),
-    );
-    writeFileSync(
-      join(workspace, ".mcp.json"),
-      JSON.stringify({
-        mcpServers: {
-          shared: {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          "workspace-only": {
-            command: "/bin/sh",
-            args: ["-c", `touch ${workspaceMarker}`],
-          },
-          broken: {
-            command: "${MISSING_LIST_COMMAND}",
-          },
-        },
-      }),
-    );
-    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    const both = JSON.stringify({
+      mcp: { alpha: { command: "alpha-server" } },
+      mcpServers: { beta: { command: "beta-server" } },
+    });
+    writeFileSync(profilePath, both, { mode: 0o600 });
     try {
-      const path = await runFx(["mcp", "path"], { cwd: workspace, env });
-      expect(path.code).toBe(0);
-      expect(path.stderr).toBe("");
-      expect(path.stdout.trim()).toBe(join(home, ".fx", "mcp.json"));
-
-      const before = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(before.code).toBe(0);
-      expect(before.stderr).toBe("");
-      expect(before.stdout).toMatch(/shared source=profile scope=profile/);
-      expect(before.stdout).toMatch(
-        /workspace-only source=workspace scope=workspace/,
-      );
-      expect(before.stdout).not.toMatch(/shared source=workspace scope=workspace/);
-      expect(before.stdout).not.toContain("MISSING_LIST_COMMAND");
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const removed = await runFx(["mcp", "remove", "shared"], {
-        cwd: workspace,
-        env,
-      });
-      expect(removed.code).toBe(0);
-      expect(removed.stderr).toBe("");
-      expect(removed.stdout).toContain("Removed MCP server 'shared'");
-      expect(JSON.parse(readFileSync(join(home, ".fx", "mcp.json"), "utf8")))
-        .toEqual({ mcp: {} });
-
-      const after = await runFx(["mcp", "list"], { cwd: workspace, env });
-      expect(after.code).toBe(0);
-      expect(after.stdout).toMatch(/shared source=workspace scope=workspace/);
-      expect(existsSync(profileMarker)).toBe(false);
-      expect(existsSync(workspaceMarker)).toBe(false);
-
-      const missing = await runFx(["mcp", "remove", "missing"], {
-        cwd: workspace,
-        env,
-      });
-      expect(missing.code).not.toBe(0);
-      expect(missing.stderr).toContain("MCP server 'missing' was not found");
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("adds local and HTTP servers without launching either server", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-add-")));
-    const home = join(root, "home");
-    const marker = join(root, "launched");
-    mkdirSync(home, { recursive: true });
-    try {
-      const help = await runFx(["mcp", "--help"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(help.code).toBe(0);
-      for (const command of [
-        "fx mcp add NAME COMMAND [ARGS...]",
-        "fx mcp auth NAME",
-        "fx mcp list",
-        "fx mcp logout NAME",
-        "fx mcp path",
-        "fx mcp remove NAME",
-        "fx mcp trust approve|reject NAME",
-        "fx mcp trust approve-all|reset",
-      ]) expect(help.stdout).toContain(command);
-
-      const local = await runFx(
-        ["mcp", "add", "local", "/bin/sh", "-c", `touch ${marker}`],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      const bare = await runFx(["mcp"], { env: { HOME: home, ...NO_GATEWAY_AUTH } });
-      expect(bare.code).toBe(0);
-      expect(bare.stdout).toBe(help.stdout);
-      expect(existsSync(marker)).toBe(false);
-      const missingAuthName = await runFx(["mcp", "auth"], {
-        env: { HOME: home, ...NO_GATEWAY_AUTH },
-      });
-      expect(missingAuthName.code).toBe(1);
-      expect(missingAuthName.stderr).toBe("usage: di mcp auth NAME\n");
-      expect(existsSync(marker)).toBe(false);
-      expect(local.code).toBe(0);
-      expect(local.stderr).toBe("");
-      expect(local.stdout).toContain("Saved MCP server 'local'");
-      expect(existsSync(marker)).toBe(false);
-
-      const remote = await runFx(
-        [
-          "mcp",
-          "add",
-          "--transport",
-          "http",
-          "remote",
-          "https://example.test/mcp",
-        ],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(remote.code).toBe(0);
-      expect(remote.stderr).toBe("");
-
-      const profile = JSON.parse(
-        readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
-      );
-      expect(profile).not.toHaveProperty("mcpServers");
-      expect(profile.mcp.local.command).toEqual([
-        "/bin/sh",
-        "-c",
-        `touch ${marker}`,
-      ]);
-      expect(profile.mcp.remote).toMatchObject({
-        type: "http",
-        url: "https://example.test/mcp",
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("canonicalizes alias input and refuses ambiguous server-like keys", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-alias-")));
-    const home = join(root, "home");
-    const fxDir = join(home, ".fx");
-    mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-    const profilePath = join(fxDir, "mcp.json");
-    try {
-      writeFileSync(
-        profilePath,
-        JSON.stringify({ mcpServers: { old: { command: "old-server" } } }),
-        { mode: 0o600 },
-      );
-      const migrated = await runFx(
-        ["mcp", "add", "new", "new-server"],
-        { env: { HOME: home, ...NO_GATEWAY_AUTH } },
-      );
-      expect(migrated.code).toBe(0);
-      const canonical = JSON.parse(readFileSync(profilePath, "utf8"));
-      expect(Object.keys(canonical.mcp).sort()).toEqual(["new", "old"]);
-      expect(canonical).not.toHaveProperty("mcpServers");
-
-      const ambiguous = JSON.stringify({
-        mcp: { canonical: { command: "canonical-server" } },
-        "MCP-Servers": { blocked: { command: "blocked-server" } },
-        metadata: { owner: "team" },
-      });
-      writeFileSync(profilePath, ambiguous, { mode: 0o600 });
       const refused = await runFx(
-        ["mcp", "add", "unsafe", "must-not-save"],
+        ["mcp", "add", "gamma", "--", "gamma-server"],
         { env: { HOME: home, ...NO_GATEWAY_AUTH } },
       );
-      expect(refused.code).not.toBe(0);
-      expect(refused.stderr).toContain("McpConfigAmbiguousServerKey");
-      expect(readFileSync(profilePath, "utf8")).toBe(ambiguous);
+      expect(refused.code).toBe(1);
+      expect(refused.stderr).toBe(
+          "Couldn't add gamma to ~/.fx/mcp.json: the file has both \"mcp\" and \"mcpServers\"; merge them into one.\n",
+      );
+      expect(readFileSync(profilePath, "utf8")).toBe(both);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("serializes concurrent different-name additions", async () => {
+  test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");
     mkdirSync(home, { recursive: true });
     try {
       const [first, second] = await Promise.all([
-        runFx(["mcp", "add", "first", "first-server"], {
+        runFx(["mcp", "add", "first", "--", "first-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
-        runFx(["mcp", "add", "second", "second-server"], {
+        runFx(["mcp", "add", "second", "--", "second-server"], {
           env: { HOME: home, ...NO_GATEWAY_AUTH },
         }),
       ]);
@@ -5646,24 +5472,24 @@ describe("cli: MCP profile add", () => {
       const profile = JSON.parse(
         readFileSync(join(home, ".fx", "mcp.json"), "utf8"),
       );
-      expect(Object.keys(profile.mcp).sort()).toEqual(["first", "second"]);
+      expect(Object.keys(profile.mcpServers).sort()).toEqual(["first", "second"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("fails precisely without HOME or valid add syntax", async () => {
-    const missingHome = await runFx(["mcp", "add", "fixture", "node"], {
+  test("add fails precisely without HOME and on a flag it doesn't have", async () => {
+    const missingHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
-    expect(missingHome.code).not.toBe(0);
-    expect(missingHome.stderr).toContain("HomeNotSet");
+    expect(missingHome.code).toBe(1);
+    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
 
-    const invalid = await runFx(
+    const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],
       { env: { HOME: tmpdir(), ...NO_GATEWAY_AUTH } },
     );
-    expect(invalid.code).not.toBe(0);
-    expect(invalid.stderr).toContain("mcp add NAME COMMAND");
+    expect(flagged.code).toBe(2);
+    expect(flagged.stderr).toStartWith("fx mcp add has no --transport flag.\nusage: fx mcp add");
   });
 });

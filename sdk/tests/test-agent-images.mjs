@@ -608,9 +608,9 @@ for (const resizeImage of [undefined, (image) => image]) {
 }
 
 // The SDK decodes base64 itself, so non-canonical base64 throws before the
-// turn starts. Kernel-side content validation stays authoritative: a sniffed
-// media type that contradicts the declaration fails the turn with a typed error
-// rather than reaching the model.
+// turn starts, and so does an image whose bytes aren't the type it declares,
+// or a type libfx doesn't take, as the kernel would refuse it. A Blob's bytes
+// are checked once read, which rejects the turn before the prompt is sent.
 {
   const gateway = mockGateway();
   const agent = await createAgent(gateway, { model: "sdk/vision-model" });
@@ -621,17 +621,27 @@ for (const resizeImage of [undefined, (image) => image]) {
     );
   }
   const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]).toString("base64");
-  const mismatch = agent.prompt([{ type: "image", data: jpegBytes, mimeType: "image/png" }]);
-  await assert.rejects(mismatch.result, /Invalid image prompt block/);
+  const mislabeled = (error) => error instanceof TypeError && /holds image\/jpeg data, not image\/png/.test(error.message);
+  assert.throws(() => agent.prompt([{ type: "image", data: jpegBytes, mimeType: "image/png" }]), mislabeled);
+  assert.throws(() => agent.prompt([{ type: "image", data: Buffer.from(jpegBytes, "base64"), mimeType: "image/png" }]), mislabeled);
+  assert.throws(
+    () => agent.prompt([{ type: "image", data: Buffer.from("not an image"), mimeType: "image/png" }]),
+    (error) => error instanceof TypeError && /is not a PNG, JPEG, GIF or WebP image/.test(error.message),
+  );
   const blobMismatch = agent.prompt([
     { type: "image", data: new Blob([Buffer.from(jpegBytes, "base64")], { type: "image/png" }) },
   ]);
-  await assert.rejects(blobMismatch.result, /Invalid image prompt block/);
+  await assert.rejects(blobMismatch.result, mislabeled);
   for (const mimeType of ["image/svg+xml", "text/plain", "image/png\n"]) {
-    const referenceOnly = agent.prompt([{ type: "image", mimeType, sourceRef: "host:unsupported-mime" }]);
-    await assert.rejects(referenceOnly.result, /Invalid image prompt block/);
+    assert.throws(
+      () => agent.prompt([{ type: "image", mimeType, sourceRef: "host:unsupported-mime" }]),
+      (error) => error instanceof TypeError && /mimeType must be image\/png, image\/jpeg, image\/gif or image\/webp/.test(error.message),
+    );
   }
+  assert.throws(() => agent.prompt(""), (error) => error instanceof TypeError && /prompt is empty/.test(error.message));
   assert.equal(gateway.state.chatBodies.length, 0);
+  // The agent still takes a valid prompt.
+  assert.equal((await runPrompt(agent, [{ type: "image", data: pngData, mimeType: "image/png" }])).stopReason, "end_turn");
   await agent.close();
 }
 
@@ -1222,6 +1232,29 @@ for (const [index, mimeType] of mediaTypes.entries()) {
   assert.equal((await runPrompt(restored, "use the saved image refs")).stopReason, "end_turn");
   assert.deepEqual(calls, ["load_image", "prepare_image"]);
   await restored.close();
+}
+
+// A host tool's image reaches a model the catalog lists with vision but not
+// file-input, as it lists the default spacexai/grok-4.7: file-input covers
+// documents such as PDFs, and image input needs only vision.
+{
+  const model = "sdk/vision-only-model";
+  const modelCatalog = [{ id: model, type: "language", tags: ["reasoning", "tool-use", "implicit-caching", "vision", "structured-output"] }];
+  const gateway = mockGateway((body, step) => {
+    if (step === 1) return toolResponse("load_image", {});
+  });
+  const agent = await createAgent(gateway, {
+    model,
+    modelCatalog,
+    tools: [{ name: "load_image", description: "Load the host image", inputSchema: { type: "object" }, execute: () => ({ type: "libfx.tool-result", text: "host image", images: [{ type: "image", data: pngData, mimeType: "image/png" }] }) }],
+  });
+  assert.equal((await runPrompt(agent, "load the image")).stopReason, "end_turn");
+  assert.equal(gateway.state.chatBodies.length, 2);
+  const followup = gateway.state.chatBodies[1];
+  assert.deepEqual(fileParts(followup), [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }]);
+  assert.doesNotMatch(JSON.stringify(followup.prompt), /Tool images were retained but not sent/);
+  assert.ok(!followup.tools.some((item) => item.name === "vision"), "a native image model is not offered the vision tool");
+  await agent.close();
 }
 
 // Rich host results share the existing data/count/frame limits. Referenced

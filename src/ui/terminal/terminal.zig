@@ -34,6 +34,11 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
 }
 
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const io_mod = @import("../../core/shared/io.zig");
+        const size = io_mod.consoleSize(io_mod.stdoutHandle()) orelse io_mod.consoleSize(io_mod.stderrHandle()) orelse return error.UnableToReadTerminalSize;
+        return layoutFromSize(size.rows, size.cols, footer_rows);
+    }
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -63,7 +68,7 @@ pub fn isInvalidLayoutError(err: anyerror) bool {
 }
 
 pub fn moveCursorSequence(buf: []u8, row: u16, col: u16) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x1b[{d};{d}H", .{ row, col });
+    return std.mem.print(buf, "\x1b[{d};{d}H", .{ row, col });
 }
 
 test "moveCursorSequence formats correctly" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -16,8 +17,8 @@ pub fn validSourceRef(source_ref: []const u8) bool {
 
 test "source references are bounded opaque UTF-8 without control bytes" {
     try std.testing.expect(validSourceRef("host:screenshot-1"));
-    try std.testing.expect(validSourceRef("é" ** 256));
-    for ([_][]const u8{ "", "a" ** 513, "bad\nref", "bad\x7fref", "\xff" }) |value| {
+    try std.testing.expect(validSourceRef(text_utils.repeat("é", 256)));
+    for ([_][]const u8{ "", text_utils.repeat("a", 513), "bad\nref", "bad\x7fref", "\xff" }) |value| {
         try std.testing.expect(!validSourceRef(value));
     }
 }
@@ -428,7 +429,7 @@ fn testGif(width: u16, height: u16) [10]u8 {
 }
 
 fn testWebpHeader(chunk: *const [4]u8) [30]u8 {
-    var bytes = [_]u8{0} ** 30;
+    var bytes: [30]u8 = @splat(0);
     @memcpy(bytes[0..4], "RIFF");
     @memcpy(bytes[8..12], "WEBP");
     @memcpy(bytes[12..16], chunk);
@@ -543,7 +544,7 @@ test "encoded image dimensions agree with raw headers at every truncation" {
 
 test "image dimension parsing stays bounded on arbitrary bytes" {
     try std.testing.fuzz({}, fuzzImageDimensions, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             &testPngHeader(3420, 2224),
             &testJpeg(2001, 1),
             &testGif(1, 1),
@@ -555,7 +556,7 @@ test "image dimension parsing stays bounded on arbitrary bytes" {
             "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\xff\xff\xff\xff\xff\xff\xff\xff",
             // RIFF header naming WebP with no chunk.
             "RIFF\x00\x00\x00\x00WEBP",
-        },
+        }) ++ @import("fuzz_corpus").image_dimensions.*),
     });
 }
 

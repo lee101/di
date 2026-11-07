@@ -357,7 +357,7 @@ fn postJsonDefault(
         error.StreamTooLong => return GenerateError.GeminiResponseTooLarge,
         else => return err,
     };
-    return .{ .status = @intFromEnum(response.head.status), .body = body };
+    return .{ .status = @backingInt(response.head.status), .body = body };
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

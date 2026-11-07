@@ -1,10 +1,13 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice } from "./fx-sdk.js";
+import { checkPromptInput, coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice, resumeOutputShown } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
+// Every worker reads each record since the session's last checkpoint, so a
+// durable session checkpoints far sooner than the engine's default.
+const durableCheckpointAfterBytes = 64 * 1024;
 
 /**
  * The fx harness for `createDurableAgentFactory`. `createEngine(options)`
@@ -25,6 +28,11 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
     return {
       ...(checkpoint === undefined ? {} : { seed: snapshotOf(checkpointBytesOf(checkpoint)) }),
       settings: sessionSettings,
+      // What a session's prompt() refuses before storing anything: whatever
+      // this agent's engines would refuse.
+      checkPrompt(input) {
+        checkPromptInput(input, { resizeImage: engineOptions.resizeImage });
+      },
       async open({ sessionId, store, context, settings, durability, ready }) {
         const apiKey = engineOptions.apiKey ?? await defaultApiKey(durability);
         const engine = await createEngine({
@@ -36,9 +44,11 @@ export function fxHarness({ createEngine, defaultApiKey = async () => undefined 
           // The core folds the session from the marks on each record.
           persistence: { ...store, [journalMarksWanted]: true },
           inputsDurable: true,
-          // A checkpoint at every turn end; where a turn yields the core
-          // saves one itself before it lets the session go.
-          checkpointAfterBytes: 0,
+          // A turn's end saves a checkpoint once the records since the last
+          // one reach this many bytes, so a short turn writes none and a
+          // worker reads back little; where a turn yields, the core saves
+          // one itself before it lets the session go.
+          checkpointAfterBytes: durableCheckpointAfterBytes,
           ...(context === undefined || context === null ? {} : { toolContext: context }),
         });
         return fxSession(engine, idempotent);
@@ -102,6 +112,7 @@ function fxTurn(turn, exited) {
   return {
     result,
     steer: (text, id) => turn.steer(text, id),
+    endForSteer: () => turn[engineInternals]?.endForSteer(),
     cancel: (options) => turn.cancel(options),
     async *[Symbol.asyncIterator]() {
       try {
@@ -119,6 +130,7 @@ function refusedTurn(error) {
   return {
     result: Promise.resolve({ stopReason: "error", usage: {}, error: { name: error?.name ?? "Error", message: String(error?.message ?? error) } }),
     steer: async () => {},
+    endForSteer: async () => {},
     cancel() {},
     async *[Symbol.asyncIterator]() {},
   };
@@ -140,7 +152,9 @@ function fxSession(engine, idempotent) {
     // A call left running reruns only when running it twice is safe, and
     // with `rerun: false` not even then. Any other call is never run again:
     // the model is told it may have partly run, and the turn goes on.
-    resume: ({ rerun = true, ...options } = {}) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (rerun && idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
+    // The session's stream already holds what the turn sent before it
+    // stopped, so the resume does not send it again.
+    resume: ({ rerun = true, ...options } = {}) => fxTurn(engine.resume({ ...options, [resumeOutputShown]: true, onAmbiguous: (call) => (rerun && idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
     get openTurn() {
       return internals.openTurn;
     },
@@ -172,9 +186,20 @@ function claimedTools(tools, ready) {
   return tools;
 }
 
+// The tools whose cut-off calls run again. Every tool the host runs must say
+// whether that is safe, so the choice is never a default: `idempotent: true`
+// when running a call twice is harmless, `false` when it is not. A tool that
+// is not an object is left for the engine to refuse.
 function idempotentTools(tools) {
   const names = new Set();
-  for (const tool of toolEntries(tools)) if (tool?.idempotent === true && typeof tool.name === "string") names.add(tool.name);
+  for (const [index, tool] of toolEntries(tools).entries()) {
+    if (!tool || typeof tool !== "object" || tool.providerExecuted === true) continue;
+    if (typeof tool.idempotent !== "boolean") {
+      const name = typeof tool.name === "string" ? tool.name : index;
+      throw new TypeError(`tool ${name} must set idempotent: true if running a call twice is safe, or idempotent: false if it is not`);
+    }
+    if (tool.idempotent && typeof tool.name === "string") names.add(tool.name);
+  }
   return names;
 }
 

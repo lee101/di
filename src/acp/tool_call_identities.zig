@@ -7,12 +7,12 @@
 
 const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
 
 const Allocator = std.mem.Allocator;
-const Identity = mcp_runtime.McpRuntime.ToolIdentity;
+const Identity = catalog_state.ToolIdentity;
 
 /// The side file a v1 session keeps its record in.
 pub const file_name = "mcp-tool-identities.json";
@@ -30,7 +30,7 @@ pub const Target = union(enum) {
 
 pub const Record = struct {
     mutex: std.Io.Mutex = .init,
-    entries: std.StringArrayHashMapUnmanaged(Identity) = .empty,
+    entries: std.array_hash_map.String(Identity) = .empty,
 
     pub fn deinit(self: *Record, alloc: Allocator) void {
         for (self.entries.keys(), self.entries.values()) |name, identity| {
@@ -155,7 +155,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Record {
         const tool = stringField(object, "tool") orelse return error.InvalidToolIdentityRecord;
         const title: ?[]u8 = switch (object.get("title") orelse .null) {
             .null => null,
-            .string => |text| if (mcp_runtime.usableDisplayTitle(text)) |usable| @constCast(usable) else null,
+            .string => |text| if (catalog_state.usableDisplayTitle(text)) |usable| @constCast(usable) else null,
             else => return error.InvalidToolIdentityRecord,
         };
         try record.put(alloc, field.key_ptr.*, .{ .server = server, .tool = tool, .title = title });
@@ -247,7 +247,7 @@ test "tool identity record refuses names that would outgrow the stored record" {
     var name_buf: [32]u8 = undefined;
     var accepted: usize = 0;
     const full = for (0..max_entries) |index| {
-        const name = try std.fmt.bufPrint(&name_buf, "mcp_s_tool_{d}", .{index});
+        const name = try std.mem.print(&name_buf, "mcp_s_tool_{d}", .{index});
         record.remember(alloc, .none, name, .{ .server = server_name, .tool = @constCast("tool") }) catch |err| {
             try std.testing.expectEqual(error.ToolIdentityRecordFull, err);
             break name;

@@ -272,15 +272,20 @@ describe("fx ask presentation", () => {
     };
     const shellTool = firstRequest.tools.find(({ name }) => name === "shell");
     const shellSchema = shellTool?.inputSchema;
-    expect(Object.keys(shellSchema?.properties ?? {})).toEqual(["request"]);
-    expect(shellSchema?.required).toEqual(["request"]);
-    expect(shellSchema?.additionalProperties).toBe(false);
-    const branches = shellSchema?.properties?.request?.oneOf ?? [];
-    expect(branches.map((branch: any) => branch.properties.action.enum[0])).toEqual([
-      "run",
-      "interact",
-      "stop",
+    // No-save asks advertise the process-only fields, flat with one action enum.
+    expect(Object.keys(shellSchema?.properties ?? {})).toEqual([
+      "action",
+      "command",
+      "cwd",
+      "profile",
+      "yield_time_ms",
+      "timeout_ms",
+      "session_id",
+      "force",
     ]);
+    expect(shellSchema?.required).toEqual(["action"]);
+    expect(shellSchema?.additionalProperties).toBe(false);
+    expect(shellSchema?.properties?.action?.enum).toEqual(["run", "interact", "stop"]);
     const serializedShellTool = JSON.stringify(shellTool);
     expect(serializedShellTool).not.toContain('"tty"');
     expect(serializedShellTool).not.toContain('"write"');
@@ -1015,6 +1020,27 @@ describe("fx ask shell startup files", () => {
     // One capture, and one more after the edit: never once per command.
     expect(startupLoads(root.home)).toBe(2);
     expect(result.stderr).not.toContain("shell snapshot unavailable");
+  }, TIMEOUT);
+
+  test("a user-profile command with a quoting error carries rewrite guidance", async () => {
+    const root = createRoot();
+    const gateway = startFakeGateway([
+      userShellRun("unmatched", "echo \"oops"),
+      fakeGatewayFinalText("Guidance checked.\n"),
+    ]);
+    gateways.push(gateway);
+
+    const result = await runFx(
+      ["ask", "--json", "--yolo", "--no-save", "Check the guidance."],
+      { cwd: root.workspace, env: { ...gatewayEnv(root.home, gateway), FX_SOUND: "0" }, timeoutMs: TIMEOUT },
+    );
+
+    expect(result.code).toBe(0);
+    // The snapshot runs the command through eval, so zsh reports the error as
+    // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
+    expect(gateway.requests[1]!.body).toMatch(/\(eval\):1:|\/dev\/fd\/0: eval:/);
+    expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
   }, TIMEOUT);
 
   test("startup files the snapshot cannot capture fall back with one notice", async () => {

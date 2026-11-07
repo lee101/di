@@ -13,7 +13,7 @@ pub const clipboard = host.Clipboard{
 pub const secret_store = native_secret_store.provider;
 
 fn copyToClipboard(_: ?*anyopaque, text: []const u8) host.ClipboardError!bool {
-    const argv = clipboardCommand(builtin.os.tag) orelse return false;
+    const argv = clipboardCommand(builtin.target.os.tag) orelse return false;
     const io = io_mod.getIo();
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -104,6 +104,7 @@ fn close_clipboard_process_streams(child: *std.process.Child) void {
 }
 
 pub fn try_reap_child_process(child: *std.process.Child) error{WaitFailed}!?std.process.Child.Term {
+    if (comptime builtin.os.tag == .windows) return null;
     const pid = child.id orelse return error.WaitFailed;
     var status: c_int = undefined;
     const waited = std.c.waitpid(pid, &status, std.c.W.NOHANG);
@@ -172,14 +173,14 @@ fn run_clipboard_process(
 // Publish eager file representations so the pasteboard server owns them after
 // this short-lived process exits.
 fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) host.ClipboardError!bool {
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         return copy_file_contents_to_clipboard(
             path,
             &file_clipboard_candidates,
             io_mod.getenv("WAYLAND_DISPLAY") != null,
         );
     }
-    if (comptime builtin.os.tag != .macos) return false;
+    if (comptime builtin.target.os.tag != .macos) return false;
 
     const script =
         \\function run(argv) {
@@ -226,8 +227,8 @@ fn copy_file_to_clipboard(_: ?*anyopaque, alloc: std.mem.Allocator, path: []cons
             if (code == 0) return true;
             debug_trace.logf("host", "clipboard file copy failed exit_code={d} elapsed_ms={d} stderr={s}", .{ code, elapsed_ms, result.stderr });
         },
-        .signal => |signal| debug_trace.logf("host", "clipboard file copy failed term=signal signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
-        .stopped => |signal| debug_trace.logf("host", "clipboard file copy failed term=stopped signal={d} elapsed_ms={d} stderr={s}", .{ @intFromEnum(signal), elapsed_ms, result.stderr }),
+        .signal => |signal| debug_trace.logf("host", "clipboard file copy failed term=signal signal={d} elapsed_ms={d} stderr={s}", .{ @backingInt(signal), elapsed_ms, result.stderr }),
+        .stopped => |signal| debug_trace.logf("host", "clipboard file copy failed term=stopped signal={d} elapsed_ms={d} stderr={s}", .{ @backingInt(signal), elapsed_ms, result.stderr }),
         .unknown => |status| debug_trace.logf("host", "clipboard file copy failed term=unknown status={d} elapsed_ms={d} stderr={s}", .{ status, elapsed_ms, result.stderr }),
     }
     return error.CopyFailed;
@@ -301,8 +302,8 @@ fn copySucceeded(term: std.process.Child.Term) bool {
 fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
     switch (term) {
         .exited => |code| debug_trace.logf("host", "clipboard copy failed exit_code={d}", .{code}),
-        .signal => |signal| debug_trace.logf("host", "clipboard copy failed term=signal signal={d}", .{@intFromEnum(signal)}),
-        .stopped => |signal| debug_trace.logf("host", "clipboard copy failed term=stopped signal={d}", .{@intFromEnum(signal)}),
+        .signal => |signal| debug_trace.logf("host", "clipboard copy failed term=signal signal={d}", .{@backingInt(signal)}),
+        .stopped => |signal| debug_trace.logf("host", "clipboard copy failed term=stopped signal={d}", .{@backingInt(signal)}),
         .unknown => |status| debug_trace.logf("host", "clipboard copy failed term=unknown status={d}", .{status}),
     }
 }

@@ -5,6 +5,7 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
@@ -14,15 +15,12 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
-const session_adapter = @import("../session/session_adapter.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
 const mcp_health = @import("../mcp/health.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -37,7 +35,7 @@ else
 
 const Allocator = std.mem.Allocator;
 
-const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
+const GracefulExitSigintGuard = if (host_target.is_wasm or @import("builtin").os.tag == .windows) struct {
     fn install(_: bool) @This() {
         return .{};
     }
@@ -48,6 +46,7 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
 
     fn install(enabled: bool) @This() {
         if (!enabled) return .{};
+        if (comptime @import("builtin").os.tag == .windows) return .{};
 
         const ignore_action: std.posix.Sigaction = .{
             .handler = .{ .handler = std.posix.SIG.IGN },
@@ -98,12 +97,7 @@ pub const Config = struct {
     inspect_mcp_profile_config: mcp_contract.InspectProfileConfigFn,
     inspect_mcp_local_config: mcp_health.InspectLocalConfigFn =
         mcp_health.inspectLocalConfigUnavailable,
-    load_mcp_runtime: mcp_runtime.LoadRuntimeFn,
     load_mcp_host: ?mcp_host.LoadFn = null,
-    add_mcp_profile_server: mcp_command_provider.AddProfileServerFn =
-        mcp_command_provider.addProfileServerUnavailable,
-    remove_mcp_profile_server: mcp_command_provider.RemoveProfileServerFn =
-        mcp_command_provider.removeProfileServerUnavailable,
     acp_runner: acp_runner.Runner,
 };
 
@@ -227,85 +221,100 @@ fn unavailableCliDispatch(_: ?*anyopaque, _: Allocator, _: []const [:0]const u8,
     return error.UnknownCliCommand;
 }
 
+/// The exit for an interactive launch whose app could not start.
+fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: Allocator, err: anyerror) anyerror!RunOutcome {
+    switch (err) {
+        error.NotATerminal => {
+            writeStderr(deps, "di requires an interactive terminal (TTY).\n");
+            return .{ .exit = 1 };
+        },
+        error.TerminalTooSmall => {
+            writeStderr(deps, "di needs at least 5 terminal rows.\n");
+            return .returned;
+        },
+        error.RecordingStartFailed => {
+            writeStderr(deps, "di: unable to start terminal recording.\n");
+            return .{ .exit = 1 };
+        },
+        error.NoRememberedSession => {
+            writeStderr(deps, "di: no remembered session for this workspace; choose one with di -r or di --resume <id>\n");
+            return .{ .exit = 1 };
+        },
+        error.RememberedSessionUnavailable => {
+            writeStderr(deps, "di: the remembered session ID could not be read; choose one with di -r or di --resume <id>\n");
+            return .{ .exit = 1 };
+        },
+        error.NoSavedSessions => {
+            writeStderr(deps, "di: no saved sessions for this workspace.\n");
+            return .{ .exit = 1 };
+        },
+        error.NoReadableSessions => {
+            // The unreadable sessions can belong to any workspace, so only
+            // the absence of a readable one is tied to this workspace.
+            writeStderr(deps, "di: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `di doctor` for recovery guidance.\n");
+            return .{ .exit = 1 };
+        },
+        error.SessionNotFound => {
+            writeStderr(deps, "di: saved session not found.\n");
+            return .{ .exit = 1 };
+        },
+        error.SessionBusy => {
+            writeStderr(deps, "di: another di process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
+            return .{ .exit = 1 };
+        },
+        error.SessionLockUnsupported => {
+            writeStderr(deps, "di: the filesystem cannot provide the required session lock\n");
+            return .{ .exit = 1 };
+        },
+        error.SessionAuthorityBoundaryUnavailable,
+        error.SessionCommitBoundaryUnavailable,
+        => {
+            writeStderr(deps, "di: a saved session has an unfinished update that could not be recovered; run `di doctor` to identify the affected session\n");
+            return .{ .exit = 1 };
+        },
+        error.OneOffSessionNotResumable => {
+            writeStderr(deps, "di: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
+            return .{ .exit = 1 };
+        },
+        error.InvalidSessionFormat => {
+            if (launch.resume_refusal) |reason| {
+                const message = alloc.print("di: this session can't be converted (InvalidSessionFormat): {s}\n", .{reason}) catch null;
+                defer if (message) |text| alloc.free(text);
+                writeStderr(deps, message orelse "di: this session can't be converted (InvalidSessionFormat)\n");
+            } else writeStderr(deps, "di: saved session is unreadable. Run `di doctor`; if it is recoverable, use `di session recover <id>`.\n");
+            return .{ .exit = 1 };
+        },
+        error.UnsupportedSessionSchema => {
+            writeStderr(deps, "di: saved session uses an unsupported version and cannot be resumed by this di build.\n");
+            return .{ .exit = 1 };
+        },
+        else => {
+            // A storage fault is named (D29).
+            if (v2StorageFaultMessage(err)) |message| {
+                writeStderr(deps, message);
+                return .{ .exit = 1 };
+            }
+            reportUnexpectedInteractiveError(deps, err);
+            return err;
+        },
+    }
+}
+
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
-    const resume_requested = launch.requested_resume != null;
-    app.* = App.init(alloc, launch, auth_mode) catch |err| {
-        switch (err) {
-            error.NotATerminal => {
-                writeStderr(deps, "di requires an interactive terminal (TTY).\n");
-                return .{ .exit = 1 };
-            },
-            error.TerminalTooSmall => {
-                writeStderr(deps, "di needs at least 5 terminal rows.\n");
-                return .returned;
-            },
-            error.RecordingStartFailed => {
-                writeStderr(deps, "di: unable to start terminal recording.\n");
-                return .{ .exit = 1 };
-            },
-            error.NoRememberedSession => {
-                writeStderr(deps, "di: no remembered session for this workspace; choose one with di -r or di --resume <id>\n");
-                return .{ .exit = 1 };
-            },
-            error.RememberedSessionUnavailable => {
-                writeStderr(deps, "di: the remembered session ID could not be read; choose one with di -r or di --resume <id>\n");
-                return .{ .exit = 1 };
-            },
-            error.NoSavedSessions => {
-                writeStderr(deps, "di: no saved sessions for this workspace.\n");
-                return .{ .exit = 1 };
-            },
-            error.NoReadableSessions => {
-                // The unreadable sessions can belong to any workspace, so only
-                // the absence of a readable one is tied to this workspace.
-                writeStderr(deps, "di: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `di doctor` for recovery guidance.\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionNotFound => {
-                writeStderr(deps, "di: saved session not found.\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionBusy => {
-                writeStderr(deps, "di: another di process may be using this session (running or suspended); check other terminals or run jobs, then use fg or quit that process\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionLockUnsupported => {
-                writeStderr(deps, "di: the filesystem cannot provide the required session lock\n");
-                return .{ .exit = 1 };
-            },
-            error.SessionAuthorityBoundaryUnavailable,
-            error.SessionCommitBoundaryUnavailable,
-            => {
-                writeStderr(deps, "di: a saved session has an unfinished update that could not be recovered; run `di doctor` to identify the affected session\n");
-                return .{ .exit = 1 };
-            },
-            error.OneOffSessionNotResumable => {
-                writeStderr(deps, "di: subagent child sessions cannot be resumed directly; message the named agent from its parent session\n");
-                return .{ .exit = 1 };
-            },
-            error.InvalidSessionFormat => {
-                writeStderr(deps, "di: saved session is unreadable. Run `di doctor`; if it is recoverable, use `di session recover <id>`.\n");
-                return .{ .exit = 1 };
-            },
-            error.UnsupportedSessionSchema => {
-                writeStderr(deps, "di: saved session uses an unsupported version and cannot be resumed by this di build.\n");
-                return .{ .exit = 1 };
-            },
-            else => {
-                // v2 names a storage fault (D29); v1 reports it as it always has.
-                if (session_adapter.enabled(launch.modifiers.sessions_v2)) {
-                    if (v2StorageFaultMessage(err)) |message| {
-                        writeStderr(deps, message);
-                        return .{ .exit = 1 };
-                    }
-                }
-                reportUnexpectedInteractiveError(deps, err);
-                return err;
-            },
+    var resume_requested = launch.requested_resume != null;
+    app.* = App.init(alloc, launch, auth_mode) catch |first_err| fresh: {
+        // An update relaunched a session that had no turn, which v2 never
+        // saved (D2): the new build opens a fresh session instead (D81).
+        if (first_err == error.SessionNotFound and launch.upgrade_relaunch != null) {
+            debug_trace.logf("session", "event=upgrade_relaunch_fresh_session reason=SessionNotFound", .{});
+            if (launch.requested_resume) |*target| target.deinit(alloc);
+            launch.requested_resume = null;
+            resume_requested = false;
+            if (App.init(alloc, launch, auth_mode)) |started| break :fresh started else |err| return initFailure(deps, launch, alloc, err);
         }
+        return initFailure(deps, launch, alloc, first_err);
     };
     if (comptime !cooperative) {
-        if (@hasDecl(App, "startMcpDiscovery")) app.startMcpDiscovery();
         if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
     }
     var app_needs_deinit = true;
@@ -318,13 +327,8 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             if (shutdown.failure) |err| reportShutdownFailure(deps, err);
         }
     };
-    if (comptime !cooperative and @hasField(App, "session") and
-        @hasDecl(@TypeOf(app.session), "attachProfileUsagePublisher"))
-    {
-        app.session.attachProfileUsagePublisher(app.alloc);
-    }
     if (comptime !cooperative) {
-        if (resume_requested) app.startResumedSessionReconciliation();
+        if (resume_requested) app.startResumedSessionWarmup();
         if (@hasDecl(App, "configureNotifications")) try app.configureNotifications();
         if (@hasDecl(App, "playStartupSound")) app.playStartupSound();
         if (@hasDecl(App, "startAutoUpgrade")) app.startAutoUpgrade();
@@ -335,7 +339,6 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return err;
         };
         app.startModelCacheWarmup();
-        if (@hasDecl(App, "startSessionCatalogPreload")) app.startSessionCatalogPreload();
     }
 
     app.run() catch |err| {
@@ -391,15 +394,10 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         if (handoff_value) |value| {
             var handoff = value;
             defer handoff.deinit(alloc);
-            var argv: [6][]const u8 = undefined;
+            var argv: [5][]const u8 = undefined;
             var argc: usize = 0;
             argv[argc] = request.executablePath();
             argc += 1;
-            // A v2 session resumes only with the flag that saved it.
-            if (handoff.sessions_v2) {
-                argv[argc] = cli_surface.sessions_v2_arg;
-                argc += 1;
-            }
             for ([_][]const u8{ "resume", handoff.session_id, cli_surface.upgrade_relaunch_arg }) |arg| {
                 argv[argc] = arg;
                 argc += 1;
@@ -414,7 +412,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 io_mod.getIo(),
                 .{ .argv = argv_slice },
             );
-            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id, handoff.sessions_v2);
+            writeUpgradeRelaunchFailure(deps, replace_err, handoff.session_id);
         } else {
             writeStderr(
                 deps,
@@ -432,10 +430,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
                 &message_buffer,
                 handoff.session_id,
                 resume_handoff_columns,
-                handoff.sessions_v2,
             )
         else
-            formatResumeHandoff(&message_buffer, handoff.session_id, handoff.sessions_v2)) catch return .returned;
+            formatResumeHandoff(&message_buffer, handoff.session_id)) catch return .returned;
         deps.write_stdout(deps.stdout_ctx, message) catch {};
     }
     return .returned;
@@ -443,7 +440,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
 
 fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     var buffer: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, "di: session save failed: {s}\n", .{@errorName(err)}) catch
+    const text = std.mem.print(&buffer, "di: session save failed: {s}\n", .{@errorName(err)}) catch
         "di: session save failed\n";
     writeStderr(deps, text);
 }
@@ -460,13 +457,12 @@ fn writeUpgradeRelaunchFailure(
     deps: RunDeps,
     err: std.process.ReplaceError,
     session_id: []const u8,
-    sessions_v2: bool,
 ) void {
     var buffer: [768]u8 = undefined;
-    const message = std.fmt.bufPrint(
+    const message = std.mem.print(
         &buffer,
-        "di: upgrade installed, but relaunch failed: {s}\nContinue session with: di {s}--resume {s}\n",
-        .{ @errorName(err), if (sessions_v2) "--sessions-v2 " else "", session_id },
+        "di: upgrade installed, but relaunch failed: {s}\nContinue session with: di --resume {s}\n",
+        .{ @errorName(err), session_id },
     ) catch "di: upgrade installed, but relaunch failed; run `di doctor`.\n";
     writeStderr(deps, message);
 }
@@ -503,10 +499,7 @@ fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
         .tool_set = cfg.tool_set,
         .inspect_mcp_profile_config = cfg.inspect_mcp_profile_config,
         .inspect_mcp_local_config = cfg.inspect_mcp_local_config,
-        .load_mcp_runtime = cfg.load_mcp_runtime,
         .load_mcp_host = cfg.load_mcp_host,
-        .add_mcp_profile_server = cfg.add_mcp_profile_server,
-        .remove_mcp_profile_server = cfg.remove_mcp_profile_server,
         .acp_runner = cfg.acp_runner,
     };
 }
@@ -538,16 +531,12 @@ fn writeRealStdout(_: ?*anyopaque, text: []const u8) !void {
     try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
 }
 
-fn formatResumeHandoff(buffer: []u8, session_id: []const u8, sessions_v2: bool) ![]const u8 {
-    return std.fmt.bufPrint(
-        buffer,
-        "Continue session with: di {s}--resume {s}\n",
-        .{ if (sessions_v2) "--sessions-v2 " else "", session_id },
-    );
+fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+    return std.mem.print(buffer, "Continue session with: di --resume {s}\n", .{session_id});
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "di: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+    return std.mem.print(buffer, "di: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
 }
 
 /// A v2 session that cannot be written at startup, in one sentence; null
@@ -594,10 +583,6 @@ const test_entry_context_registry = context_contract.Registry{ .default_provider
     .append_transient_fn = appendNoopTransientContextForTest,
 } };
 
-fn noMcpRuntimeForTest(_: Allocator, _: []const u8, _: @import("../mcp/elicitation.zig").Capabilities) !?*mcp_runtime.McpRuntime {
-    return null;
-}
-
 fn noMcpConfigInspectionForTest(
     _: Allocator,
 ) error{OutOfMemory}!mcp_contract.ProfileConfigDiagnostic {
@@ -634,7 +619,6 @@ fn testConfig() Config {
         .context_registry = test_entry_context_registry,
         .mode_registry = .{ .default_mode_id = "entry" },
         .inspect_mcp_profile_config = noMcpConfigInspectionForTest,
-        .load_mcp_runtime = noMcpRuntimeForTest,
         .acp_runner = .{ .run_fn = unexpectedAcpRunForTest },
         .tool_set = .{
             .registry = .{ .tools = &.{} },
@@ -669,7 +653,7 @@ fn appendInitEvent(launch: *const cli_surface.InteractiveLaunch) void {
             .pick => appendTestEvent("init:pick"),
             .last => appendTestEvent("init:last"),
             .remembered => appendTestEvent("init:remembered"),
-            .id => |id| appendTestEvent(std.fmt.bufPrint(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
+            .id => |id| appendTestEvent(std.mem.print(&test_init_event_buf, "init:{s}", .{id}) catch "init:<invalid>"),
         }
     } else {
         appendTestEvent("init:none");
@@ -691,6 +675,8 @@ const TestCapture = struct {
     stdout: std.Io.Writer.Allocating,
     bench_value: ?[]const u8 = null,
     init_error: ?anyerror = null,
+    /// `init_error` fails only the first init.
+    init_error_once: bool = false,
     worker_error: ?anyerror = null,
     run_error: ?anyerror = null,
     stderr_error: ?anyerror = null,
@@ -700,7 +686,6 @@ const TestCapture = struct {
     record_stderr_event: bool = false,
     record_stdout_event: bool = false,
     resume_handoff_id: ?[]const u8 = null,
-    resume_handoff_sessions_v2: bool = false,
     shutdown_failure: ?anyerror = null,
     raise_sigint_during_deinit: bool = false,
     upgrade_relaunch_path: ?[]const u8 = null,
@@ -818,7 +803,10 @@ const TestApp = struct {
 
     fn init(_: Allocator, launch: *cli_surface.InteractiveLaunch, _: credentials.AuthMode) !TestApp {
         appendInitEvent(launch);
-        if (active_capture.?.init_error) |err| return err;
+        if (active_capture.?.init_error) |err| {
+            if (active_capture.?.init_error_once) active_capture.?.init_error = null;
+            return err;
+        }
 
         var app = TestApp{};
         if (launch.requested_resume) |target| {
@@ -841,7 +829,7 @@ const TestApp = struct {
                 self.deinit();
                 return .{ .failure = error.OutOfMemory };
             };
-            break :blk .{ .session_id = session_id, .sessions_v2 = active_capture.?.resume_handoff_sessions_v2 };
+            break :blk .{ .session_id = session_id };
         } else null;
         if (active_capture.?.raise_sigint_during_deinit) {
             _ = std.c.raise(std.posix.SIG.INT);
@@ -850,7 +838,7 @@ const TestApp = struct {
         return .{ .handoff = handoff, .failure = active_capture.?.shutdown_failure };
     }
 
-    fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
+    pub fn takeUpgradeRelaunchRequest(_: *TestApp) ?auto_upgrade.RelaunchRequest {
         const path = active_capture.?.upgrade_relaunch_path orelse return null;
         var request = auto_upgrade.RelaunchRequest{
             .executable_path_len = path.len,
@@ -869,23 +857,19 @@ const TestApp = struct {
         appendTestEvent("terminal-release");
     }
 
-    fn startResumedSessionReconciliation(_: *TestApp) void {
+    fn startResumedSessionWarmup(_: *TestApp) void {
         appendTestEvent("resume-reconciliation");
     }
 
-    fn startAutoUpgrade(_: *TestApp) void {
+    pub fn startAutoUpgrade(_: *TestApp) void {
         appendTestEvent("auto-upgrade");
     }
 
-    fn startFileIndex(_: *TestApp) void {
+    pub fn startFileIndex(_: *TestApp) void {
         appendTestEvent("file-index");
     }
 
-    fn startMcpDiscovery(_: *TestApp) void {
-        appendTestEvent("mcp-discovery");
-    }
-
-    fn rebindAfterInit(_: *TestApp) void {
+    pub fn rebindAfterInit(_: *TestApp) void {
         appendTestEvent("rebind-after-init");
     }
 
@@ -931,7 +915,6 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expect(capture.seen_config.?.secret_store.context == cfg.secret_store.context);
     try std.testing.expect(capture.seen_config.?.secret_store.load_fn == cfg.secret_store.load_fn);
     try std.testing.expect(capture.seen_config.?.inspect_mcp_profile_config == noMcpConfigInspectionForTest);
-    try std.testing.expect(capture.seen_config.?.load_mcp_runtime == noMcpRuntimeForTest);
     try std.testing.expectEqual(@as(usize, 0), test_event_count);
 }
 
@@ -987,7 +970,7 @@ test "app entry runs interactive startup callbacks in active order" {
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry reports persistence failure after teardown instead of a successful handoff" {
@@ -1023,7 +1006,6 @@ test "app entry writes exact resume handoff after interactive teardown" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
         "rebind-after-init",
         "auto-upgrade",
         "file-index",
@@ -1066,26 +1048,6 @@ test "app entry bounds graceful-exit SIGINT suppression to handoff lifetime" {
     try std.testing.expectEqual(@as(usize, 1), test_sigint_count.load(.seq_cst));
 }
 
-test "a v2 handoff relaunches and hints with --sessions-v2" {
-    const alloc = std.testing.allocator;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.resume_handoff_id = "session-123";
-    capture.resume_handoff_sessions_v2 = true;
-    capture.upgrade_relaunch_path = "/tmp/fx-upgraded";
-
-    const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
-
-    try std.testing.expectEqual(@as(u8, 1), outcome.exit);
-    try std.testing.expectEqual(@as(usize, 5), capture.replace_arg_count);
-    try std.testing.expectEqualStrings("/tmp/fx-upgraded", capture.replaceArg(0));
-    try std.testing.expectEqualStrings("--sessions-v2", capture.replaceArg(1));
-    try std.testing.expectEqualStrings("resume", capture.replaceArg(2));
-    try std.testing.expectEqualStrings("session-123", capture.replaceArg(3));
-    try std.testing.expectEqualStrings("--upgrade-relaunch", capture.replaceArg(4));
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "di --sessions-v2 --resume session-123") != null);
-}
-
 test "app entry relaunches only after teardown with the validated handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -1121,7 +1083,6 @@ test "app entry relaunches only after teardown with the validated handoff" {
     ) != null);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
         "rebind-after-init",
         "auto-upgrade",
         "file-index",
@@ -1224,7 +1185,7 @@ test "app entry releases terminal before reporting worker start errors" {
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("di: TestWorkerStartFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry releases terminal before reporting initial context failures exactly" {
@@ -1246,7 +1207,7 @@ test "app entry releases terminal before reporting initial context failures exac
             runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
         );
         var expected_stderr_buf: [64]u8 = undefined;
-        const expected_stderr = try std.fmt.bufPrint(
+        const expected_stderr = try std.mem.print(
             &expected_stderr_buf,
             "di: {s}\n",
             .{@errorName(expected_error)},
@@ -1255,7 +1216,6 @@ test "app entry releases terminal before reporting initial context failures exac
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{
             "init:none",
-            "mcp-discovery",
             "rebind-after-init",
             "auto-upgrade",
             "file-index",
@@ -1280,7 +1240,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     try std.testing.expectEqualStrings("di: TestRunFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
 }
 
 test "app entry treats terminal input closure as abnormal cleanup without stderr" {
@@ -1305,7 +1265,6 @@ test "app entry treats terminal input closure as abnormal cleanup without stderr
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{
         "init:none",
-        "mcp-discovery",
         "rebind-after-init",
         "auto-upgrade",
         "file-index",
@@ -1327,7 +1286,7 @@ test "app entry preserves run errors when fatal formatting fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry preserves run errors when fatal writer fails" {
@@ -1341,7 +1300,7 @@ test "app entry preserves run errors when fatal writer fails" {
     try std.testing.expectError(error.TestRunFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
-    try expectEvents(&.{ "init:none", "mcp-discovery", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
+    try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry passes requested resume into app init" {
@@ -1352,7 +1311,22 @@ test "app entry passes requested resume into app init" {
     const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("resume"), @constCast("session-123") }, testConfig(), capture.deps());
 
     try std.testing.expectEqual(RunOutcome.returned, outcome);
-    try expectEvents(&.{ "init:session-123", "mcp-discovery", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+    try expectEvents(&.{ "init:session-123", "rebind-after-init", "resume-reconciliation", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
+}
+
+test "app entry opens a fresh session when an upgrade relaunch hands over a session that saved nothing (D81)" {
+    const alloc = std.testing.allocator;
+    const id = try alloc.dupe(u8, "pristine-123");
+    var capture = TestCapture.init(.{ .interactive = .{ .requested_resume = .{ .id = id }, .upgrade_relaunch = .{} } });
+    defer capture.deinit();
+    capture.init_error = error.SessionNotFound;
+    capture.init_error_once = true;
+    const outcome = try runWithDeps(TestApp, alloc, &.{ @constCast("resume"), @constCast("pristine-123"), @constCast("--upgrade-relaunch") }, testConfig(), capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try std.testing.expectEqualStrings("", capture.stderr.written());
+    // The second init has no resume, so no resumed-session warmup runs.
+    try expectEvents(&.{ "init:pristine-123", "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
 test "app entry maps noninteractive terminal startup to exit one" {
@@ -1372,6 +1346,8 @@ test "app entry maps missing saved sessions to exit one" {
     const Case = struct { err: anyerror, stderr: []const u8 };
     for ([_]Case{
         .{ .err = error.NoSavedSessions, .stderr = "di: no saved sessions for this workspace.\n" },
+        // Only an update's own relaunch opens a fresh session instead (D81).
+        .{ .err = error.SessionNotFound, .stderr = "di: saved session not found.\n" },
         .{
             .err = error.NoReadableSessions,
             .stderr = "di: no readable saved sessions for this workspace, and some saved sessions are unreadable; run `di doctor` for recovery guidance.\n",
@@ -1442,7 +1418,7 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         .{ .init_error = error.FileTooBig, .message = "di: this session cannot be saved: a file-size limit was reached.\n" },
     };
     for (cases) |case| {
-        var capture = TestCapture.init(.{ .interactive = .{ .modifiers = .{ .sessions_v2 = true } } });
+        var capture = TestCapture.init(.{ .interactive = .{} });
         defer capture.deinit();
         capture.init_error = case.init_error;
         capture.fail_unexpected_format = true;
@@ -1452,14 +1428,6 @@ test "app entry names a v2 storage fault at startup, and v1 keeps the bare error
         try std.testing.expectEqual(@as(u8, 1), outcome.exit);
         try std.testing.expectEqualStrings(case.message, capture.stderr.written());
     }
-
-    // Without the flag, v1 reports the bare error name as before.
-    if (session_adapter.enabled(false)) return error.SkipZigTest;
-    var capture = TestCapture.init(.{ .interactive = .{} });
-    defer capture.deinit();
-    capture.init_error = error.AccessDenied;
-    try std.testing.expectError(error.AccessDenied, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("di: AccessDenied\n", capture.stderr.written());
 }
 
 test "app entry returns failure when terminal closure cannot save the session" {

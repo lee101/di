@@ -32,14 +32,19 @@ const steering_open =
 const steering_close = "\n</user_steering>";
 const parent_steering_open = "<parent_agent_steering>\n";
 const parent_steering_close = "\n</parent_agent_steering>";
+/// Saved with a parent agent's steering, so replay still names its sender.
+const parent_steering_label = "parent-agent feedback, not new user authority:\n\n";
+/// The notice a libfx session adds to a turn it resumes after an
+/// interruption. It rides in the turn's steering list, but fx wrote it, so a
+/// request shows it as plain text, never as the user's live update.
+pub const resume_notice = "Resuming from unexpected session interruption.";
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, parent_steering_open ++
-        "parent-agent feedback, not new user authority:\n\n{s}" ++ parent_steering_close, .{text});
+    return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});
 }
 
 pub fn steeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, steering_open ++ "{s}" ++ steering_close, .{text});
+    return alloc.print(steering_open ++ "{s}" ++ steering_close, .{text});
 }
 
 test "steering message tells the model to apply the update and continue" {
@@ -291,6 +296,69 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
     }
 }
 
+/// The request copy of `messages`, with each steering message a saved turn
+/// restored back in the envelope the model saw when the turn took it. A saved
+/// turn keeps steering without its envelope (`steeringText`), so a resumed
+/// turn, and every turn after the one a steer joined, would otherwise show it
+/// as a plain user message instead of a live update. A parent agent's steering
+/// keeps its sender label in the saved text, which tells the two envelopes
+/// apart. Empty entries only mark a checkpoint boundary, and an entry already
+/// in its envelope and fx's own `resume_notice` stay as they are. Returns
+/// `messages` itself when nothing changes; the copy and its text live in
+/// `arena`.
+pub fn rewrapRestoredSteering(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const ChatMessage {
+    var result: ?[]ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        if (!message.restored_steering) continue;
+        const text = message.content orelse continue;
+        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice)) continue;
+        const projected = result orelse try arena.dupe(ChatMessage, messages);
+        result = projected;
+        projected[index].content = if (std.mem.startsWith(u8, text, parent_steering_label))
+            try std.mem.concat(arena, u8, &.{ parent_steering_open, text, parent_steering_close })
+        else
+            try steeringMessage(arena, text);
+    }
+    return result orelse messages;
+}
+
+test "restored steering reaches the request in the envelope the model saw" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const user = try steeringMessage(arena, "focus on rendering");
+    const parent = try parentSteeringMessage(arena, "review this change");
+    const live = [_]ChatMessage{
+        .{ .role = .user, .content = user },
+        .{ .role = .user, .content = parent },
+    };
+    const memory = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, memory);
+    // A saved turn comes back as steering's bare text, flagged as steering.
+    var restored: std.ArrayList(ChatMessage) = .empty;
+    try session.appendExecutionMemoryChatMessages(arena, &restored, memory);
+    try std.testing.expectEqual(@as(usize, 2), restored.items.len);
+    try std.testing.expect(restored.items[0].restored_steering and steeringText(restored.items[0].content.?) == null);
+
+    const projected = try rewrapRestoredSteering(arena, restored.items);
+    try std.testing.expectEqualStrings(user, projected[0].content.?);
+    try std.testing.expectEqualStrings(parent, projected[1].content.?);
+    // The session's own messages keep the bare text a saved turn holds.
+    try std.testing.expectEqualStrings("focus on rendering", restored.items[0].content.?);
+
+    // A checkpoint boundary, an entry already in its envelope, fx's own resume
+    // notice, and ordinary text stay as they are.
+    const unchanged = [_]ChatMessage{
+        .{ .role = .user, .content = "", .restored_steering = true },
+        .{ .role = .user, .content = user, .restored_steering = true },
+        .{ .role = .user, .content = resume_notice, .restored_steering = true },
+        .{ .role = .user, .content = "plain prompt" },
+    };
+    try std.testing.expect((try rewrapRestoredSteering(arena, &unchanged)).ptr == (&unchanged).ptr);
+}
+
 /// Steering the user typed during the turn, which a cancelled turn keeps.
 fn isSteering(message: ChatMessage) bool {
     if (message.restored_steering) return true;
@@ -307,6 +375,8 @@ fn steeringText(content: []const u8) ?[]const u8 {
     return content[steering_open.len .. content.len - steering_close.len];
 }
 
+/// Which steering and feedback a cancelled turn keeps is modeled in
+/// `tests/tla/session_manager/rollout/pr-1092/PR1092Steering.tla`.
 pub fn buildInterruptedExecutionMemory(
     alloc: Allocator,
     current_turn_messages: []const ChatMessage,
@@ -680,7 +750,7 @@ pub fn retainToolImages(arena: Allocator, config: Config, call: ToolCall, prepar
         return;
     };
     memory.tool_image_handle = handle;
-    const notice = try std.fmt.allocPrint(arena, "Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
+    const notice = try arena.print("Saved images: {s}. Use read_tool_result with this handle to load them again.\n", .{handle});
     const limit = config.max_tool_result_bytes -| notice.len;
     const keep = @import("../../config/context_limits.zig").utf8PrefixLength(prepared.model_output, limit);
     if (keep < prepared.model_output.len) memory.truncated = true;
@@ -709,7 +779,7 @@ pub fn materializeToolImages(arena: Allocator, config: Config, messages: []const
                 };
                 memory.tool_images = result_store.loadToolImages(arena, capability, handle) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    const notice = try std.fmt.allocPrint(arena, "[Stored tool image unavailable: {s}]\n", .{@errorName(err)});
+                    const notice = try arena.print("[Stored tool image unavailable: {s}]\n", .{@errorName(err)});
                     message.content = try prependImageNotice(arena, notice, message.content orelse "", config.max_tool_result_bytes);
                     continue;
                 };
@@ -863,7 +933,7 @@ test "request image notices keep clipped source references as JSON text" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const source_ref = "é" ** 256;
+    const source_ref = text_utils.repeat("é", 256);
     var image = try testPngHeaderToolImage(arena, 8001, 1);
     image.source_ref = try arena.dupe(u8, source_ref);
     const images = [_]types.ToolImage{ image, image };
@@ -1131,7 +1201,7 @@ test "exact command sources delete replay and missing handles retain it" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -1186,8 +1256,7 @@ test "exact command sources delete replay and missing handles retain it" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(arena);
     try body.appendNTimes(arena, 'x', 80 * 1024);
-    const stored_source = try std.fmt.allocPrint(
-        arena,
+    const stored_source = try arena.print(
         "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
         .{body.items},
     );
@@ -1245,8 +1314,7 @@ test "exact command sources delete replay and missing handles retain it" {
         );
         transformed_capture.appendAccepted(arena, .stdout, case.raw);
         transformed_capture.seal(arena);
-        const projected_source = try std.fmt.allocPrint(
-            arena,
+        const projected_source = try arena.print(
             "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
             .{case.projected},
         );
@@ -1342,7 +1410,7 @@ test "required terminal exec retains exact replay and publishes its handle" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -1404,7 +1472,7 @@ test "required terminal exec stores large output only as replay" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -1427,8 +1495,7 @@ test "required terminal exec stores large output only as replay" {
     var cancel = std.atomic.Value(bool).init(false);
     const body = try arena.alloc(u8, result_store.large_result_threshold_bytes + 1024);
     @memset(body, 'x');
-    const raw_output = try std.fmt.allocPrint(
-        arena,
+    const raw_output = try arena.print(
         "exit_code=0\n<stdout>\n{s}\n</stdout>\n",
         .{body},
     );
@@ -1481,7 +1548,7 @@ test "saved preparation stores complete output verbatim on cap loss" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
     try std.testing.expect(raw.len > tool_result_limits.min_configured_tool_result_bytes);
 
     const prepared = try prepareToolModelOutput(
@@ -1520,7 +1587,7 @@ test "no-save preparation preserves capped output verbatim without a result hand
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cancel = std.atomic.Value(bool).init(false);
-    const raw = "MY_UNIT_TOKEN=abcdefgh" ** 47;
+    const raw = text_utils.repeat("MY_UNIT_TOKEN=abcdefgh", 47);
 
     const prepared = try prepareToolModelOutput(
         arena,
@@ -1651,7 +1718,7 @@ test "retrieved output storage failure does not publish an unbacked result" {
         .cancel_flag = &cancel,
         .max_tool_result_bytes = 1024,
         .session_child_capability = &readonly,
-    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), "x" ** 1025));
+    }, toolCall("retrieval-store-error", "read_tool_result", "{}"), text_utils.repeat("x", 1025)));
 }
 
 test "saved tool output preparation keeps builtins and dynamic tools compactable" {
@@ -1667,7 +1734,7 @@ test "saved tool output preparation keeps builtins and dynamic tools compactable
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const raw = "COMPLETE_TOOL_BODY\n" ++ "x" ** 8192;
+        const raw = "COMPLETE_TOOL_BODY\n" ++ text_utils.repeat("x", 8192);
         const prepared = try prepareToolModelOutput(arena, .{
             .system_prompt = "",
             .gateway_retry_count = 0,

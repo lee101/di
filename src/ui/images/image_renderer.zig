@@ -87,9 +87,9 @@ const PayloadSlot = struct {
     base64: []u8 = &.{},
 };
 
-var meta_slots: [meta_slot_count]MetaSlot = [_]MetaSlot{.{}} ** meta_slot_count;
+var meta_slots: [meta_slot_count]MetaSlot = @splat(MetaSlot{});
 var meta_next: usize = 0;
-var payload_slots: [kitty_graphics.max_live_images]PayloadSlot = [_]PayloadSlot{.{}} ** kitty_graphics.max_live_images;
+var payload_slots: [kitty_graphics.max_live_images]PayloadSlot = @splat(PayloadSlot{});
 var dim_style: []const u8 = "";
 
 // Retained payloads use a dedicated allocator with precise frees so caller
@@ -105,7 +105,7 @@ pub fn resetState() void {
         if (slot.used) payload_alloc.free(slot.base64);
         slot.* = .{};
     }
-    meta_slots = [_]MetaSlot{.{}} ** meta_slot_count;
+    meta_slots = @splat(MetaSlot{});
     meta_next = 0;
 }
 

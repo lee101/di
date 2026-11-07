@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const types = @import("../../shared/types.zig");
@@ -564,7 +565,7 @@ fn deliverSemanticThematicRule(raw: *anyopaque, out: *std.ArrayList(u8)) !void {
 
 pub fn emitProviderLengthNotice(hooks: *const AgentRuntimeDeps, arena: Allocator, disposition: types.ProviderCompletionDisposition) !void {
     if (disposition != .length_limited) return;
-    const line = try std.fmt.allocPrint(arena, "response hit provider length limit; output may be incomplete", .{});
+    const line = try arena.print("response hit provider length limit; output may be incomplete", .{});
     try hooks.push_system_notice(hooks.ctx, line);
 }
 
@@ -579,7 +580,7 @@ pub fn finishLengthLimitedToolCallCompletion(
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
     const rendered = if (normalized.len > 0)
-        try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ normalized, blocker })
+        try arena.print("{s}\n\n{s}", .{ normalized, blocker })
     else
         blocker;
 
@@ -718,7 +719,7 @@ const NoticeCapture = struct {
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
@@ -754,7 +755,7 @@ const NoticeCapture = struct {
     fn httpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
 
     fn formatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 };
 
@@ -837,7 +838,7 @@ const StreamCapture = struct {
         return arena.dupe(u8, call.name);
     }
     fn noopDescribeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
     fn noopPermissionTarget(_: *anyopaque, arena: Allocator, _: ToolCall, _: []const []const u8) ![]const u8 {
         return arena.dupe(u8, "");
@@ -855,7 +856,7 @@ const StreamCapture = struct {
     fn noopCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
     fn noopHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
     fn noopFormatError(_: *anyopaque, arena: Allocator, _: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}", .{@errorName(err)});
+        return arena.print("{s}", .{@errorName(err)});
     }
 
     fn captureToolLifecycle(raw: *anyopaque, event: types.ToolLifecycleEvent) !void {
@@ -1016,7 +1017,7 @@ fn assert_frozen_ansi_span_fixture() !void {
     var oversized_url: [3000]u8 = undefined;
     @memset(&oversized_url, 'a');
     var oversized_line_buf: [3072]u8 = undefined;
-    const oversized_line = try std.fmt.bufPrint(
+    const oversized_line = try std.mem.print(
         &oversized_line_buf,
         "literal [x]({s})\n",
         .{oversized_url[0..]},
@@ -1324,8 +1325,8 @@ test "streamed markdown image retains raw source and publishes its rendered labe
         stream_ctx.raw_text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "▧ architecture") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "![architecture]") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "▧ architecture") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "![architecture]") == null);
 }
 
 test "streamed angle autolinks retain raw source and publish rendered labels" {
@@ -1345,11 +1346,11 @@ test "streamed angle autolinks retain raw source and publish rendered labels" {
         stream_ctx.raw_text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "\x1b]8;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "https://example.com/docs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "mailto:dev@example.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "<https://example.com/docs>") == null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "<dev@example.com>") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "\x1b]8;") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "https://example.com/docs") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "mailto:dev@example.com") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "<https://example.com/docs>") == null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "<dev@example.com>") == null);
 }
 
 test "streamed setext heading waits for its underline and flushes before a tool" {
@@ -1426,6 +1427,23 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer environ.deinit();
     try environ.put(ansi_span_fixture_env, "1");
 
+    // The fixture reaches the shell tool, which imports the `test_paths`
+    // module that `zig build test` generates, so the nested compile needs the
+    // same module.
+    const test_paths = @import("test_paths");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const test_paths_source = try alloc.print(
+        "pub const product_exe: []const u8 = \"{f}\";\npub const source_root: []const u8 = \"{f}\";\n",
+        .{ std.zig.fmtString(test_paths.product_exe), std.zig.fmtString(test_paths.source_root) },
+    );
+    defer alloc.free(test_paths_source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "test_paths.zig", .data = test_paths_source });
+    const test_paths_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "test_paths.zig");
+    defer alloc.free(test_paths_path);
+    const test_paths_module = try alloc.print("-Mtest_paths={s}", .{test_paths_path});
+    defer alloc.free(test_paths_module);
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
 
@@ -1434,14 +1452,14 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     const home_zig: ?[]u8 = blk: {
         const home = std.process.Environ.getAlloc(std.testing.environ, alloc, "HOME") catch break :blk null;
         defer alloc.free(home);
-        break :blk try std.fmt.allocPrint(alloc, "{s}/.zvm/bin/zig", .{home});
+        break :blk try alloc.print("{s}/.zvm/bin/zig", .{home});
     };
     defer if (home_zig) |exe| alloc.free(exe);
 
     for ([3]?[]const u8{ exe_override, "zig", home_zig }) |toolchain| {
         const exe = toolchain orelse continue;
         const result = std.process.run(alloc, std.testing.io, .{
-            .argv = &.{ exe, "test", "-lc", "-Mroot=src/main.zig", "--test-filter", ansi_span_test_name },
+            .argv = &.{ exe, "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
             .cwd = .{ .path = cwd },
             .environ_map = &environ,
             .stdout_limit = .limited(64 * 1024),
@@ -1502,7 +1520,7 @@ test "streamed footnotes retain raw source and flush before a tool" {
         &.{ .text, .table, .text },
         capture.presentation_order.items,
     );
-    try std.testing.expect(std.mem.indexOf(u8, capture.text_spans.items[0], "\x1b[2m[1]\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "\x1b[2m[1]\x1b[22m") != null);
     try std.testing.expectEqualStrings(
         "\n\x1b[2m[1] \x1b[22mOBSERVER_FOOTNOTE_PROJECTION\n",
         capture.text_spans.items[1],
@@ -2011,7 +2029,7 @@ test "stream callbacks publish absolute raw output token progress" {
 }
 
 test "streamed presentation suppresses callback-time failures" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
 
     {
         var capture = StreamCapture{};
@@ -2193,7 +2211,7 @@ fn checkSemanticCodeBlockCaptureAllocationFailures(alloc: Allocator) !void {
 
 test "streamed presentation cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStreamPresentationAllocationFailures,
         .{},
     );
@@ -2201,7 +2219,7 @@ test "streamed presentation cleans up every allocation failure" {
 
 test "semantic table capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticTableCaptureAllocationFailures,
         .{},
     );
@@ -2209,7 +2227,7 @@ test "semantic table capture cleans up every allocation failure" {
 
 test "semantic code block capture cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticCodeBlockCaptureAllocationFailures,
         .{},
     );

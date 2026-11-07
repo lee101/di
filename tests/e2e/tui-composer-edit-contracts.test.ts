@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -30,6 +31,7 @@ const COMPOSER_LIMIT_PASTE_TIMEOUT = TIMEOUT * 3;
 const COMPOSER_BYTE_LIMIT = 8 * 1024 * 1024;
 const PASTE_START = ["1b", "5b", "32", "30", "30", "7e"] as const;
 const PASTE_END = ["1b", "5b", "32", "30", "31", "7e"] as const;
+const SUFFIX_IGNORED_NOTICE = "Input that arrived right after the paste was ignored.";
 const MANAGED_REVIEW_BODY = "GROUP_C_MANAGED_REVIEW_BODY";
 const WORKSPACE_REVIEW_BODY = "GROUP_C_WORKSPACE_REVIEW_BODY";
 
@@ -137,16 +139,18 @@ async function startFx(
   return session;
 }
 
-function historyImageSnapshotPath(): string {
-  const sessionsRoot = join(root!, "home", ".fx", "sessions");
-  const sessionNames = readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) =>
-      entry.isDirectory() &&
-      existsSync(join(sessionsRoot, entry.name, "images"))
-    )
-    .map((entry) => entry.name);
-  expect(sessionNames).toHaveLength(1);
-  const imageDir = join(sessionsRoot, sessionNames[0]!, "images");
+/// The folders fx captures prompt images into, outside the session store,
+/// until a turn saves them (D44).
+function imageSnapshotDirs(): string[] {
+  const tmp = realpathSync("/tmp");
+  return readdirSync(tmp).filter((name) => name.startsWith("fx-image-snapshots-")).map((name) => join(tmp, name));
+}
+
+/// The image this run captured: the one snapshot folder made since `before`.
+function historyImageSnapshotPath(before: Set<string>): string {
+  const made = imageSnapshotDirs().filter((dir) => !before.has(dir));
+  expect(made).toHaveLength(1);
+  const imageDir = made[0]!;
   const snapshotNames = readdirSync(imageDir)
     .filter((name) => name.endsWith(".bin"));
   expect(snapshotNames).toHaveLength(1);
@@ -218,9 +222,20 @@ function userParts(requestIndex = 0): Array<{
   return message?.content ?? [];
 }
 
-function finalUserText(requestIndex = 0): string {
+// The request names each attached image's saved file ahead of the prompt.
+const IMAGE_LOCATION_NOTES = /^(\[Image #\d+ \(image\/[a-z]+\) [^\n]*\]\n)+/;
+
+function requestUserText(requestIndex: number): string {
   return userParts(requestIndex).find((part) => part.type === "text")?.text ??
     "";
+}
+
+function finalUserText(requestIndex = 0): string {
+  return requestUserText(requestIndex).replace(IMAGE_LOCATION_NOTES, "");
+}
+
+function imageLocationNotes(requestIndex = 0): string {
+  return requestUserText(requestIndex).match(IMAGE_LOCATION_NOTES)?.[0] ?? "";
 }
 
 function nestedText(content: unknown): string {
@@ -261,6 +276,21 @@ async function pasteExact(active: TmuxSession, text: string): Promise<void> {
     ...textHex(text),
     ...PASTE_END,
   ]);
+}
+
+/// Pastes `text` and presses `key` in one tmux command, so the key reaches fx
+/// right behind the paste's end marker, as when a user presses a key while a
+/// large paste is still arriving.
+function pasteThenKey(active: TmuxSession, text: string, key: string): void {
+  const buffer = `${active.name}-paste-then-key`;
+  execFileSync("tmux", ["load-buffer", "-b", buffer, "-"], {
+    input: text,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  execFileSync("tmux", [
+    "paste-buffer", "-d", "-p", "-b", buffer, "-t", active.name,
+    ";", "send-keys", "-t", active.name, key,
+  ], { stdio: "pipe" });
 }
 
 async function selectReviewSkill(
@@ -305,6 +335,7 @@ tmuxTest(
     await waitForGatewayRequest();
 
     expect(finalUserText()).toBe("CRLF_SENTINEL_A\nCRLF_SENTINEL_B");
+    expect(await active.captureFullScrollback()).not.toContain(SUFFIX_IGNORED_NOTICE);
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -323,10 +354,18 @@ tmuxTest(
       "0d",
       ...PASTE_END,
     ]);
-    await waitForTraceOrExit(active, "reason=unsafe_suffix");
+    // "/version", "\r", and the terminal's real end marker all follow the
+    // embedded one in the same delivery.
+    await waitForTraceOrExit(
+      active,
+      "paste suffix dropped owner=composer bytes=15 reason=same_delivery_as_end_marker",
+    );
+    await active.waitForText(SUFFIX_IGNORED_NOTICE, TIMEOUT);
 
     expect(gateway?.requestCount()).toBe(0);
-    expect(await active.captureFullScrollback()).not.toMatch(/[*✓!✗⊘i] version:/);
+    const scrollback = await active.captureFullScrollback();
+    expect(scrollback).not.toMatch(/[*✓!✗⊘i] version:/);
+    expect(composerContains(scrollback, "/version")).toBe(false);
     await active.waitForText("PRESERVED_DRAFT", TIMEOUT);
 
     await active.sendKeys("Enter");
@@ -351,13 +390,109 @@ tmuxTest(
       "5b",
       ...PASTE_END,
     ]);
-    await waitForTraceOrExit(active, "reason=unsafe_suffix");
+    await waitForTraceOrExit(
+      active,
+      "paste suffix dropped owner=composer bytes=8 reason=same_delivery_as_end_marker",
+    );
 
     expect(gateway?.requestCount()).toBe(0);
-    await active.waitForText("ESCAPE_DRAFT", TIMEOUT);
+    await active.waitForPane((pane) => composerContains(pane, "ESCAPE_DRAFTpaste"), TIMEOUT);
     await active.sendKeys("Enter");
     await waitForGatewayRequest();
-    expect(finalUserText()).toBe("ESCAPE_DRAFT");
+    expect(finalUserText()).toBe("ESCAPE_DRAFTpaste");
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "Enter in the same delivery as a paste keeps the paste and does not submit",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+    await active.sendLiteralText("DRAFT ");
+
+    await active.sendHexBytes([
+      ...PASTE_START,
+      ...textHex("PASTED_BODY"),
+      ...PASTE_END,
+      "0d",
+    ]);
+    await waitForTraceOrExit(active, "paste end owner=composer bytes=11");
+    await waitForTraceOrExit(
+      active,
+      "paste suffix dropped owner=composer bytes=1 reason=same_delivery_as_end_marker",
+    );
+    await active.waitForText(SUFFIX_IGNORED_NOTICE, TIMEOUT);
+    await active.waitForPane((pane) => composerContains(pane, "DRAFT PASTED_BODY"), TIMEOUT);
+    expect(gateway?.requestCount()).toBe(0);
+
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    expect(finalUserText()).toBe("DRAFT PASTED_BODY");
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "keys typed in the same delivery as a paste are not added to the draft",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+
+    await active.sendHexBytes([
+      ...PASTE_START,
+      ...textHex("PASTED_BODY"),
+      ...PASTE_END,
+      ...textHex("TYPED"),
+    ]);
+    await waitForTraceOrExit(
+      active,
+      "paste suffix dropped owner=composer bytes=5 reason=same_delivery_as_end_marker",
+    );
+    await active.waitForText(SUFFIX_IGNORED_NOTICE, TIMEOUT);
+    await active.waitForPane((pane) => composerContains(pane, "PASTED_BODY"), TIMEOUT);
+    expect(composerContains(await active.capturePane(), "TYPED")).toBe(false);
+
+    // Keys typed after the paste has been read are ordinary input again.
+    await active.sendLiteralText(" AFTER");
+    await active.waitForPane((pane) => composerContains(pane, "PASTED_BODY AFTER"), TIMEOUT);
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    expect(finalUserText()).toBe("PASTED_BODY AFTER");
+    expectCleanRuntime(active);
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "a large paste with Enter pressed right behind it stays in the draft",
+  async () => {
+    const active = await startFx(true, 1, false, "input");
+    const lines = Array.from(
+      { length: 400 },
+      (_, index) => `log line ${String(index).padStart(5, "0")} GET /assets/chunk.js 200 340ms`,
+    );
+    const body = lines.join("\n");
+    await active.sendLiteralText("is there a download optimization to make? ");
+
+    pasteThenKey(active, body, "Enter");
+    await waitForTraceOrExit(active, `paste end owner=composer bytes=${body.length}`);
+    await waitForTraceOrExit(
+      active,
+      "paste suffix dropped owner=composer bytes=1 reason=same_delivery_as_end_marker",
+    );
+    await active.waitForText(SUFFIX_IGNORED_NOTICE, TIMEOUT);
+    await active.waitForPane(
+      (pane) =>
+        composerContains(pane, "is there a download optimization to make?") &&
+        composerContains(pane, "[Pasted text #1, 400 lines]"),
+      TIMEOUT,
+    );
+    expect(gateway?.requestCount()).toBe(0);
+
+    await active.sendKeys("Enter");
+    await waitForGatewayRequest();
+    expect(finalUserText()).toBe(`is there a download optimization to make? ${body}`);
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -876,6 +1011,22 @@ tmuxTest(
     expect(finalUserText(1)).toBe("[Image #2] describe history image");
     expect(userParts(0).filter((part) => part.type === "file")).toHaveLength(1);
     expect(userParts(1).filter((part) => part.type === "file")).toHaveLength(1);
+    // Each turn names the session copy of its image, not the pasted path.
+    const savedPaths = [0, 1].map((requestIndex) => {
+      const note = imageLocationNotes(requestIndex).match(
+        /^\[Image #(\d+) \(image\/png\) is saved at ("(?:[^"\\]|\\.)*")\.\]\n$/,
+      );
+      expect(note).not.toBeNull();
+      expect(note![1]).toBe(String(requestIndex + 1));
+      expect(gateway!.requests[requestIndex]!.body).not.toContain(fixtureImagePath!);
+      const saved = JSON.parse(note![2]!) as string;
+      expect(saved.startsWith(join(root!, "home", ".fx", "sessions"))).toBe(true);
+      expect(readFileSync(saved)).toEqual(readFileSync(fixtureImagePath!));
+      return saved;
+    });
+    // The session keeps those bytes once, as the blob named by their hash.
+    expect(savedPaths[1]).toBe(savedPaths[0]);
+    expect(savedPaths[0]!.startsWith(join(root!, "home", ".fx", "sessions", "v2"))).toBe(true);
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -885,14 +1036,12 @@ for (
   const scenario of [
     {
       name: "corrupt",
-      expectedError: "ImageSnapshotCorrupt",
       damage(path: string) {
         writeFileSync(path, Buffer.from("corrupt history snapshot"));
       },
     },
     {
       name: "deleted",
-      expectedError: "FileNotFound",
       damage(path: string) {
         rmSync(path, { force: true });
       },
@@ -900,8 +1049,9 @@ for (
   ]
 ) {
   tmuxTest(
-    `history recall preserves the composer when an image snapshot is ${scenario.name}`,
+    `history recall keeps its image when the captured file is ${scenario.name}`,
     async () => {
+      const before = new Set(imageSnapshotDirs());
       const active = await startFx(true, 1, false, "prompt_history");
 
       await pasteExact(active, fixtureImagePath!);
@@ -917,18 +1067,18 @@ for (
         TIMEOUT,
       );
 
-      scenario.damage(historyImageSnapshotPath());
-      await active.sendLiteralText("KEEP_CURRENT_DRAFT");
+      // The recalled image carries its bytes, checked against its digest, so
+      // the file fx captured it into is never read again (D84).
+      scenario.damage(historyImageSnapshotPath(before));
       await active.sendKeys("Up");
-      await active.sendKeys("Up");
-      const rejectionTrace =
-        `[prompt_history] event=recall_rejected err=${scenario.expectedError}`;
-      await waitForTraceOrExit(active, rejectionTrace);
+      await active.waitForPane(
+        (pane) => composerContains(pane, "remember image") && composerContains(pane, "[Image 1]"),
+        TIMEOUT,
+      );
 
       expect(active.isAlive()).toBe(true);
-      await active.waitForText("KEEP_CURRENT_DRAFT", TIMEOUT);
       expect(readFileSync(stderrPath!, "utf8")).toBe("");
-      expect(readFileSync(join(root!, "trace.log"), "utf8")).toContain(rejectionTrace);
+      expect(readFileSync(join(root!, "trace.log"), "utf8")).not.toContain("event=recall_rejected");
     },
     TIMEOUT,
   );

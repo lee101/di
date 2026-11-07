@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const types = @import("../core/shared/types.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
@@ -10,6 +11,7 @@ const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -85,13 +87,13 @@ fn matching_reasoning_metadata(first: std.json.Value, next: std.json.Value, fiel
 test "chat completions replay compacts unsigned fragments without crossing metadata boundaries" {
     const alloc = std.testing.allocator;
     const fragment = "{\"type\":\"reasoning.text\",\"text\":\"x\",\"format\":\"unknown\",\"index\":0}";
-    const raw = (fragment ++ ",") ** 999 ++ fragment;
+    const raw = text_utils.repeat(fragment ++ ",", 999) ++ fragment;
     const compacted = try compact_reasoning_details(alloc, raw);
     defer alloc.free(compacted);
     try std.testing.expect(compacted.len < 1100);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, compacted, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("x" ** 1000, parsed.value.object.get("text").?.string);
+    try std.testing.expectEqualStrings(text_utils.repeat("x", 1000), parsed.value.object.get("text").?.string);
 
     const protected = fragment ++ "," ++
         "{\"type\":\"reasoning.text\",\"text\":\"y\",\"format\":\"unknown\",\"index\":1}," ++
@@ -368,7 +370,7 @@ test "chat completions error masking survives JSON and recovery decoding" {
     const duplicate = try redact_error_detail(alloc, "{\"error\":{\"message\":\"alpha\\/beta\"},\"alpha/beta\":0,\"alpha\\/beta\":1}", "alpha/beta");
     defer alloc.free(duplicate);
     try std.testing.expectEqualStrings("Provider error details could not be decoded", duplicate);
-    const nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    const nested = text_utils.repeat("[", 65) ++ "0" ++ text_utils.repeat("]", 65);
     const bounded = try redact_error_detail(alloc, nested, "alpha");
     defer alloc.free(bounded);
     try std.testing.expectEqualStrings("Provider error details exceeded the nesting limit", bounded);
@@ -385,7 +387,7 @@ test "chat completions error masking releases partial allocations" {
             defer alloc.free(plain);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
@@ -410,7 +412,6 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
             if (call.provenance != .fx_local or call.provider_result != null) return error.UnsupportedToolProvenance;
             if (call.id.len == 0 or call.final_identity != .valid) return error.InvalidToolCallId;
             try validate_name(call.name);
-            if (call.argument_integrity != .valid) return error.InvalidToolArguments;
             if (call.arguments_json.len > max_history_arguments_bytes) return error.ArgumentsTooLarge;
             try validate_arguments(alloc, call.arguments_json);
             const entry = try pending.getOrPut(alloc, call.id);
@@ -597,9 +598,9 @@ fn write_user_content_parts(
 /// assistant tool-call message they answer.
 fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, tool_names: []const []const u8, images: []const types.ToolImage) !void {
     const label = if (tool_names.len == 1)
-        try std.fmt.allocPrint(alloc, "The tool \"{s}\" returned {d} image(s).", .{ tool_names[0], images.len })
+        try alloc.print("The tool \"{s}\" returned {d} image(s).", .{ tool_names[0], images.len })
     else
-        try std.fmt.allocPrint(alloc, "Tool results returned {d} image(s).", .{images.len});
+        try alloc.print("Tool results returned {d} image(s).", .{images.len});
     defer alloc.free(label);
     try writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
     try std.json.Stringify.value(label, .{}, writer);
@@ -774,22 +775,18 @@ const Tool = struct {
 };
 
 /// Single-owner, request-local state machine. No I/O, callbacks, tool execution,
-/// or hidden cancellation reads. Owns all retained input (including selected
-/// names) until deinit. Any accept/finish failure poisons the reducer; deinit
-/// remains mandatory. A successful finish transfers independent owned results.
+/// or hidden cancellation reads. Owns all retained input until deinit. Any
+/// accept/finish failure poisons the reducer; deinit remains mandatory. A
+/// successful finish transfers independent owned results.
 pub const Reducer = struct {
     alloc: Allocator,
     limits: Limits,
     choice: types.ToolChoice,
-    names: std.ArrayList([]u8) = .empty,
     tools: std.ArrayList(Tool) = .empty,
     content: std.ArrayList(u8) = .empty,
     generation_id: ?[]u8 = null,
     response_model: ?[]u8 = null,
     usage: types.Usage = .{},
-    /// Set by transports that treat reported cost as exact billing for this provider.
-    exact_provider: ?model_provider.ProviderId = null,
-    request_model: []const u8 = "",
     usage_total: ?u64 = null,
     usage_final_fields: packed struct(u3) {
         input: bool = false,
@@ -807,21 +804,10 @@ pub const Reducer = struct {
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
         try validate_request(request);
-        var functions = try select_functions(alloc, request.tools, request.tool_choice);
-        defer functions.deinit(alloc);
-        var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice, .request_model = request.model };
-        errdefer self.deinit();
-        for (functions.items) |function| {
-            const name = try alloc.dupe(u8, function.name);
-            errdefer alloc.free(name);
-            try self.names.append(alloc, name);
-        }
-        return self;
+        return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
     }
 
     pub fn deinit(self: *Reducer) void {
-        for (self.names.items) |name| self.alloc.free(name);
-        self.names.deinit(self.alloc);
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.content.deinit(self.alloc);
@@ -1020,18 +1006,10 @@ pub const Reducer = struct {
                 if (non_null(function, "name")) |name_value| {
                     const fragment = try string(name_value);
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
-                    var prefix = false;
-                    for (self.names.items) |name| prefix = prefix or std.mem.startsWith(u8, name, tool.name.items);
-                    if (!prefix) return error.InvalidToolName;
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
-    }
-
-    fn known_name(self: *const Reducer, name: []const u8) bool {
-        for (self.names.items) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
-        return false;
     }
 
     fn accept_usage(self: *Reducer, value: std.json.Value, final: bool) Error!void {
@@ -1089,7 +1067,6 @@ pub const Reducer = struct {
     /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
     /// explicit errors, never executable partial calls or successful tool turns.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
-    /// Observed tokens are not exact billing; no deferred lookup is invented.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
         errdefer self.phase = .closed;
         if (cancelled) return error.Cancelled;
@@ -1105,10 +1082,13 @@ pub const Reducer = struct {
         if (self.refusal_seen) return error.Refused;
         if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        // Unadvertised names and invalid arguments are returned as sent. The tool
+        // loop decides whether such a call runs and answers the rest, and the
+        // permission reviewer retries a malformed decision.
         for (self.tools.items) |tool| {
             if (tool.id == null) return error.InvalidToolCallId;
-            if (!self.known_name(tool.name.items)) return error.InvalidToolName;
-            try validate_arguments(self.alloc, tool.arguments.items);
+            try validate_name(tool.name.items);
+            try check_json_depth(tool.arguments.items);
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
@@ -1141,30 +1121,11 @@ pub const Reducer = struct {
         const generation_id = self.generation_id;
         self.generation_id = null;
         errdefer if (generation_id) |id| self.alloc.free(id);
-        var billing: ?types.ProviderBilling = null;
-        var usage_outcome: stream_provider.UsageOutcome = .{ .unavailable = .possibly_billed };
-        if (self.exact_provider) |provider| if (self.usage.cost) |cost| if (generation_id != null) {
-            const input = self.usage.input_tokens orelse 0;
-            billing = .{
-                .created_at_ms = io_mod.milliTimestamp(),
-                .model = try self.alloc.dupe(u8, self.request_model),
-                .total_cost = cost,
-                .input_tokens = input,
-                .output_tokens = self.usage.output_tokens orelse 0,
-                .cache_read_tokens = @min(self.usage.cache_read_tokens orelse 0, input),
-                .cache_write_tokens = self.usage.cache_write_tokens orelse 0,
-                .reasoning_tokens = self.usage.reasoning_tokens,
-                .billable_web_search_calls = 0,
-            };
-            usage_outcome = .{ .exact = provider };
-        };
-        errdefer if (billing) |value| self.alloc.free(@constCast(value.model));
         const owned_calls = try calls.toOwnedSlice(self.alloc);
         self.phase = .closed;
         return .{ .completed = .{
-            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .billing = billing, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
+            .completion = .{ .content = content, .tool_calls = owned_calls, .generation_id = generation_id, .finish_reason = reason, .usage = self.usage, .provider_state_json = provider_state },
             .ownership = .owned,
-            .usage = usage_outcome,
         } };
     }
 };
@@ -1228,18 +1189,12 @@ fn append_bounded(alloc: Allocator, destination: *std.ArrayList(u8), text: []con
 /// exactly at framed [DONE], without waiting for EOF or consuming another event.
 /// event_bytes also bounds all wire between dispatched data events (including
 /// ignored fields/comments); total_wire_bytes bounds the entire consumed stream.
-pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool)) Error!stream_provider.Result {
-    return consume_stream_exact(alloc, source, request, limits, events, cancel_flag, null);
-}
-
-/// With `exact_provider`, a final usage chunk carrying `cost` and a generation id
-/// settles exact billing for that provider; otherwise usage stays unbilled-unknown.
-pub fn consume_stream_exact(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), exact_provider: ?model_provider.ProviderId) Error!stream_provider.Result {
+/// `progress`, when set, is told about each data event.
+pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     var reducer = try Reducer.init(alloc, request, limits);
     defer reducer.deinit();
-    reducer.exact_provider = exact_provider;
-    var framing = sse.Reader{ .max_event_bytes = limits.event_bytes };
+    var framing = sse.Reader{ .max_event_bytes = limits.event_bytes, .progress = progress };
     defer framing.deinit(alloc);
     while (true) {
         const remaining = limits.total_wire_bytes - framing.total_bytes;
@@ -1316,7 +1271,7 @@ test "chat completions reasoning fields survive a completed response" {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         for ([_][]const u8{ "think ", "carefully" }) |fragment| {
-            const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":\"{s}\"}}}}]}}", .{ field, fragment });
+            const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"{s}\":\"{s}\"}}}}]}}", .{ field, fragment });
             defer alloc.free(chunk);
             try test_accept(&reducer, chunk);
         }
@@ -1438,7 +1393,7 @@ test "chat completions replay-only assistant supports silent-tool continuation a
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions stripped replay-only rows are omitted without changing canonical history" {
@@ -1496,7 +1451,7 @@ test "chat completions replay-only input rejects missing malformed over-limit or
         .{ .raw = "{\"reasoning\":[],\"_tool_call_ids\":[]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[\"missing-call\"]}", .failure = error.InvalidProviderState },
         .{ .raw = "{\"reasoning\":\"text\",\"_tool_call_ids\":[],\"role\":\"system\"}", .failure = error.InvalidProviderState },
-        .{ .raw = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
+        .{ .raw = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}", .failure = error.JsonTooDeep },
         .{ .raw = oversized, .failure = error.ReplayTooLarge },
     }) |case| {
         request.messages = &.{.{ .role = .assistant, .provider_replay = .{
@@ -1597,7 +1552,7 @@ test "chat completions recovered replay rejects injection malformed associations
         try std.testing.expectError(error.InvalidProviderState, build_request(alloc, request, .{ .provider = &provider }));
         try std.testing.expectError(error.InvalidProviderState, project_replay(alloc, replay, &.{}, true, true));
     }
-    const deep = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 64 ++ "0" ++ "}" ** 64 ++ "],\"_tool_call_ids\":[]}";
+    const deep = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 64) ++ "0" ++ text_utils.repeat("}", 64) ++ "],\"_tool_call_ids\":[]}";
     try std.testing.expectError(error.JsonTooDeep, parse_replay(alloc, deep));
     const oversized = try alloc.alloc(u8, types.ProviderReplay.max_bytes + 1);
     defer alloc.free(oversized);
@@ -1617,7 +1572,7 @@ test "chat completions replay accepts exactly the byte and nesting limits" {
     var parsed = try parse_replay(alloc, raw);
     defer parsed.deinit();
     try std.testing.expectEqual(raw.len - prefix.len - suffix.len, parsed.value.object.get("reasoning").?.string.len);
-    const deepest = "{\"reasoning_details\":[" ++ "{\"nested\":" ** 62 ++ "0" ++ "}" ** 62 ++ "],\"_tool_call_ids\":[]}";
+    const deepest = "{\"reasoning_details\":[" ++ text_utils.repeat("{\"nested\":", 62) ++ "0" ++ text_utils.repeat("}", 62) ++ "],\"_tool_call_ids\":[]}";
     var nested = try parse_replay(alloc, deepest);
     defer nested.deinit();
 }
@@ -1627,7 +1582,7 @@ test "chat completions reasoning rejects malformed deltas and enforces aggregate
     for ([_][]const u8{ "\"reasoning\":{}", "\"reasoning_content\":1", "\"reasoning_details\":{}", "\"reasoning_details\":[null]", "\"reasoning_details\":[[]]" }) |field| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}}}}]}}", .{field});
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{{s}}}}}]}}", .{field});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -1680,7 +1635,7 @@ test "chat completions reasoning replay releases all partial allocations" {
             defer alloc.free(stripped);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
 }
 
 test "chat completions reasoning presentation checks cancellation before content from the same event" {
@@ -1709,9 +1664,9 @@ test "chat completions reasoning presentation checks cancellation before content
         var source = std.Io.Reader.fixed(wire);
         const sink: stream_provider.EventSink = .{ .context = &observer, .emit_fn = Observer.emit };
         if (cancel) {
-            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag));
+            try std.testing.expectError(error.Cancelled, consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null));
         } else {
-            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag);
+            var result = try consume_stream(std.testing.allocator, &source, test_request(), .{}, sink, &flag, null);
             defer result.deinit(std.testing.allocator);
         }
         try std.testing.expectEqual(@as(usize, 1), observer.reasoning_count);
@@ -1744,7 +1699,7 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
         defer invalid.deinit();
         try test_accept(&invalid, progress);
         if (final) try test_accept(&invalid, test_stop);
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
+        const chunk = try alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ if (final) "[]" else "[{\"index\":0,\"delta\":{}}]", case.usage });
         defer alloc.free(chunk);
         try std.testing.expectError(case.failure, invalid.accept(chunk, false));
     };
@@ -1758,7 +1713,7 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
 
 fn test_usage_snapshot(reducer: *Reducer, usage: []const u8) Error!void {
     const choices = if (reducer.phase == .finished) "[]" else "[{\"index\":0,\"delta\":{}}]";
-    const chunk = try std.fmt.allocPrint(reducer.alloc, "{{\"choices\":{s},\"usage\":{s}}}", .{ choices, usage });
+    const chunk = try reducer.alloc.print("{{\"choices\":{s},\"usage\":{s}}}", .{ choices, usage });
     defer reducer.alloc.free(chunk);
     try test_accept(reducer, chunk);
 }
@@ -1770,7 +1725,7 @@ test "chat completions final usage allows optional total metadata in either orde
     for ([_]bool{ false, true }) |total_first| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{if (total_first) with_total else counts});
+        const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{if (total_first) with_total else counts});
         defer alloc.free(terminal);
         try test_accept(&reducer, terminal);
         try test_usage_snapshot(&reducer, if (total_first) counts else with_total);
@@ -1835,8 +1790,6 @@ test "chat completions progress with omitted totals reaches enriched final usage
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(?u64, 10), result.completed.completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
-    try std.testing.expect(result.completed.completion.billing == null);
-    try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
 }
 
 test "chat completions partial final fields do not freeze carried progress observations" {
@@ -1942,7 +1895,7 @@ test "chat completions opaque number preservation does not relax index or usage 
     for ([_][]const u8{ "-1", "0.0", "1e0", "9223372036854775808", "\"0\"", "null" }) |number| {
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":{s},\"delta\":{{}}}}]}}", .{number});
+        const chunk = try alloc.print("{{\"choices\":[{{\"index\":{s},\"delta\":{{}}}}]}}", .{number});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
     }
@@ -1950,7 +1903,7 @@ test "chat completions opaque number preservation does not relax index or usage 
         var reducer = try Reducer.init(alloc, test_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        const chunk = try std.fmt.allocPrint(alloc, "{{\"choices\":[],\"usage\":{{\"completion_tokens\":{s}}}}}", .{number});
+        const chunk = try alloc.print("{{\"choices\":[],\"usage\":{{\"completion_tokens\":{s}}}}}", .{number});
         defer alloc.free(chunk);
         try std.testing.expectError(error.InvalidChunk, reducer.accept(chunk, false));
     }
@@ -2014,7 +1967,7 @@ test "chat completions nested builtin additional and dynamic tool wire" {
 
 test "chat completions bounds dynamic schema traversal before serialization" {
     const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"items\":" ** 65 ++ "{}" ++ "}" ** 65, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, text_utils.repeat("{\"items\":", 65) ++ "{}" ++ text_utils.repeat("}", 65), .{});
     defer parsed.deinit();
     var request = test_request();
     request.tools.selected_dynamic = &.{.{ .name = "deep", .description = "Deep schema.", .input_schema = parsed.value }};
@@ -2191,7 +2144,7 @@ test "chat completions serializes user message images as content parts" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const abs = try io_mod.dirRealpathAlloc(arena, tmp.dir, "pixel.png");
-    const snapshot_dir = std.fs.path.dirname(abs).?;
+    const snapshot_dir = std.Io.Dir.path.dirname(abs).?;
     var attachment: types.ImageAttachment = .{
         .id = 1,
         .path = try arena.dupe(u8, abs),
@@ -2247,44 +2200,22 @@ test "chat completions prompt caching hints require the provider opt in" {
     try std.testing.expect(std.mem.find(u8, plain, "\"usage\":{") == null);
 }
 
-test "chat completions exact billing needs the provider, a cost, and a generation id" {
+test "chat completions reduces cache, reasoning and cost usage" {
     const alloc = std.testing.allocator;
     const final = "{\"id\":\"chat-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20,\"total_tokens\":1020,\"cost\":0.0123,\"prompt_tokens_details\":{\"cached_tokens\":900,\"cache_write_tokens\":50},\"completion_tokens_details\":{\"reasoning_tokens\":5}}}";
-    const provider = model_provider.parse("router").?;
-    {
-        var reducer = try Reducer.init(alloc, test_request(), .{});
-        defer reducer.deinit();
-        reducer.exact_provider = provider;
-        try test_accept(&reducer, test_text);
-        try test_accept(&reducer, test_stop);
-        try test_accept(&reducer, final);
-        try test_accept(&reducer, "[DONE]");
-        var result = try reducer.finish(false);
-        defer result.deinit(alloc);
-        const completed = result.completed;
-        try std.testing.expectEqual(@as(?u64, 900), completed.completion.usage.cache_read_tokens);
-        try std.testing.expectEqual(@as(?u64, 50), completed.completion.usage.cache_write_tokens);
-        try std.testing.expectEqual(@as(?u64, 5), completed.completion.usage.reasoning_tokens);
-        try std.testing.expectEqual(@as(?f64, 0.0123), completed.completion.usage.cost);
-        try std.testing.expect(completed.usage == .exact);
-        const billing = completed.completion.billing.?;
-        try std.testing.expectEqualStrings("opaque/local-model:8b", billing.model);
-        try std.testing.expectEqual(@as(u64, 900), billing.cache_read_tokens);
-        try std.testing.expectEqual(@as(u64, 1000), billing.input_tokens);
-    }
-    {
-        var reducer = try Reducer.init(alloc, test_request(), .{});
-        defer reducer.deinit();
-        try test_accept(&reducer, test_text);
-        try test_accept(&reducer, test_stop);
-        try test_accept(&reducer, final);
-        try test_accept(&reducer, "[DONE]");
-        var result = try reducer.finish(false);
-        defer result.deinit(alloc);
-        try std.testing.expect(result.completed.completion.billing == null);
-        try std.testing.expect(result.completed.usage == .unavailable);
-        try std.testing.expectEqual(@as(?u64, 900), result.completed.completion.usage.cache_read_tokens);
-    }
+    var reducer = try Reducer.init(alloc, test_request(), .{});
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    try test_accept(&reducer, test_stop);
+    try test_accept(&reducer, final);
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    const completed = result.completed;
+    try std.testing.expectEqual(@as(?u64, 900), completed.completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 50), completed.completion.usage.cache_write_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), completed.completion.usage.reasoning_tokens);
+    try std.testing.expectEqual(@as(?f64, 0.0123), completed.completion.usage.cost);
 }
 
 test "chat completions rejects unsupported requests and ambiguous selection" {
@@ -2358,7 +2289,7 @@ test "chat completions accepts matching empty terminal usage choices" {
         defer reducer.deinit();
         try test_accept(&reducer, if (with_tools) test_call else test_text);
         try test_accept(&reducer, if (with_tools) test_tools_finish else test_stop);
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{if (with_tools) "tool_calls" else "stop"});
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{if (with_tools) "tool_calls" else "stop"});
         defer alloc.free(trailer);
         try std.testing.expect((try reducer.accept(trailer, false)).content == null);
         try test_accept(&reducer, "[DONE]");
@@ -2367,7 +2298,6 @@ test "chat completions accepts matching empty terminal usage choices" {
         try std.testing.expectEqual(@as(?u64, 16), result.completed.completion.usage.input_tokens);
         try std.testing.expectEqual(@as(?u64, 6), result.completed.completion.usage.output_tokens);
         try std.testing.expectEqual(@as(usize, if (with_tools) 1 else 0), result.completed.completion.tool_calls.len);
-        try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
     }
 }
 
@@ -2385,7 +2315,7 @@ test "chat completions terminal usage cannot introduce content tools or a differ
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{ case.delta, case.reason });
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{s},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":16,\"completion_tokens\":6,\"total_tokens\":22}}}}", .{ case.delta, case.reason });
         defer alloc.free(trailer);
         try std.testing.expectError(error.InconsistentFinishReason, reducer.accept(trailer, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -2410,7 +2340,7 @@ test "chat completions repeated terminal choices reject invalid or conflicting u
         defer reducer.deinit();
         try test_accept(&reducer, test_stop);
         if (case.seed_usage) try test_accept(&reducer, "{\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}");
-        const trailer = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{case.usage});
+        const trailer = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{s}}}", .{case.usage});
         defer alloc.free(trailer);
         try std.testing.expectError(case.expected, reducer.accept(trailer, false));
         try std.testing.expectError(error.StreamClosed, reducer.finish(false));
@@ -2438,24 +2368,53 @@ test "chat completions owns fragmented interleaved tools and results independent
     try std.testing.expectEqualStrings("{\"path\":\"a\"}", completion.tool_calls[0].arguments_json);
     try std.testing.expectEqualStrings("{\"request\":{\"command\":\"pwd\"}}", completion.tool_calls[1].arguments_json);
     try std.testing.expectEqual(types.ToolExecutionProvenance.fx_local, completion.tool_calls[1].provenance);
-    try std.testing.expect(completion.billing == null);
-    try std.testing.expectEqual(stream_provider.UsageUnavailable.possibly_billed, result.completed.usage.unavailable);
 }
 
-test "chat completions malformed and nonobject final arguments never become tools" {
+test "chat completions returns unadvertised names and invalid arguments as sent" {
+    // The tool loop and the permission reviewer decide what happens to these
+    // calls, so the stream must not fail here.
     const alloc = std.testing.allocator;
-    for ([_][]const u8{ "", "{", "[]", "null", "3", "{}junk", "{\"x\":1,\"x\":2}" }) |arguments| {
+    const cases = [_]struct { name: []const u8, arguments: []const u8 }{
+        .{ .name = "not_advertised", .arguments = "{\"path\":\"a\"}" },
+        .{ .name = "read_file", .arguments = "" },
+        .{ .name = "read_file", .arguments = "{" },
+        .{ .name = "read_file", .arguments = "[]" },
+        .{ .name = "read_file", .arguments = "null" },
+        .{ .name = "read_file", .arguments = "3" },
+        .{ .name = "read_file", .arguments = "{}junk" },
+        .{ .name = "read_file", .arguments = "{\"x\":1,\"x\":2}" },
+    };
+    for (cases) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
-        try out.writer.writeAll("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"read_file\",\"arguments\":");
-        try std.json.Stringify.value(arguments, .{}, &out.writer);
+        try out.writer.writeAll("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":");
+        try std.json.Stringify.value(case.name, .{}, &out.writer);
+        try out.writer.writeAll(",\"arguments\":");
+        try std.json.Stringify.value(case.arguments, .{}, &out.writer);
         try out.writer.writeAll("}}]}}]}");
         try test_accept(&reducer, out.written());
-        try std.testing.expectError(error.InvalidToolArguments, test_finish(&reducer, test_tools_finish));
-        try std.testing.expectError(error.StreamClosed, reducer.finish(false));
+        var result = try test_finish(&reducer, test_tools_finish);
+        defer result.deinit(alloc);
+        const call = result.completed.completion.tool_calls[0];
+        try std.testing.expectEqualStrings(case.name, call.name);
+        try std.testing.expectEqualStrings(case.arguments, call.arguments_json);
     }
+}
+
+test "chat completions history replays a call the tool loop blocked" {
+    // dupeBlockedToolCall keeps the rejected integrity and replays `{}`.
+    const alloc = std.testing.allocator;
+    var request = test_tool_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "hi" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}", .argument_integrity = .malformed_json }} },
+        .{ .role = .tool, .tool_call_id = "call-1", .tool_name = "read_file", .content = "Tool arguments were not valid JSON." },
+    };
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"arguments\":\"{}\"") != null);
 }
 
 test "chat completions terminal evidence and finish reasons are strict" {
@@ -2479,7 +2438,7 @@ test "chat completions terminal evidence and finish reasons are strict" {
         var reducer = try Reducer.init(alloc, test_tool_request(), .{});
         defer reducer.deinit();
         try test_accept(&reducer, test_call);
-        const terminal = try std.fmt.allocPrint(alloc, "{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{case.reason});
+        const terminal = try alloc.print("{{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}", .{case.reason});
         defer alloc.free(terminal);
         try std.testing.expectError(case.failure, test_finish(&reducer, terminal));
     }
@@ -2510,7 +2469,6 @@ test "chat completions rejects malformed chunks contradictory identities and ext
         .{ .first = test_text, .chunk = "{\"id\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_text, .chunk = "{\"model\":\"other\",\"choices\":[]}", .failure = error.ConflictingIdentity },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"other\"}]}}]}", .failure = error.ConflictingIdentity },
-        .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\"}}]}}]}", .failure = error.InvalidToolName },
         .{ .first = test_call, .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call-1\"}]}}]}", .failure = error.ConflictingIdentity },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":-1}]}}]}", .failure = error.InvalidChunk },
         .{ .chunk = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0},{\"index\":0}]}}]}", .failure = error.ConflictingIdentity },
@@ -2526,7 +2484,7 @@ test "chat completions rejects malformed chunks contradictory identities and ext
     }
 }
 
-test "chat completions usage trailers preserve observations without billing" {
+test "chat completions usage trailers preserve observations" {
     const alloc = std.testing.allocator;
     var reducer = try Reducer.init(alloc, test_request(), .{});
     defer reducer.deinit();
@@ -2543,7 +2501,6 @@ test "chat completions usage trailers preserve observations without billing" {
     try std.testing.expectEqualStrings("chat-1", completion.generation_id.?);
     try std.testing.expectEqual(@as(?u64, 17), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 3), completion.usage.output_tokens);
-    try std.testing.expect(completion.billing == null);
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     for ([_][]const u8{
         "{\"choices\":[],\"usage\":{\"prompt_tokens\":-1}}",
@@ -2566,33 +2523,94 @@ test "chat completions stream framing handles chunks trailers truncation and wir
         defer alloc.free(buffer);
         var fixed = std.Io.Reader.fixed(wire);
         var source = fixed.limited(.unlimited, buffer);
-        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled);
+        var result = try consume_stream(alloc, &source.interface, test_request(), .{}, null, &cancelled, null);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("hello", result.completed.completion.content.?);
         try std.testing.expectEqual(@as(?u64, 5), result.completed.completion.usage.input_tokens);
     }
     for ([_][]const u8{ "", "data: [DONE]\n\n", "data: " ++ test_stop ++ "\n\n", "data: " ++ test_stop ++ "\n\ndata: [DONE]", "data: " ++ test_stop ++ "\n\ndata: [DONE]\n" }) |truncated| {
         var source = std.Io.Reader.fixed(truncated);
-        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+        try std.testing.expectError(error.IncompleteStream, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n" ** 20);
-        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled));
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n", 20));
+        try std.testing.expectError(error.EventTooLarge, consume_stream(alloc, &source, test_request(), .{ .event_bytes = 30 }, null, &cancelled, null));
     }
     {
-        var source = std.Io.Reader.fixed(": comment\n\n" ** 20);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled));
+        var source = std.Io.Reader.fixed(text_utils.repeat(": comment\n\n", 20));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = 30 }, null, &cancelled, null));
     }
     {
         var source = std.Io.Reader.fixed(wire);
-        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled));
+        try std.testing.expectError(error.StreamTooLarge, consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len - 1 }, null, &cancelled, null));
     }
     // A terminal delimiter is sufficient: never wait for a failing next read.
     var source = std.Io.Reader.failing;
     source.buffer = @constCast(wire);
     source.end = wire.len;
-    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null);
     defer result.deinit(alloc);
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    if (reasoning.text.items.len > 0) {
+        for (try reasoning.pieces(arena)) |piece| {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning\":{f}}}}}]}}", piece);
+        }
+    }
+    for (try content.pieces(arena), 0..) |piece, index| {
+        if (index == 0) {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"id\":\"chat-1\",\"model\":\"resolved-model\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{f}}},\"finish_reason\":null}}]}}", piece);
+        } else {
+            try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{f}}}}}]}}", piece);
+        }
+    }
+    if (with_tool) {
+        for (try arguments.pieces(arena), 0..) |piece, index| {
+            if (index == 0) {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":{f}}}}}]}}}}]}}", piece);
+            } else {
+                try stream_fuzz.appendEvent(wire, smith, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{f}}}}}]}}}}]}}", piece);
+            }
+        }
+    }
+    try wire.print("data: {s}\n\ndata: [DONE]\n\n", .{if (with_tool) test_tools_finish else test_stop});
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    const cancelled = std.atomic.Value(bool).init(false);
+    var result = try consume_stream(std.testing.allocator, &source.interface, test_tool_request(), .{}, deltas.sink(), &cancelled, null);
+    defer result.deinit(std.testing.allocator);
+
+    if (result != .completed) return error.TestStreamFailed;
+    const completion = result.completed.completion;
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call-1", arguments.text.items);
+}
+
+test "chat completions streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").chat_completions_stream.*),
+    });
 }
 
 test "chat completions reducer caps events content identities arguments tools and nesting" {
@@ -2605,7 +2623,7 @@ test "chat completions reducer caps events content identities arguments tools an
         .{ .limits = .{ .content_bytes = 4 }, .chunk = test_text, .failure = error.ContentTooLarge },
         .{ .limits = .{ .arguments_bytes = 2 }, .chunk = test_call, .failure = error.ArgumentsTooLarge },
         .{ .limits = .{ .tool_calls = 0 }, .chunk = test_call, .failure = error.TooManyTools },
-        .{ .limits = .{}, .chunk = "[" ** 65 ++ "]" ** 65, .failure = error.JsonTooDeep },
+        .{ .limits = .{}, .chunk = text_utils.repeat("[", 65) ++ text_utils.repeat("]", 65), .failure = error.JsonTooDeep },
     }) |case| {
         var reducer = try Reducer.init(alloc, test_tool_request(), case.limits);
         defer reducer.deinit();
@@ -2627,7 +2645,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     try std.testing.expectError(error.StreamClosed, reducer.finish(false));
     var cancelled = std.atomic.Value(bool).init(true);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, null, &cancelled, null));
     var request = test_request();
     request.budget = .{ .cancel_flag = &cancelled };
     const serialized = try build_request(alloc, request, .{});
@@ -2644,7 +2662,7 @@ test "chat completions cancellation poisons retained state and progress cannot e
     var observer = Observer{ .flag = &cancelled };
     cancelled.store(false, .seq_cst);
     source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n");
-    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled));
+    try std.testing.expectError(error.Cancelled, consume_stream(alloc, &source, test_request(), .{}, .{ .context = &observer, .emit_fn = Observer.emit }, &cancelled, null));
     try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
@@ -2657,12 +2675,12 @@ fn test_allocation_paths(alloc: Allocator) !void {
     defer alloc.free(body);
     var source = std.Io.Reader.fixed("data: " ++ test_text ++ "\n\ndata: " ++ test_call ++ "\n\ndata: " ++ test_tools_finish ++ "\n\ndata: [DONE]\n\n");
     const cancelled = std.atomic.Value(bool).init(false);
-    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled);
+    var result = try consume_stream(alloc, &source, request, .{}, null, &cancelled, null);
     defer result.deinit(alloc);
 }
 
 test "chat completions allocation failure cleanup covers serialization framing reduction and result transfer" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, test_allocation_paths, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_allocation_paths, .{});
 }
 
 test "chat completions name fragments preserve repeated bytes and shared prefixes" {
@@ -2698,12 +2716,12 @@ test "chat completions accepts empty name fragments without losing arguments" {
 test "chat completions accepts echoed models up to the request model limit" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     const body = try build_request(alloc, request, .{});
     defer alloc.free(body);
     var reducer = try Reducer.init(alloc, request, .{});
     defer reducer.deinit();
-    const chunk = try std.fmt.allocPrint(alloc, "{{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}", .{request.model});
+    const chunk = try alloc.print("{{\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}", .{request.model});
     defer alloc.free(chunk);
     try test_accept(&reducer, chunk);
     try test_accept(&reducer, "[DONE]");
@@ -2715,11 +2733,11 @@ test "chat completions accepts echoed models up to the request model limit" {
 test "chat completions model bounds and serializer ignore external cancellation state" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    for ([_][]const u8{ " leading", "trailing ", "bad\xff", "m" ** (configured_provider.max_model_bytes + 1) }) |invalid| {
+    for ([_][]const u8{ " leading", "trailing ", "bad\xff", text_utils.repeat("m", configured_provider.max_model_bytes + 1) }) |invalid| {
         request.model = invalid;
         try std.testing.expectError(error.InvalidModel, build_request(alloc, request, .{}));
     }
-    request.model = "m" ** configured_provider.max_model_bytes;
+    request.model = text_utils.repeat("m", configured_provider.max_model_bytes);
     var cancelled = std.atomic.Value(bool).init(false);
     request.budget = .{ .cancel_flag = &cancelled };
     const before = try build_request(alloc, request, .{});
@@ -2735,11 +2753,10 @@ test "chat completions missing tool fields sparse indexes and invalid identities
     const cases = [_]struct { delta: []const u8, failure: Error, at_finish: bool = false }{
         .{ .delta = "{\"index\":0,\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
-        .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read_file\"}}", .failure = error.InvalidToolArguments, .at_finish = true },
+        .{ .delta = "{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolName, .at_finish = true },
         .{ .delta = "{\"index\":1,\"id\":\"x\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}", .failure = error.InvalidToolCallId, .at_finish = true },
         .{ .delta = "{\"index\":0,\"id\":\"\"}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"id\":7}", .failure = error.InvalidChunk },
-        .{ .delta = "{\"index\":0,\"function\":{\"name\":\"not_advertised\"}}", .failure = error.InvalidToolName },
         .{ .delta = "{\"index\":0,\"function\":{\"name\":3}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":0,\"function\":{\"arguments\":{}}}", .failure = error.InvalidChunk },
         .{ .delta = "{\"index\":999999999}", .failure = error.TooManyTools },
@@ -2756,16 +2773,13 @@ test "chat completions missing tool fields sparse indexes and invalid identities
     }
 }
 
-test "chat completions repeated consistent identity preserves one call and selected names are owned" {
+test "chat completions repeated consistent identity preserves one call" {
     const alloc = std.testing.allocator;
     var request = test_request();
-    const name = try alloc.dupe(u8, "read_file");
-    defer alloc.free(name);
-    const function: model_tool_schema.FunctionSchema = .{ .name = name, .description = "Read." };
+    const function: model_tool_schema.FunctionSchema = .{ .name = "read_file", .description = "Read." };
     request.tools.additional_functions = &.{function};
     var reducer = try Reducer.init(alloc, request, .{});
     defer reducer.deinit();
-    @memset(name, 'x');
     try test_accept(&reducer, test_call);
     try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"arguments\":\"\"}}]}}]}");
     var result = try test_finish(&reducer, test_tools_finish);
@@ -2810,7 +2824,7 @@ test "chat completions exact wire and aggregate delta bounds include the termina
     const wire = "data: " ++ test_text ++ "\n\ndata: " ++ test_stop ++ "\n\ndata: [DONE]\n\n";
     const cancelled = std.atomic.Value(bool).init(false);
     var source = std.Io.Reader.fixed(wire);
-    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled);
+    var result = try consume_stream(alloc, &source, test_request(), .{ .total_wire_bytes = wire.len }, null, &cancelled, null);
     defer result.deinit(alloc);
     for ([_]struct { limits: Limits, failure: Error }{
         .{ .limits = .{ .total_wire_bytes = test_text.len }, .failure = error.StreamTooLarge },

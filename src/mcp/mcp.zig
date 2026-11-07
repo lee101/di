@@ -1,7 +1,7 @@
 //! MCPv2 module root and public API.
 //!
 //! Files under `src/mcp/` import only `std` and each other. The host passes in
-//! `std.Io` and everything else through `host.zig`. See `docs/approach.md`.
+//! `std.Io` and everything else through `host.zig`.
 
 const std = @import("std");
 
@@ -84,6 +84,7 @@ test {
     _ = engine;
     _ = @import("io/lines.zig");
     _ = @import("io/bell.zig");
+    _ = @import("io/budget.zig");
     _ = core.request;
     _ = core.stdio_conn;
     _ = core.era;

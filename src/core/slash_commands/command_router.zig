@@ -11,6 +11,7 @@ pub const ParsedCommand = union(enum) {
     reset_session,
     resume_session,
     rename_session: []const u8,
+    fork_session,
     help,
     login,
     logout: []const u8,
@@ -19,6 +20,7 @@ pub const ParsedCommand = union(enum) {
     image: []const u8,
     images: []const u8,
     model: []const u8,
+    effort: []const u8,
     permissions: []const u8,
     allowlist: []const u8,
     stats,
@@ -51,6 +53,7 @@ pub const CommandHandlers = struct {
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    fork_session: *const fn (ctx: *anyopaque) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -59,6 +62,7 @@ pub const CommandHandlers = struct {
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_model: *const fn (ctx: *anyopaque, query: []const u8) anyerror!void,
+    handle_effort: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_permissions: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_allowlist: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_stats: *const fn (ctx: *anyopaque) anyerror!void,
@@ -97,6 +101,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .rename_session => .{ .rename_session = payload },
+        .fork_session => .fork_session,
         .help => .help,
         .login => .login,
         .logout => .{ .logout = payload },
@@ -105,6 +110,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .images => .{ .images = payload },
         .image => .{ .image = payload },
         .model => .{ .model = payload },
+        .effort => .{ .effort = payload },
         .permissions => .{ .permissions = payload },
         .allowlist => .{ .allowlist = payload },
         .stats => .stats,
@@ -151,6 +157,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
+        .fork_session => try handlers.fork_session(handlers.ctx),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
@@ -159,6 +166,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
         .model => |query| try handlers.handle_model(handlers.ctx, query),
+        .effort => |rest| try handlers.handle_effort(handlers.ctx, rest),
         .permissions => |rest| try handlers.handle_permissions(handlers.ctx, rest),
         .allowlist => |rest| try handlers.handle_allowlist(handlers.ctx, rest),
         .stats => try handlers.show_stats(handlers.ctx),
@@ -238,6 +246,11 @@ test "parse distinguishes new and reset lifecycle commands" {
 
 test "parse recognizes interactive resume" {
     try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
+}
+
+test "parse recognizes fork without a payload" {
+    try std.testing.expectEqual(ParsedCommand.fork_session, parse(testSlashRegistry(), "/fork"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/fork 2"));
 }
 
 test "parse recognizes logout" {
@@ -390,7 +403,7 @@ test "parse covers every registered slash command token and alias" {
 test "parse payload acceptance follows slash spec metadata" {
     var buf: [128]u8 = undefined;
     for (testSlashRegistry().commands) |spec| {
-        const command_with_payload = try std.fmt.bufPrint(&buf, "{s} sample", .{spec.command});
+        const command_with_payload = try std.mem.print(&buf, "{s} sample", .{spec.command});
         const parsed = parse(testSlashRegistry(), command_with_payload);
         if (spec.accepts_payload) {
             try std.testing.expect(!parsedIsUnknown(parsed));
@@ -431,6 +444,10 @@ fn recordCopy(ctx: *anyopaque) anyerror!void {
 
 fn recordResumeSession(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "resume";
+}
+
+fn recordForkSession(ctx: *anyopaque) anyerror!void {
+    testContext(ctx).called = "fork";
 }
 
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
@@ -476,6 +493,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
+        .fork_session = unexpectedNoPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
@@ -484,6 +502,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
         .handle_model = unexpectedPayload,
+        .handle_effort = unexpectedPayload,
         .handle_permissions = unexpectedPayload,
         .handle_allowlist = unexpectedPayload,
         .show_stats = unexpectedNoPayload,
@@ -541,6 +560,16 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
+}
+
+test "route calls fork handler" {
+    var ctx: TestContext = .{};
+    var handlers = testHandlers(&ctx);
+    handlers.fork_session = recordForkSession;
+
+    try route(testSlashRegistry(), &handlers, "/fork");
+
+    try std.testing.expectEqualStrings("fork", ctx.called);
 }
 
 test "route forwards borrowed payload slice" {

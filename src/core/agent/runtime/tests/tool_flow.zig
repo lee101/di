@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -35,6 +36,7 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
+const text_utils = @import("../../../shared/text_utils.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -100,7 +102,7 @@ fn makeOwnedVisionCatalog(
     errdefer types.freeImageAttachment(alloc, catalog[0]);
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     try image_attachments.captureImageSnapshot(alloc, &catalog[0], snapshot_dir);
     return catalog;
@@ -438,6 +440,12 @@ const FreshnessApplicableContext = struct {
 };
 
 fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
+    return expectPermissionDeniedToolResultAs(gateway, index, tool_name, tool_name, reason);
+}
+
+/// `history_tool_name` is the result's tool in the replayed request, which can
+/// differ from the denied tool when legacy history is projected onto shell.
+fn expectPermissionDeniedToolResultAs(gateway: *const FakeGateway, index: usize, history_tool_name: []const u8, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
     const alloc = std.testing.allocator;
     try std.testing.expect(index < gateway.request_bodies.items.len);
 
@@ -454,7 +462,7 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
         for (content.array.items) |part| {
             if (part != .object) continue;
             const part_tool_name = part.object.get("toolName") orelse continue;
-            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
+            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, history_tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
             const output_type = output.object.get("type") orelse continue;
@@ -1115,7 +1123,7 @@ test "processQueuedPrompt malformed parallel fallback emits one terminal and rej
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "parallel-fallback-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "parallel-fallback-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2062,7 +2070,7 @@ fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !v
 }
 
 test "processQueuedPrompt rejects unstorable tool batches before permissions or execution" {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     const invalid = [_]ToolCall{
         .{ .id = "bad", .name = "", .arguments_json = "{}" },
         .{ .id = &oversized, .name = "read_file", .arguments_json = "{}" },
@@ -2264,7 +2272,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
 }
 
 test "vision OOM propagates through assembled orchestrator without a tool result" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{toolCall(
         "call_vision_oom",
         "vision",
@@ -2799,7 +2807,7 @@ test "same-batch retarget defers stale scoped call before permission and reloads
     defer alloc.free(new_target);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
@@ -2905,11 +2913,11 @@ test "same-batch file mutation retarget stops before permission and execution" {
     defer alloc.free(workspace);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
-    const old_output = try std.fs.path.join(alloc, &.{ workspace, "old/proof.txt" });
+    const old_output = try std.Io.Dir.path.join(alloc, &.{ workspace, "old/proof.txt" });
     defer alloc.free(old_output);
-    const new_output = try std.fs.path.join(alloc, &.{ workspace, "new/proof.txt" });
+    const new_output = try std.Io.Dir.path.join(alloc, &.{ workspace, "new/proof.txt" });
     defer alloc.free(new_output);
 
     const calls = [_]ToolCall{
@@ -2977,7 +2985,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer alloc.free(new_target);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
@@ -3092,7 +3100,10 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqualStrings("read_file", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
-    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    // Hosts finish their own record of a refused call (ACP's final update,
+    // the `fx ask --json` tool_calls entry) through the rejection hook.
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try std.testing.expectEqualStrings("missing_tool", hooks.rejected_names.items[0]);
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
         &.{
@@ -4320,7 +4331,7 @@ test "terminal publication failure deletes retained command replay" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -4460,7 +4471,8 @@ test "processQueuedPrompt denied registered run command compatibility never reac
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqualStrings("terminal", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectPermissionDeniedToolResult(&gateway, 1, "terminal", .user_denied);
+    // History replays the legacy exec as the shell run it maps to.
+    try expectPermissionDeniedToolResultAs(&gateway, 1, "shell", "terminal", .user_denied);
 }
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
@@ -4933,7 +4945,7 @@ test "initial session grants follow active registry metadata" {
 }
 
 test "processQueuedPrompt once permission binds external mutation grants before prompt returns" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4958,9 +4970,9 @@ test "processQueuedPrompt once permission binds external mutation grants before 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
-    const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const link_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link" });
+    const requested = try std.Io.Dir.path.join(arena, &.{ link_path, "created.txt" });
+    const args = try arena.print("{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -4999,7 +5011,7 @@ test "processQueuedPrompt once permission binds external mutation grants before 
 }
 
 test "processQueuedPrompt always permission retains external mutation session grants from approved targets" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5024,9 +5036,9 @@ test "processQueuedPrompt always permission retains external mutation session gr
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
-    const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const link_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link" });
+    const requested = try std.Io.Dir.path.join(arena, &.{ link_path, "created.txt" });
+    const args = try arena.print("{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -5314,7 +5326,7 @@ test "processQueuedPrompt caps chatty grep_files model output" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "match\n" ++ ("x" ** 2048),
+        .model_output = "match\n" ++ text_utils.repeat("x", 2048),
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5339,7 +5351,7 @@ test "processQueuedPrompt caps chatty terminal exec result with explicit marker"
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ ("x" ** 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
+        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ text_utils.repeat("x", 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5460,7 +5472,7 @@ test "web_search denial trace records redacted query without api keys or result 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5545,7 +5557,7 @@ test "PreToolUse rewrite is authoritative for validation permission execution hi
 }
 
 test "PreToolUse allocation failure escapes before history validation permission or execution" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"src/main.zig\"}"),
     };
@@ -5919,7 +5931,7 @@ test "owner cancellation wins over PreToolUse outcome allocation failure" {
         }
     };
 
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var handler = CancelRewriteHandler{ .cancel_flag = &cancel_flag };
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);

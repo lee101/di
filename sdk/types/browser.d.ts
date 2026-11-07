@@ -26,7 +26,11 @@ export type {
   FxAccepted,
   FxAgent,
   FxAgentEvent,
+  FxAgentHostTool,
+  FxAgentKeyedTool,
   FxAgentOptions,
+  FxAgentTool,
+  FxAgentTools,
   FxApiKeyCredentials,
   FxBrowserBackendOptions,
   FxBytes,
@@ -49,6 +53,10 @@ export type {
   FxGatewayProvider,
   FxGrokProvider,
   FxHostTool,
+  FxHooks,
+  FxHookEvent,
+  FxHookMessage,
+  FxHookToolCall,
   FxIdleResult,
   FxImageBlock,
   FxJsonSchema,
@@ -76,6 +84,8 @@ export type {
   FxSessionTurnEvent,
   FxSharedOptions,
   FxSteer,
+  FxSteerOptions,
+  FxSteered,
   FxSteeringInput,
   FxStopReason,
   FxStreamLine,
@@ -86,6 +96,9 @@ export type {
   FxTextBlock,
   FxTool,
   FxToolContext,
+  FxToolObservation,
+  FxWaitRequest,
+  FxWaitResponse,
   FxToolImage,
   FxToolResult,
   FxTools,
@@ -130,4 +143,4 @@ export declare function createFxEngine(options: FxBrowserEngineOptions): Promise
 export declare function createFxTerminal(options: FxBrowserTerminalOptions): Promise<FxTerminal>;
 
 /** The version of the libfx agent API. */
-export declare const libfxApiVersion: 2;
+export declare const libfxApiVersion: 3;

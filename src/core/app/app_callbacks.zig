@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
@@ -29,12 +30,10 @@ const tool_presentation = @import("../tooling/tool_presentation.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const io_mod = @import("../shared/io.zig");
 const session_runtime = @import("../session/session.zig");
-const session_codec = @import("../session/session_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const result_store = @import("../session/result_store.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
-const session_usage = @import("../session/session_usage.zig");
 const types = @import("../shared/types.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
@@ -143,7 +142,7 @@ test "prepared diff payload keeps compact elision and retains the complete appro
         var line: [32]u8 = undefined;
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "full-review-{d:0>3}\n", .{line_number}),
+            try std.mem.print(&line, "full-review-{d:0>3}\n", .{line_number}),
         );
     }
 
@@ -176,11 +175,11 @@ test "prepared diff payload keeps compact elision and retains the complete appro
     const payload = try preparedDiffPayload(alloc, enriched_handoff);
     defer diff_mod.freeDiffEntryPayload(alloc, payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "⋯ +118 omitted") != null);
+    try std.testing.expect(std.mem.find(u8, payload.preview, "⋯ +118 omitted") != null);
     const full = payload.full orelse return error.TestExpectedFullDiff;
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "full-review-120") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "⋯ +118 omitted") == null);
+    try std.testing.expect(std.mem.find(u8, full.content, "full-review-001") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "full-review-120") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "⋯ +118 omitted") == null);
 }
 
 test "prepared diff payload keeps compact output when full formatting is unavailable" {
@@ -191,7 +190,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
         .lifecycle_id = .{ .turn_id = 40, .call_id = "full-format-fallback" },
     };
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 
@@ -203,7 +202,7 @@ test "prepared diff payload keeps compact output when full formatting is unavail
     defer diff_mod.freeDiffEntryPayload(std.testing.allocator, payload);
 
     try std.testing.expect(payload.full == null);
-    try std.testing.expect(std.mem.indexOf(u8, payload.preview, "after") != null);
+    try std.testing.expect(std.mem.find(u8, payload.preview, "after") != null);
 }
 
 test "full diff formatter renders unchanged review elisions" {
@@ -267,9 +266,9 @@ test "full diff formatter renders unchanged review elisions" {
     )) orelse
         return error.TestExpectedFullDiff;
     defer full.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "5 unchanged lines ⋯") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "old") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full.content, "new") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "5 unchanged lines ⋯") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "old") != null);
+    try std.testing.expect(std.mem.find(u8, full.content, "new") != null);
 }
 
 pub fn Bindings(comptime App: type) type {
@@ -334,18 +333,12 @@ pub fn Bindings(comptime App: type) type {
                     .running = runCompactionActivity,
                     .settle = settleCompactionActivity,
                 } else null,
-                .recovery_checkpoint = if (comptime @hasField(App, "session_persistence"))
-                    if (app.session_persistence.writable != null)
-                        .{
-                            .set = agentSetRecoveryCheckpoint,
-                            .clear = agentClearRecoveryCheckpoint,
-                        }
-                    else
-                        null
-                else
-                    null,
                 .append_turn_piece = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
+                else
+                    null,
+                .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -376,29 +369,11 @@ pub fn Bindings(comptime App: type) type {
                 .record_tool_call_failed = agentRecordToolCallFailed,
                 .report_usage = agentReportUsage,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
-                .usage_allocator = app.alloc,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
                     .removed = ui_render.diff_removed_marker_style,
                 },
             };
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                deps.usage = &app.session.usage;
-                if (comptime @hasField(App, "session_persistence") and
-                    @hasField(@TypeOf(app.session_persistence), "writable"))
-                {
-                    app.session.usage.configureCheckpointSink(
-                        if (app.session_persistence.writable != null or app.session_persistence.v2 != null)
-                            .{
-                                .context = @ptrCast(app),
-                                .allocator = app.alloc,
-                                .persist = agentPersistUsageCheckpoint,
-                            }
-                        else
-                            null,
-                    );
-                }
-            }
             if (comptime @hasDecl(App, "releaseAgentTerminalLease")) {
                 deps.release_agent_terminal_lease = agentReleaseTerminalLease;
             }
@@ -485,7 +460,6 @@ pub fn Bindings(comptime App: type) type {
                 .command_output_complete = workerBridgeCommandOutputComplete,
                 .diff_block = workerBridgeDiffBlock,
                 .context_compaction = workerBridgeContextCompaction,
-                .prepare_fresh_prompt = workerBridgePrepareFreshPrompt,
                 .append_history_turn = workerBridgeAppendHistoryTurn,
                 .session_grant = workerBridgeSessionGrant,
                 .error_text = workerBridgeErrorText,
@@ -710,7 +684,7 @@ pub fn Bindings(comptime App: type) type {
         pub fn onMcpProgress(ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var label_buf: [512]u8 = undefined;
-            const label = std.fmt.bufPrint(
+            const label = std.mem.print(
                 &label_buf,
                 "{s}● {s}{s}",
                 .{ ui_render.bold_style, text, reset_style },
@@ -1220,30 +1194,14 @@ pub fn Bindings(comptime App: type) type {
             );
         }
 
-        fn agentSetRecoveryCheckpoint(
-            ctx: *anyopaque,
-            checkpoint: session_codec.RecoveryCheckpoint,
-        ) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).setRecoveryCheckpoint(app, checkpoint);
-        }
-
-        fn agentClearRecoveryCheckpoint(ctx: *anyopaque) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).clearRecoveryCheckpoint(app);
-        }
-
         fn agentAppendTurnPiece(ctx: *anyopaque, progress: agent_runtime.TurnProgress) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).appendTurnPiece(app, progress);
         }
 
-        fn agentPersistUsageCheckpoint(
-            ctx: *anyopaque,
-            snapshot: session_usage.Snapshot,
-        ) !void {
+        fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try app_session_runtime.Runtime(App).persistUsageCheckpoint(app, snapshot);
+            try app_session_runtime.Runtime(App).savePromptImages(app, alloc, images);
         }
 
         fn agentPropagateGrant(ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) !void {
@@ -1364,8 +1322,7 @@ pub fn Bindings(comptime App: type) type {
                 try gateway_error_format.formatHttpErrorMessage(std.heap.c_allocator, status, detail);
             defer std.heap.c_allocator.free(message);
             const label = if (auth_failure) |failure|
-                try std.fmt.allocPrint(
-                    std.heap.c_allocator,
+                try std.heap.c_allocator.print(
                     "⚠ {s} · {s}",
                     .{
                         message,
@@ -1380,7 +1337,7 @@ pub fn Bindings(comptime App: type) type {
                     },
                 )
             else
-                try std.fmt.allocPrint(std.heap.c_allocator, "⚠ {s}", .{message});
+                try std.heap.c_allocator.print("⚠ {s}", .{message});
             defer std.heap.c_allocator.free(label);
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .api_status_text = label });
         }
@@ -1390,8 +1347,7 @@ pub fn Bindings(comptime App: type) type {
             const question = switch (request.finish_reason) {
                 .content_filter => "Response blocked by content filter. What should fx do?",
                 else => if (request.replay_safe)
-                    try std.fmt.allocPrint(
-                        arena,
+                    try arena.print(
                         "Route failed after {d} attempt{s} for {s}. What should fx do?",
                         .{
                             request.semantic_attempts,
@@ -1599,19 +1555,6 @@ pub fn Bindings(comptime App: type) type {
         fn workerBridgeContextCompaction(ctx: *anyopaque, value: worker_runtime.ContextCompaction) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).commitContextCompaction(app, value.summary, value.active_prefix, value.retained_from);
-        }
-
-        fn workerBridgePrepareFreshPrompt(ctx: *anyopaque, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app_session_runtime.Runtime(App).prepareFreshPrompt(app, value);
-        }
-
-        pub fn prepareFreshPrompt(app: *App, value: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            if (comptime runtime_profile.allows(App, .cooperative_agent)) {
-                const current = app_session_runtime.Runtime(App).normalizeFreshPromptPreparation(app, value);
-                return app.worker.publishFreshPrompt(std.heap.c_allocator, current, app, workerBridgePrepareFreshPrompt);
-            }
-            return app.worker.prepareFreshPrompt(std.heap.c_allocator, value);
         }
 
         fn workerBridgeAppendHistoryTurn(ctx: *anyopaque, finished: types.FinishedPrompt) !app_worker_runtime.HistoryDelivery {
@@ -1886,7 +1829,7 @@ test "skill preparation uses the active turn tool result budget" {
         }
 
         fn observeBudget(ctx: dispatch.DispatchContext, _: []const u8) dispatch.DispatchError!skill_contract.CallPreparation {
-            return .{ .failure = .{ .model_output = try std.fmt.allocPrint(ctx.allocator, "{d}", .{ctx.max_tool_result_bytes}) } };
+            return .{ .failure = .{ .model_output = try ctx.allocator.print("{d}", .{ctx.max_tool_result_bytes}) } };
         }
     };
     var app: SkillApp = .{};
@@ -2025,7 +1968,7 @@ const FakeApp = struct {
 
     fn validateToolCall(self: *FakeApp, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
         _ = self;
-        return .{ .failure = try std.fmt.allocPrint(arena, "invalid {s}", .{call.name}) };
+        return .{ .failure = try arena.print("invalid {s}", .{call.name}) };
     }
 
     fn checkToolAvailability(self: *FakeApp, _: Allocator, _: ToolCall) !?[]const u8 {
@@ -2035,22 +1978,22 @@ const FakeApp = struct {
 
     fn describeToolActionWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "run {s}", .{call.name});
+        return arena.print("run {s}", .{call.name});
     }
 
     fn describeToolActionCompletedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "done {s}", .{call.name});
+        return arena.print("done {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "denied {s} {s}", .{ call.name, label });
+        return arena.print("denied {s} {s}", .{ call.name, label });
     }
 
     fn permissionTargetForCallWithAdvertised(self: *FakeApp, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "target:{s}", .{call.id});
+        return arena.print("target:{s}", .{call.id});
     }
 
     fn executeToolCallWithAdvertised(
@@ -2070,7 +2013,7 @@ const FakeApp = struct {
 
     fn formatToolExecutionErrorForAgent(self: *FakeApp, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
         _ = self;
-        return std.fmt.allocPrint(arena, "{s}:{s}", .{ tool_name, @errorName(err) });
+        return arena.print("{s}:{s}", .{ tool_name, @errorName(err) });
     }
 
     fn writeUserPromptCard(self: *FakeApp, prompt: types.UserTurn) !void {
@@ -2098,7 +2041,7 @@ const FakeApp = struct {
         self.command_output_count += 1;
     }
 
-    fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
+    pub fn writeCommandOutputChunkForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, text: []const u8, record: bool) !void {
         storeLifecycleId(
             &self.last_command_output_lifecycle_turn_id,
             &self.last_command_output_lifecycle_call_id,
@@ -2111,7 +2054,7 @@ const FakeApp = struct {
         try self.flushCommandOutputSummaryForLifecycle(null, record);
     }
 
-    fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
+    pub fn flushCommandOutputSummaryForLifecycle(self: *FakeApp, lifecycle_id: ?types.ToolLifecycleId, record: bool) !void {
         _ = record;
         storeLifecycleId(
             &self.last_command_output_complete_lifecycle_turn_id,

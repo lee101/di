@@ -33,7 +33,7 @@ pub const Operation = enum {
 
     pub fn parse(text: []const u8) ?Operation {
         for (operation_names, 0..) |name, index| {
-            if (std.mem.eql(u8, name, text)) return @enumFromInt(index);
+            if (std.mem.eql(u8, name, text)) return @fromBackingInt(@intCast(index));
         }
         return null;
     }
@@ -59,9 +59,9 @@ const status_names = [_][]const u8{
     @tagName(Status.blocked),
 };
 
-fn deriveNames(comptime E: type) [std.meta.fields(E).len][]const u8 {
-    var names: [std.meta.fields(E).len][]const u8 = undefined;
-    for (std.meta.fields(E), 0..) |field, index| names[index] = field.name;
+fn deriveNames(comptime E: type) [@typeInfo(E).@"enum".field_names.len][]const u8 {
+    var names: [@typeInfo(E).@"enum".field_names.len][]const u8 = undefined;
+    for (@typeInfo(E).@"enum".field_names, 0..) |name, index| names[index] = name;
     return names;
 }
 
@@ -967,9 +967,9 @@ fn countOpen(list: List) usize {
 
 test "todo operation names cover every enum member and reject unknown input" {
     try std.testing.expectEqual(@as(usize, 9), operation_names.len);
-    inline for (std.meta.fields(Operation), 0..) |field, index| {
-        try std.testing.expectEqualStrings(field.name, operation_names[index]);
-        try std.testing.expectEqual(@as(Operation, @enumFromInt(index)), Operation.parse(field.name));
+    inline for (@typeInfo(Operation).@"enum".field_names, 0..) |name, index| {
+        try std.testing.expectEqualStrings(name, operation_names[index]);
+        try std.testing.expectEqual(@as(Operation, @fromBackingInt(@intCast(index))), Operation.parse(name));
     }
     try std.testing.expect(Operation.parse("complete") == null);
     try std.testing.expect(Operation.parse("") == null);
@@ -1064,14 +1064,14 @@ test "todo init rejects an empty phase name and an empty phase" {
 
 test "todo init bounds phase names, task content, phase count, and task count" {
     const alloc = std.testing.allocator;
-    const long_name = "p" ** (max_phase_name_bytes + 1);
+    const long_name: [max_phase_name_bytes + 1]u8 = @splat('p');
     try expectErrors(alloc, .{}, .{ .op = .init, .list = &.{
-        .{ .phase = long_name, .items = &.{"Wire OAuth"} },
+        .{ .phase = long_name[0..], .items = &.{"Wire OAuth"} },
     } }, &.{std.fmt.comptimePrint("Phase \"{s}\" is {d} bytes, at most {d} are allowed", .{ long_name, long_name.len, max_phase_name_bytes })});
 
-    const long_content = "t" ** (max_task_content_bytes + 1);
+    const long_content: [max_task_content_bytes + 1]u8 = @splat('t');
     try expectErrors(alloc, .{}, .{ .op = .init, .list = &.{
-        .{ .phase = "Auth", .items = &.{long_content} },
+        .{ .phase = "Auth", .items = &.{long_content[0..]} },
     } }, &.{std.fmt.comptimePrint("Task content is {d} bytes, at most {d} are allowed", .{ long_content.len, max_task_content_bytes })});
 
     const too_many_phases = try alloc.alloc(InitEntry, max_phases + 1);
@@ -1233,8 +1233,8 @@ test "todo block rejects an over-long reason" {
     const alloc = std.testing.allocator;
     var list = try seeded(alloc, foundation_and_verification);
     defer list.deinit(alloc);
-    const reason = "r" ** (max_blocker_bytes + 1);
-    try expectErrors(alloc, list, .{ .op = .block, .task = "Scaffold crate", .reason = reason }, &.{
+    const reason: [max_blocker_bytes + 1]u8 = @splat('r');
+    try expectErrors(alloc, list, .{ .op = .block, .task = "Scaffold crate", .reason = reason[0..] }, &.{
         std.fmt.comptimePrint("Blocker reason is {d} bytes, at most {d} are allowed", .{ reason.len, max_blocker_bytes }),
     });
 }
@@ -1332,12 +1332,12 @@ test "todo append bounds the phase name, task content, and total task count" {
     const alloc = std.testing.allocator;
     var list = try seeded(alloc, foundation_and_verification);
     defer list.deinit(alloc);
-    const long_name = "p" ** (max_phase_name_bytes + 1);
-    try expectErrors(alloc, list, .{ .op = .append, .phase = long_name, .items = &.{"Wire output"} }, &.{
+    const long_name: [max_phase_name_bytes + 1]u8 = @splat('p');
+    try expectErrors(alloc, list, .{ .op = .append, .phase = long_name[0..], .items = &.{"Wire output"} }, &.{
         std.fmt.comptimePrint("Phase \"{s}\" is {d} bytes, at most {d} are allowed", .{ long_name, long_name.len, max_phase_name_bytes }),
     });
-    const long_content = "t" ** (max_task_content_bytes + 1);
-    try expectErrors(alloc, list, .{ .op = .append, .phase = "Auth", .items = &.{long_content} }, &.{
+    const long_content: [max_task_content_bytes + 1]u8 = @splat('t');
+    try expectErrors(alloc, list, .{ .op = .append, .phase = "Auth", .items = &.{long_content[0..]} }, &.{
         std.fmt.comptimePrint("Task content is {d} bytes, at most {d} are allowed", .{ long_content.len, max_task_content_bytes }),
     });
     const many = try alloc.alloc([]u8, max_tasks);

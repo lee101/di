@@ -10,9 +10,9 @@ const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
-const command_provider = @import("../mcp/command_provider.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const secret = @import("../auth/secret.zig");
 const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
 const Host = @import("host.zig").Host;
@@ -109,7 +109,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             pair_flag = a;
             i += 1;
             const kv = if (i < dash) rest[i] else "";
-            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse 0;
+            const eq = std.mem.findScalar(u8, kv, '=') orelse 0;
             if (eq == 0) return usage(arena, verb, "{s} needs KEY=VALUE.", .{a});
             try pairs.append(arena, .{ .key = kv[0..eq], .value = kv[eq + 1 ..] });
             continue;
@@ -131,7 +131,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .add => {
             if (n.len == 0) return usage(arena, verb, "{s} add needs a NAME.", .{p});
             const name = n[0];
-            if (!command_provider.isValidServerName(name))
+            if (!isValidServerName(name))
                 return usage(arena, verb, "'{s}' can't be a server name: use letters, digits, '-' and '_'.", .{name});
             const file: config_file.File = if (project) .project else .profile;
             if (dash < rest.len) {
@@ -178,11 +178,11 @@ fn isHelp(a: []const u8) bool {
 }
 
 fn moved(arena: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!Parsed {
-    return .{ .moved = try std.fmt.allocPrint(arena, fmt, args) };
+    return .{ .moved = try arena.print(fmt, args) };
 }
 
 fn usage(arena: Allocator, verb: ?Verb, comptime fmt: []const u8, args: anytype) Allocator.Error!Parsed {
-    return .{ .usage = .{ .verb = verb, .message = try std.fmt.allocPrint(arena, fmt, args) } };
+    return .{ .usage = .{ .verb = verb, .message = try arena.print(fmt, args) } };
 }
 
 const overview = [_][2][]const u8{
@@ -206,7 +206,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         try w.print("usage: {s} COMMAND\n\n", .{p});
         for (overview, 0..) |row, k| {
             var buffer: [48]u8 = undefined;
-            const left = if (k < 2) std.fmt.bufPrint(&buffer, "{s}{s}", .{ row[0], json }) catch row[0] else row[0];
+            const left = if (k < 2) std.mem.print(&buffer, "{s}{s}", .{ row[0], json }) catch row[0] else row[0];
             try w.print("  {s:<28}{s}\n", .{ left, row[1] });
         }
         return w.print("\nRun '{s} COMMAND -h' for a command's flags.\n", .{p});
@@ -299,6 +299,16 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+/// Why a write to `path` failed; a link says what it points to.
+fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    // The profile's replace refuses a link itself (DurablePathUnsafe).
+    if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    const target = try safe(arena, buffer[0..n]);
+    return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
+}
+
 /// fx's words for an error, never its name.
 fn describe(err: anyerror) []const u8 {
     return switch (err) {
@@ -311,7 +321,7 @@ fn describe(err: anyerror) []const u8 {
         error.AccessDenied => "permission denied",
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => "~/.fx/mcp.json isn't valid JSON",
-        error.McpConfigInvalidHeaders => "a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
+        error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => "a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
         else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) "~/.fx/mcp.json has a server entry fx can't read" else "something went wrong",
     };
 }
@@ -321,7 +331,7 @@ const Paths = struct { profile: []const u8, project: []const u8 };
 fn paths(c: Context, arena: Allocator) !Paths {
     return .{
         .profile = try profile_paths.mcpConfigPath(arena, c.home),
-        .project = try std.fs.path.join(arena, &.{ c.workspace_root, ".mcp.json" }),
+        .project = try std.Io.Dir.path.join(arena, &.{ c.workspace_root, ".mcp.json" }),
     };
 }
 
@@ -339,6 +349,8 @@ fn sourceFile(status: Status) config_file.File {
 fn list(c: Context, arena: Allocator, json: bool) !u8 {
     const host = try c.hosts.get(c.hosts.context, null);
     defer if (host) |h| c.hosts.release(c.hosts.context, h);
+    // A login another fx saved since counts before statuses are read.
+    if (host) |h| h.runtime.pickUpLogins() catch |err| debug_trace.logf("mcp", "MCP saved logins not checked err={s}", .{@errorName(err)});
     const statuses = if (host) |h| try h.runtime.statuses(arena) else &.{};
     if (host) |h| try writeNotes(c, h);
     const p = try paths(c, arena);
@@ -361,9 +373,10 @@ pub fn statusText(arena: Allocator, s: Status) Allocator.Error![]const u8 {
         .waiting_for_approval => "waiting for approval",
         .rejected => "rejected",
         .unsupported => "not supported",
-        .missing_env => try std.fmt.allocPrint(arena, "needs ${s}", .{s.missing orelse "a variable"}),
+        .missing_env => try arena.print("needs ${s}", .{s.missing orelse "a variable"}),
+        .invalid_env => try arena.print("can't use ${s}", .{s.missing orelse "a variable"}),
         else => if (s.needs_login) "needs login" else switch (s.state) {
-            .ready => try std.fmt.allocPrint(arena, "ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
+            .ready => try arena.print("ready, {d} tool{s}", .{ s.tools, if (s.tools == 1) "" else "s" }),
             .connecting => "connecting",
             .retrying => "retrying",
             .failed => "failed",
@@ -380,6 +393,7 @@ fn statusToken(s: Status) []const u8 {
         .rejected => "rejected",
         .unsupported => "not_supported",
         .missing_env => "missing_env",
+        .invalid_env => "invalid_env",
         else => if (s.needs_login) "needs_login" else switch (s.state) {
             .ready => "ready",
             .connecting => "connecting",
@@ -446,6 +460,9 @@ fn writeStatusFields(jw: *std.json.Stringify, s: Status, p: Paths) !void {
 
 /// What loading the config skipped, so a server never vanishes without a reason.
 fn writeNotes(c: Context, host: *Host) !void {
+    // A reload on the UI thread may replace them meanwhile.
+    host.notes_mutex.lockUncancelable(host.runtime.io);
+    defer host.notes_mutex.unlock(host.runtime.io);
     for (host.notes) |note| try c.err.print("note: {s}\n", .{note});
 }
 
@@ -476,7 +493,8 @@ fn show(c: Context, arena: Allocator, name: []const u8, json: bool) !u8 {
         .needs_login, .failed => &.{},
         .unknown_server => return missing(c, arena, name),
     };
-    const status = findStatus(try host.runtime.statuses(arena), name).?;
+    // A reload may have taken it out since: the host takes changes in place.
+    const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
     const p = try paths(c, arena);
     if (json) {
         var jw: std.json.Stringify = .{ .writer = c.out };
@@ -552,7 +570,7 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
     if (value != .object) return null;
     const d = value.object.get("description") orelse return null;
     if (d != .string) return null;
-    const line = std.mem.trim(u8, d.string[0 .. std.mem.indexOfScalar(u8, d.string, '\n') orelse d.string.len], " \t\r");
+    const line = std.mem.trim(u8, d.string[0 .. std.mem.findScalar(u8, d.string, '\n') orelse d.string.len], " \t\r");
     return line;
 }
 
@@ -560,7 +578,7 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
     _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
-        try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), describe(err) });
+        try c.err.print("Couldn't add {s} to {s}: {s}.\n", .{ name, fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     c.hosts.changed(c.hosts.context);
@@ -592,8 +610,9 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
         return 1;
     }
     const file: config_file.File = if (in_profile) .profile else .project;
-    const updated = config_file.update(c.gpa, p.profile, file, if (file == .project) p.project else p.profile, .{ .remove = name }) catch |err| {
-        try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), describe(err) });
+    const path = if (file == .project) p.project else p.profile;
+    const updated = config_file.update(c.gpa, p.profile, file, path, .{ .remove = name }) catch |err| {
+        try c.err.print("Couldn't remove {s} from {s}: {s}.\n", .{ try safe(arena, name), fileLabel(file), try whyNot(arena, err, path) });
         return 1;
     };
     const url = switch (updated) {
@@ -602,7 +621,8 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;
-    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, name, u) catch false;
+    // A `.mcp.json` server's login is its workspace's own.
+    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch false;
     c.hosts.changed(c.hosts.context);
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
@@ -629,14 +649,19 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
         }
         return 1;
     }
-    var attempt = config_runtime.attemptProjectMcpMutation(arena, c.workspace_root, action);
-    defer attempt.deinit(arena);
-    switch (attempt) {
-        .failure => |f| {
-            try c.err.print("Couldn't save that choice: {s}.\n", .{describe(f.err)});
-            return 1;
-        },
-        .outcome => {},
+    // `--all` approves each server shown here, so a server added later still
+    // waits for approval.
+    for (0..if (action == .approve_all) targets.items.len else 1) |i| {
+        const one: project_config.ProjectMcpAction = if (action == .approve_all) .{ .approve = targets.items[i].name } else action;
+        var attempt = config_runtime.attemptProjectMcpMutation(arena, c.workspace_root, one);
+        defer attempt.deinit(arena);
+        switch (attempt) {
+            .failure => |f| {
+                try c.err.print("Couldn't save that choice: {s}.\n", .{describe(f.err)});
+                return 1;
+            },
+            .outcome => {},
+        }
     }
     c.hosts.changed(c.hosts.context);
     for (targets.items) |s| {
@@ -652,6 +677,15 @@ fn trust(c: Context, arena: Allocator, action: project_config.ProjectMcpAction) 
     return 0;
 }
 
+/// A sign-in or sign-out that changed nothing, since the saved sign-ins can't
+/// be read.
+fn unreadableLogins(c: Context, arena: Allocator, doing: []const u8, name: []const u8) !u8 {
+    try c.err.print("Can't {s} {s}: fx can't read the saved MCP sign-ins in {s}. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n", .{
+        doing, try safe(arena, name), credentials.Store.detect(arena, c.home).place(),
+    });
+    return 1;
+}
+
 fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
     const host = (try c.hosts.get(c.hosts.context, null)) orelse return missing(c, arena, name);
     defer c.hosts.release(c.hosts.context, host);
@@ -660,13 +694,21 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         try c.err.print("{s} runs a command, so it has no login.\n", .{try safe(arena, name)});
         return 1;
     }
-    const was = findStatus(try host.runtime.statuses(arena), name).?;
+    const was = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+    // There's a login to sign out of when one is saved, by this fx or
+    // another, or this session holds one. A running server needn't have one.
+    const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
+    defer if (saved) |v| secret.zeroAndFree(arena, v);
     host.runtime.logout(name) catch |err| switch (err) {
         // A held server isn't in the engine; its saved login still goes.
-        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, name, server.url.?) catch false,
+        error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
+            error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
+            else => false,
+        },
+        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
-    if (was.signed_in or was.needs_login or was.state == .ready) {
+    if (saved != null or was.signed_in) {
         try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
@@ -681,6 +723,8 @@ const Waiter = struct {
     shown: bool = false,
     done: ?bool = null,
     reason: ?[]u8 = null,
+    /// Why the new login wasn't saved, if it wasn't.
+    not_saved: ?[]u8 = null,
     gpa: Allocator,
     name: []const u8,
 
@@ -705,18 +749,22 @@ const Waiter = struct {
                 w.done = false;
             },
             .needs_login => {},
+            .not_saved => |n| if (std.mem.eql(u8, n.server, w.name) and w.not_saved == null) {
+                w.not_saved = w.gpa.dupe(u8, n.reason) catch null;
+            },
         }
     }
 
     fn deinit(w: *Waiter) void {
         if (w.authorize) |a| w.gpa.free(a);
         if (w.reason) |r| w.gpa.free(r);
+        if (w.not_saved) |r| w.gpa.free(r);
     }
 };
 
 fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
     const no_display = io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null or
-        (@import("builtin").os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
+        (@import("builtin").target.os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
     const open = browser and !no_display;
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
@@ -729,10 +777,15 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
     }
     host.runtime.login(name, open) catch |err| switch (err) {
         error.Held => {
-            const status = findStatus(try host.runtime.statuses(arena), name).?;
+            const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
             try c.err.print("{s} is {s}", .{ try safe(arena, name), try statusText(arena, status) });
             if (status.state == .waiting_for_approval) try c.err.print(": {s} approve {s}", .{ c.surface.prog(), try safe(arena, name) });
             try c.err.writeAll(".\n");
+            return 1;
+        },
+        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign in to", name),
+        error.CallbackPortInUse => {
+            try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
             return 1;
         },
         else => return err,
@@ -749,10 +802,12 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
     while (true) {
         var done: ?bool = null;
         var url: ?[]const u8 = null;
+        var not_saved: ?[]const u8 = null;
         {
             waiter.mutex.lockUncancelable(io);
             defer waiter.mutex.unlock(io);
             done = waiter.done;
+            if (waiter.not_saved) |why| not_saved = try arena.dupe(u8, why);
             if (!waiter.shown and waiter.authorize != null) {
                 waiter.shown = true;
                 url = try arena.dupe(u8, waiter.authorize.?);
@@ -768,6 +823,11 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
             try c.out.flush();
         }
         if (done) |ok| {
+            // The login was saved first, so a failed save is known by now.
+            if (ok) if (not_saved) |why| {
+                try c.err.print("Signed in to {s}, but couldn't save the login: {s}. Sign in again once that's fixed.\n", .{ try safe(arena, name), try safe(arena, why) });
+                return 1;
+            };
             if (ok) {
                 try c.out.print("Signed in to {s}.\n", .{try safe(arena, name)});
                 return 0;
@@ -789,17 +849,16 @@ fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open
 
 /// A complete line from stdin, waiting at most 100 ms for one.
 fn readPasted(arena: Allocator, line: *std.ArrayList(u8)) !?[]const u8 {
-    var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
-    if (try std.posix.poll(&fds, 100) == 0) return null;
+    if (!io_mod.pollReadable(io_mod.stdinHandle(), 100)) return null;
     var buffer: [1024]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buffer) catch return null;
+    const n = io_mod.readHandle(io_mod.stdinHandle(), &buffer) catch return null;
     if (n == 0) {
         // stdin closed: wait for the browser instead.
         io_mod.sleep(100 * std.time.ns_per_ms);
         return null;
     }
     try line.appendSlice(arena, buffer[0..n]);
-    const end = std.mem.indexOfScalar(u8, line.items, '\n') orelse return null;
+    const end = std.mem.findScalar(u8, line.items, '\n') orelse return null;
     const pasted = std.mem.trim(u8, line.items[0..end], " \t\r");
     const copy = try arena.dupe(u8, pasted);
     line.replaceRangeAssumeCapacity(0, end + 1, &.{});
@@ -810,6 +869,22 @@ const testing = std.testing;
 
 fn parseCli(arena: Allocator, args: []const []const u8) !Parsed {
     return parse(arena, .cli, args);
+}
+
+/// A server name is letters, digits, `_`, and `-`, as `mcp_SERVER_TOOL`
+/// names need.
+pub fn isValidServerName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+test "a server name is letters, digits, underscores, and hyphens" {
+    try testing.expect(isValidServerName("my-server_2"));
+    for ([_][]const u8{ "", "bad/name", "bad name", "bad.name" }) |name| try testing.expect(!isValidServerName(name));
 }
 
 test "parse reads every verb, with flags before --" {

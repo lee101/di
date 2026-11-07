@@ -17,6 +17,7 @@ const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const prompt_cache_policy = @import("../core/config/prompt_cache_policy.zig");
+const sse = @import("sse.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -150,7 +151,7 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
-    const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
+    const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
@@ -173,10 +174,14 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
     defer opened.deinit(alloc);
     const http = &opened.request.?;
-    var watch: client_mod.CancelWatch = .{};
+    var watch: client_mod.ConnectionWatch = .init(.{
+        .timeout_ms = 120_000,
+        .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
     defer watch.stop();
-    const head_deadline = phase_deadline(120_000, request.deadline);
-    if (http.connection) |connection| try watch.start(request.cancel_flag, head_deadline, connection.stream_writer.stream);
+    if (http.connection) |connection| try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+    // The 120 s head wait also bounds sending the request.
+    if (watch.armHead()) |err| return err;
     http.transfer_encoding = .{ .content_length = payload.len };
     var buffer: [8192]u8 = undefined;
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -185,12 +190,14 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     try body.writer.writeAll(payload);
     try body.end();
     if (http.connection) |connection| try connection.flush();
-    var response = http.receiveHead(&.{}) catch |err| {
-        if (expired(head_deadline)) return error.Timeout;
-        return err;
-    };
-    watch.stop();
-    if (http.connection) |connection| try watch.start(request.cancel_flag, if (response.head.status == .ok) request.deadline else phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    var response = http.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
+    if (response.head.status != .ok) {
+        // An error body is read under its own 30 s bound.
+        watch.stop();
+        watch = .init(.{ .patient = true, .stall_timeout_ms = std.math.maxInt(i64) });
+        if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    }
     var retry_after: ?u64 = null;
     var headers = response.head.iterateHeaders();
     while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -213,7 +220,12 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
         return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    return consume(alloc, definition, reader, request);
+    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
 }
 
 pub fn failure_kind(status: std.http.Status) streams.FailureKind {
@@ -231,12 +243,12 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
     };
 }
 
-/// Parses a successful streamed reply from `reader`.
-pub fn consume(alloc: Allocator, definition: *const definitions.Definition, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+/// Parses a successful streamed reply from `reader`, telling `progress` about
+/// each event when it is set.
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    const exact_provider: ?model_provider.ProviderId = if (definition.prompt_caching) bound_identity(definition) else null;
-    return codec.consume_stream_exact(alloc, reader, request.data(), limits, request.events, request.cancel_flag, exact_provider);
+    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
@@ -366,7 +378,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         .attempt_evidence = &evidence,
         .events = .{ .context = &event_context, .emit_fn = ignore_event },
         .cancel_flag = cancel,
-    }, state.input.usage, state.input.usage_allocator) catch |err| switch (err) {
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,

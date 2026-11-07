@@ -21,6 +21,7 @@ export {
   listModels,
   memory,
   supportsJspi,
+  wakeHandler,
   xtermAdapter,
 } from "./libfx.cjs";
 
@@ -29,7 +30,11 @@ export type {
   FxAccepted,
   FxAgent,
   FxAgentEvent,
+  FxAgentHostTool,
+  FxAgentKeyedTool,
   FxAgentOptions,
+  FxAgentTool,
+  FxAgentTools,
   FxApiKeyCredentials,
   FxBackendAttempt,
   FxBackendChoice,
@@ -57,6 +62,10 @@ export type {
   FxGatewayProvider,
   FxGrokProvider,
   FxHostTool,
+  FxHooks,
+  FxHookEvent,
+  FxHookMessage,
+  FxHookToolCall,
   FxIdleResult,
   FxImageBlock,
   FxJsonSchema,
@@ -86,6 +95,8 @@ export type {
   FxSessionTurnEvent,
   FxSharedOptions,
   FxSteer,
+  FxSteerOptions,
+  FxSteered,
   FxSteeringInput,
   FxStopReason,
   FxStreamLine,
@@ -96,6 +107,9 @@ export type {
   FxTextBlock,
   FxTool,
   FxToolContext,
+  FxToolObservation,
+  FxWaitRequest,
+  FxWaitResponse,
   FxToolImage,
   FxToolResult,
   FxTools,
@@ -148,4 +162,4 @@ export declare function createFxTerminal(options: FxNodeTerminalOptions): Promis
 export declare function getBackendInfo(options?: FxBackendInfoOptions): Promise<FxBackendInfo>;
 
 /** The version of the libfx agent API. */
-export declare const libfxApiVersion: 2;
+export declare const libfxApiVersion: 3;

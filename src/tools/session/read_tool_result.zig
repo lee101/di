@@ -5,13 +5,9 @@ const session_child_store = @import("../../core/session/session_child_store.zig"
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
+const read_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
 
 const Allocator = std.mem.Allocator;
-
-const HandleNormalization = struct {
-    trimmed: []const u8,
-    suffix: []const u8,
-};
 
 pub const Input = struct {
     handle: []u8,
@@ -130,20 +126,10 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-fn classifyHandleNormalization(handle: []const u8) HandleNormalization {
-    const trimmed = std.mem.trim(u8, handle, " \t\r\n");
-    const suffix = if ((std.mem.startsWith(u8, trimmed, "result-") or result_store.isImageHandle(trimmed)) and
-        std.mem.findScalar(u8, trimmed, '.') == null)
-        ".txt"
-    else
-        "";
-    return .{ .trimmed = trimmed, .suffix = suffix };
-}
-
 pub fn validate(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(Input);
     if (input.selector == .search) return null;
-    const normalization = classifyHandleNormalization(input.handle);
+    const normalization = read_result_presentation.classifyHandleNormalization(input.handle);
     if (normalization.trimmed.len == 0) return try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must not be empty");
     var record_buffer: compactor.RecordFileBuffer = undefined;
     if (compactor.recordFile(&record_buffer, normalization.trimmed)) |file| {
@@ -170,7 +156,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
         };
         const queries: []const []const u8 = input.selector.search;
         const output = compactor.search(ctx.allocator, result_store.compactorStore(capability), queries) catch |err| return .{
-            .failure = try std.fmt.allocPrint(ctx.allocator, "Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
+            .failure = try ctx.allocator.print("Searching saved turns, tool calls and earlier compactions failed: {s}", .{@errorName(err)}),
         };
         return .{ .success = output };
     }
@@ -263,13 +249,12 @@ fn readOutput(ctx: tool_dispatch.DispatchContext, input: *Input) ![]u8 {
 
 fn formatReadFailure(alloc: Allocator, handle: []const u8, err: anyerror) ![]u8 {
     if (err == error.ResultHandleNotFound) {
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "read_tool_result failed for handle {s}: ResultHandleNotFound. No exact match exists in the active tool-result store; handles are session-scoped and must be copied exactly from the tool result preview.",
             .{handle},
         );
     }
-    return std.fmt.allocPrint(alloc, "read_tool_result failed for handle {s}: {s}", .{ handle, @errorName(err) });
+    return alloc.print("read_tool_result failed for handle {s}: {s}", .{ handle, @errorName(err) });
 }
 
 pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
@@ -279,6 +264,9 @@ pub fn readsOnly(_: tool_dispatch.ToolInput) bool {
 pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
     return false;
 }
+
+/// Labels each call by what it reads. See `read_tool_result_presentation.zig`.
+pub const presentation = read_result_presentation.presentation;
 
 test "read_tool_result decodes range and query inputs" {
     const alloc = std.testing.allocator;
@@ -425,7 +413,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "legacy",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "legacy");
     defer alloc.free(dir);
@@ -447,7 +435,7 @@ test "unknown read_tool_result handle returns failure for legacy and managed sto
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -487,7 +475,7 @@ test "read_tool_result pages and searches saved command replay handles" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -564,7 +552,7 @@ test "large web_search result is previewed and available through read_tool_resul
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "<tool_result_preview") != null);
     try std.testing.expect(std.mem.find(u8, prepared.model_output, "Use read_tool_result") != null);
 
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\",\"query\":\"needle\"}}", .{prepared.memory.output_handle.?});
+    const args_json = try alloc.print("{{\"handle\":\"{s}\",\"query\":\"needle\"}}", .{prepared.memory.output_handle.?});
     defer alloc.free(args_json);
     const decoded = try decode(.{ .allocator = alloc }, args_json);
     const input = switch (decoded) {
@@ -591,7 +579,7 @@ test "persisted provider search results remain readable" {
     const handle = try result_store.storeLargeResult(alloc, dir, "legacy_provider_call", "perplexity_search", "historical provider search result");
     defer alloc.free(handle);
 
-    const args_json = try std.fmt.allocPrint(alloc, "{{\"handle\":\"{s}\"}}", .{handle});
+    const args_json = try alloc.print("{{\"handle\":\"{s}\"}}", .{handle});
     defer alloc.free(args_json);
     const decoded = try decode(.{ .allocator = alloc }, args_json);
     const input = switch (decoded) {

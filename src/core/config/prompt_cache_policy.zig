@@ -23,17 +23,17 @@ pub const Ttl = enum(u8) {
     }
 };
 
-var configured = std.atomic.Value(u8).init(@intFromEnum(Ttl.five_minutes));
+var configured = std.atomic.Value(u8).init(@backingInt(Ttl.five_minutes));
 
 pub fn setConfigured(ttl: Ttl) void {
-    configured.store(@intFromEnum(ttl), .monotonic);
+    configured.store(@backingInt(ttl), .monotonic);
 }
 
 pub fn effectiveTtl() Ttl {
     if (io_mod.getenv(env_name)) |value| {
         if (Ttl.parse(value)) |ttl| return ttl;
     }
-    return @enumFromInt(configured.load(.monotonic));
+    return @fromBackingInt(@intCast(configured.load(.monotonic)));
 }
 
 pub fn supportsCacheControl(model: []const u8) bool {
@@ -143,7 +143,8 @@ test "prompt cache policy: session header rejects empty oversized and non printa
     try std.testing.expect(validSessionHeader("") == null);
     try std.testing.expect(validSessionHeader("a b") == null);
     try std.testing.expect(validSessionHeader("a\nb") == null);
-    try std.testing.expect(validSessionHeader("a" ** 257) == null);
+    const long_id: [257]u8 = @splat('a');
+    try std.testing.expect(validSessionHeader(&long_id) == null);
 }
 
 test "prompt cache policy: plan marks the last system part and the last two user or tool messages" {

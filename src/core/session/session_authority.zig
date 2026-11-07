@@ -65,20 +65,6 @@ pub fn classifyAuthority(
     return .legacy;
 }
 
-/// Like `classifyAuthority` but treats a marker-less directory as legacy without
-/// the creation-orphan check, so an oversized legacy snapshot can still be
-/// migrated under an explicit `allow_large` request.
-pub fn classifyAuthorityAllowingLargeLegacy(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !AuthorityClassification {
-    if (try classifyMarker(alloc, session_dir, session_id)) |classification| {
-        return classification;
-    }
-    return .legacy;
-}
-
 fn isPreparedCreationOrphan(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
@@ -245,8 +231,8 @@ test "session files open without waiting on a FIFO" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/events.jsonl", .{root});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "{s}/events.jsonl", .{root}, 0);
     if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
     defer dir.close();
@@ -334,15 +320,6 @@ pub fn parseIdentifier(raw: []const u8) error{InvalidSessionFormat}!session_even
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, raw)) return error.InvalidSessionFormat;
     return result;
-}
-
-/// Deletes one obsolete legacy-session file and syncs the directory.
-pub fn deleteSessionEntry(
-    session_dir: *io_mod.VerifiedDir,
-    name: []const u8,
-) !void {
-    try session_dir.dir.deleteFile(io_mod.getIo(), name);
-    try io_mod.syncVerifiedDir(session_dir.dir);
 }
 
 /// Reads exactly `size` bytes (+1 guard) of a legacy file into an owned slice.

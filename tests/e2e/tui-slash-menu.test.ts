@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -27,6 +26,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { savedSessionIds } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -209,22 +209,6 @@ async function waitForStatuslineMenu(
     await Bun.sleep(100);
   }
   throw new Error(`Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`);
-}
-
-async function waitForUsageMenu(session: TmuxSession): Promise<string[]> {
-  const deadline = Date.now() + TIMEOUT;
-  let latest: string[] = [];
-  while (Date.now() < deadline) {
-    latest = await session.capturePaneGrid();
-    const pane = latest.join("\n");
-    if (
-      pane.includes("[30 days]") &&
-      pane.includes("esc close") &&
-      !pane.includes("Loading usage")
-    ) return latest;
-    await Bun.sleep(100);
-  }
-  throw new Error(`Timed out waiting for usage menu.\nPane:\n${latest.join("\n")}`);
 }
 
 async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
@@ -874,11 +858,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.kill();
       session = null;
 
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-        .map((entry) => entry.name);
+      const sessionIds = savedSessionIds(home);
       expect(sessionIds).toHaveLength(1);
 
       // A resumed session keeps its title in the tab, even in a new folder.
@@ -969,11 +949,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       session = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-        .map((entry) => entry.name);
+      const sessionIds = savedSessionIds(home);
       expect(sessionIds).toHaveLength(1);
       gateway.stop();
       gateway = startFakeGateway([]);
@@ -1036,7 +1012,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 38", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1225,13 +1201,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Down");
       await session.waitForText(
-        "manage local and remote MCP servers, resources, prompts, and project trust",
+        "manage MCP servers and their logins",
         5_000,
       );
       const scrolledGrid = await session.capturePaneGrid();
       const mcpRow = scrolledGrid.find((line) =>
         line.includes("/mcp") &&
-        line.includes("manage local and remote MCP servers, resources, prompts, and project trust")
+        line.includes("manage MCP servers and their logins")
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
@@ -1297,7 +1273,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(modelRow).toContain("choose what model and reasoning effort to use");
       expect(modelRow).not.toContain("Model");
       expect(mcpRow).toContain(
-        "manage local and remote MCP servers, resources, prompts, and project trust",
+        "manage MCP servers and their logins",
       );
       expect(mcpRow).not.toContain("Extensions");
 
@@ -1561,7 +1537,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 36);
+      let grid = await waitForHelpMenu(session, 38);
       let pane = grid.join("\n");
       expect(pane).toContain("di v");
       expect(pane).toContain("Run /help for commands");
@@ -1577,7 +1553,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 36);
+      grid = await waitForHelpMenu(session, 38);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1588,11 +1564,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 36);
+      await waitForHelpMenu(session, 38);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 36"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1601,7 +1577,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 36);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1618,7 +1594,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 36);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1842,457 +1818,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         5_000,
       );
 
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage and cost commands open one compact inline dashboard",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cost-menu-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-
-      await session.sendText("/cost");
-      let grid = await waitForUsageMenu(session);
-      let pane = grid.join("\n");
-      expect(pane).toContain("Tracking has not started");
-      expect(pane).not.toMatch(/^[*✓!✗⊘i] usage/m);
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/usage");
-      grid = await waitForUsageMenu(session);
-      pane = grid.join("\n");
-      expect(pane).toContain("[30 days]");
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard preserves ledger totals when recovery storage is unsafe",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-recovery-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        JSON.stringify({
-          schema_version: 1,
-          kind: "coverage",
-          started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-        }) + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-      const outside = join(root, "outside");
-      writeFileSync(outside, "not a session directory");
-      symlinkSync(outside, join(fxDir, "sessions"));
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      const pane = (await waitForUsageMenu(session)).join("\n");
-      expect(pane).not.toContain("Usage unavailable");
-      expect(pane).toContain("Partial data · some usage may be missing");
-      expect(pane).toMatch(/0 tokens/);
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard reopen discovers usage created after its initial snapshot",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-late-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(home, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      await session.waitForText("Tracking has not started", TIMEOUT);
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-
-      const fxDir = join(home, ".fx");
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify({
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 1_000,
-              model: "provider/a",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 1,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.25,
-            },
-          }),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-
-      await session.sendText("/usage");
-      const pane = await session.waitForText(/12 tokens/, TIMEOUT);
-      expect(pane).toContain("provider/a");
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard retry recovers after profile initialization becomes safe",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-retry-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      mkdirSync(home, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-      const unsafeTarget = join(root, "unsafe-profile");
-      mkdirSync(unsafeTarget, { mode: 0o700 });
-      symlinkSync(unsafeTarget, join(home, ".fx"));
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      await session.waitForText(
-        "Usage unavailable · press r to retry",
-        TIMEOUT,
-      );
-
-      rmSync(join(home, ".fx"));
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { mode: 0o700 });
-      const now = Date.now();
-      writeFileSync(
-        join(fxDir, "usage.jsonl"),
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify({
-            schema_version: 1,
-            kind: "generation",
-            fact: {
-              id: "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              created_at_ms: now - 1_000,
-              model: "provider/a",
-              input_tokens: 10,
-              output_tokens: 2,
-              cache_read_tokens: 1,
-              cache_write_tokens: 0,
-              reasoning_tokens: 1,
-              total_cost: 0.25,
-            },
-          }),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-
-      await session.sendLiteral("R");
-      const pane = await session.waitForText(/12 tokens/, TIMEOUT);
-      expect(pane).not.toContain("Usage unavailable");
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard reaches Session when every rolling scope is unavailable",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-corrupt-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(fxDir, "usage.jsonl"), "{\"broken\":true}\n", {
-        mode: 0o600,
-      });
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      let pane = await session.waitForText(
-        "Usage unavailable · press r to retry",
-        TIMEOUT,
-      );
-      expect(pane).toContain("[30 days]");
-
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toContain("Usage unavailable · press r to retry");
-      await session.sendKeys("Left");
-      pane = await session.waitForText("[Session]", TIMEOUT);
-      expect(pane).toMatch(/0 tokens/);
-      expect(pane).toContain("Session activity");
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "usage dashboard changes scope, selects and expands models, and refreshes",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-usage-menu-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const fxDir = join(home, ".fx");
-      mkdirSync(fxDir, { recursive: true, mode: 0o700 });
-      mkdirSync(workspace, { recursive: true });
-      const now = Date.now();
-      const fact = (
-        id: string,
-        model: string,
-        createdAtMs: number,
-        input: number,
-        output: number,
-        cost: number,
-      ) => ({
-        schema_version: 1,
-        kind: "generation",
-        fact: {
-          id,
-          created_at_ms: createdAtMs,
-          model,
-          input_tokens: input,
-          output_tokens: output,
-          cache_read_tokens: 1,
-          cache_write_tokens: 0,
-          reasoning_tokens: 1,
-          total_cost: cost,
-        },
-      });
-      const usagePath = join(fxDir, "usage.jsonl");
-      writeFileSync(
-        usagePath,
-        [
-          JSON.stringify({
-            schema_version: 1,
-            kind: "coverage",
-            started_at_ms: now - 40 * 24 * 60 * 60 * 1000,
-          }),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-              "provider/a",
-              now - 60 * 60 * 1000,
-              100,
-              20,
-              1,
-            ),
-          ),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW",
-              "provider/b",
-              now - 2 * 24 * 60 * 60 * 1000,
-              10,
-              2,
-              0.1,
-            ),
-          ),
-          JSON.stringify(
-            fact(
-              "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX",
-              "provider/c",
-              now - 10 * 24 * 60 * 60 * 1000,
-              4,
-              1,
-              0.01,
-            ),
-          ),
-        ].join("\n") + "\n",
-        { mode: 0o600 },
-      );
-      writeFileSync(join(fxDir, "usage.lock"), "", { mode: 0o600 });
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 120,
-        height: 36,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("/usage");
-      let pane = await session.waitForText(/137 tokens/, TIMEOUT);
-      expect(pane).toContain("[30 days]");
-
-      await session.sendKeys("Tab");
-      pane = await session.waitForText("[7 days]", TIMEOUT);
-      expect(pane).toMatch(/132 tokens/);
-      await session.sendKeys("Tab");
-      pane = await session.waitForText("[24 hours]", TIMEOUT);
-      expect(pane).toMatch(/120 tokens/);
-      await session.sendKeys("Tab");
-      pane = await session.waitForText("[Session]", TIMEOUT);
-      expect(pane).toMatch(/0 tokens/);
-      expect(pane).toContain("Session activity");
-      await session.sendKeys("BTab");
-      await session.waitForText("[24 hours]", TIMEOUT);
-      await session.sendKeys("Right");
-      await session.waitForText("[7 days]", TIMEOUT);
-
-      await session.sendKeys("Down");
-      pane = await session.waitForText(/❯ provider\/b/, TIMEOUT);
-      await session.sendKeys("Enter");
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toContain("Requests 1");
-      await session.resizeWindow(72, 16);
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
-      await session.resizeWindow(120, 36);
-      pane = await session.waitForText(/Input 10 · Output 2/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
-
-      appendFileSync(
-        usagePath,
-        JSON.stringify(
-          fact(
-            "gen_01ARZ3NDEKTSV4RRFFQ69G5FAY",
-            "provider/d",
-            now - 500,
-            4,
-            1,
-            0.01,
-          ),
-        ) + "\n",
-      );
-      await session.sendLiteral("R");
-      pane = await session.waitForText(/137 tokens/, TIMEOUT);
-      expect(pane).toMatch(/❯ provider\/b/);
-
-      appendFileSync(usagePath, "{\"broken\":true}\n");
-      await session.sendLiteral("R");
-      pane = await session.waitForText(
-        "Refresh failed · showing previous data",
-        TIMEOUT,
-      );
-      expect(pane).toMatch(/137 tokens/);
-
-      await session.sendKeys("Escape");
-      await session.waitForComposer(5_000);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -2647,7 +2172,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 36);
+      grid = await waitForHelpMenu(session, 38);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -3086,6 +2611,69 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-e");
       await session.sendKeys("C-u");
       await session.waitForPane(hasEmptyComposer, 5_000);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "model picker revalidates the catalog so a model released mid-session appears without a restart",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      const currentModel = "acme/original-model";
+      const releasedModel = "acme/released-model";
+      const catalog = [
+        { id: currentModel, type: "language", released: 100, tags: ["tool-use"] },
+        { id: "acme/second-model", type: "language", released: 90, tags: ["tool-use"] },
+      ];
+      gateway = startFakeGateway([], { models: () => catalog });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-models-refresh-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: currentModel,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+      const closePicker = async () => {
+        await session!.sendKeys("Escape");
+        await session!.waitForPane((current) => !current.includes("tab provider"), 5_000);
+      };
+
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 2);
+      await closePicker();
+      // Wait out the picker's reopen floor first, so a revalidation from a
+      // slow startup's first open has landed before the baseline is read.
+      await Bun.sleep(5_500);
+      const requestsAfterStartup = gateway.modelRequests.length;
+
+      // The gateway ships a model while fx runs. Opening the picker lists the
+      // cached models and revalidates in the background; the open menu then
+      // picks up the new model.
+      catalog.unshift({ id: releasedModel, type: "language", released: 200, tags: ["tool-use"] });
+      await session.sendKeys("C-p");
+      const grid = await waitForModelsMenu(session, 3);
+      expect(grid.join("\n")).toContain(releasedModel);
+      expect(gateway.modelRequests.length).toBe(requestsAfterStartup + 1);
+
+      // Reopening right away reuses the catalog it just fetched.
+      await closePicker();
+      await session.sendKeys("C-p");
+      await waitForModelsMenu(session, 3);
+      expect(gateway.modelRequests.length).toBe(requestsAfterStartup + 1);
+
+      await closePicker();
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -3789,7 +3377,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 36", 5_000);
+      await session.waitForText("Commands 38", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

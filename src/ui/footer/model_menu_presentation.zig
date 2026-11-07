@@ -250,7 +250,7 @@ const ProviderTabs = struct {
     fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
         var tabs: ProviderTabs = .{};
         for (0..model_cache_runtime.model_provider_filter_count) |index| {
-            const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+            const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
             if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
             tabs.indices[tabs.len] = index;
             tabs.len += 1;
@@ -269,7 +269,7 @@ const ProviderTabs = struct {
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Models {d}", .{count}) catch "Models";
+    const title = std.mem.print(&buf, "Models {d}", .{count}) catch "Models";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -298,7 +298,7 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
 }
 
 fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+    const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
         .all => "All",
         .anthropic => "Anthropic",
@@ -489,12 +489,12 @@ fn tokenFactWidth(tokens: u32, suffix: []const u8) usize {
 
 fn formatTokenFact(buf: *[48]u8, tokens: u32, suffix: []const u8) ![]const u8 {
     if (tokens >= 1_000_000 and tokens % 1_000_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
+        return try std.mem.print(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
     }
     if (tokens >= 1_000 and tokens % 1_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
+        return try std.mem.print(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
     }
-    return try std.fmt.bufPrint(buf, "{d} {s}", .{ tokens, suffix });
+    return try std.mem.print(buf, "{d} {s}", .{ tokens, suffix });
 }
 
 fn appendMetadataFact(alloc: Allocator, text: *std.ArrayList(u8), fact: []const u8) !void {
@@ -549,9 +549,9 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     const value = failure orelse return null;
     if (!value.retryable) return null;
     return switch (value.category) {
-        .rate_limited => "AI Gateway rate limited model discovery; retry /model.",
-        .transport, .gateway_unavailable => "Could not reach AI Gateway; retry /model.",
-        else => "Could not refresh model catalog; retry /model.",
+        .rate_limited => "AI Gateway rate limited model discovery; fx retries automatically.",
+        .transport, .gateway_unavailable => "Could not reach AI Gateway; fx retries automatically.",
+        else => "Could not refresh model catalog; fx retries automatically.",
     };
 }
 
@@ -695,7 +695,7 @@ test "model menu states and navigation budget stay bounded" {
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
     defer failed_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; retry /model.") != null);
+    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; fx retries automatically.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
@@ -877,10 +877,10 @@ test "model menu status follows provenance and retryable failure precedence" {
         .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
         .{ .state = .{ .public_only_reason = .chatgpt_subscription, .private_models_hidden = true }, .expected = "Codex models require an authenticated Codex catalog." },
         .{ .state = .{ .public_only_reason = .grok_subscription, .private_models_hidden = true }, .expected = "Grok models require an authenticated Grok catalog." },
-        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /model." },
-        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; retry /model." },
+        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; fx retries automatically." },
+        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; fx retries automatically." },
     };
 
     for (cases) |case| {

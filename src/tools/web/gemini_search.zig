@@ -265,8 +265,8 @@ test "output stays bounded below the size ceiling" {
     defer alloc.free(huge);
     @memset(huge, 'a');
 
-    var titles = [_]gemini_api.Source{.{ .title = huge, .url = huge }} ** 3;
-    const queries = [_][]const u8{huge} ** 2;
+    var titles: [3]gemini_api.Source = @splat(.{ .title = huge, .url = huge });
+    const queries: [2][]const u8 = @splat(huge);
     const output = try formatOutput(alloc, .{
         .query = huge,
         .answer_text = huge,

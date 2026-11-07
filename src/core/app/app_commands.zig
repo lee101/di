@@ -23,9 +23,6 @@ const output_contracts = @import("../output/output_contracts.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const image_commands = @import("../images/image_commands.zig");
-const mcp_auth = @import("../mcp/mcp_auth.zig");
-const mcp_command_provider = @import("../mcp/command_provider.zig");
-const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const app_mcp_runtime = @import("app_mcp_runtime.zig");
 const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
@@ -37,13 +34,12 @@ const display_width = @import("../shared/display_width.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_presentation = @import("../tooling/tool_presentation.zig");
 const session_commands = @import("../session/session_commands.zig");
-const usage_recovery = @import("../session/usage_recovery.zig");
-const usage_dashboard_runtime = @import("usage_dashboard_runtime.zig");
-const usage_report = @import("../session/usage_report.zig");
+const info_panel = @import("../input/info_panel.zig");
+const usage = @import("../../usage/usage.zig");
+const usage_host = @import("usage_host.zig");
 const types = @import("../shared/types.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const agent_execution_memory = @import("../agent/execution_memory.zig");
 const transcript_blocks = @import("../../ui/render_engine/transcript_blocks.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const test_builtin_skills = if (@import("builtin").is_test)
@@ -84,82 +80,6 @@ fn format_trace_notice(
         .copy_failed => |path| try out.writer.print("Clipboard copy failed. Trace saved at {s}. Review and redact it before sharing.", .{path}),
         .saved => |path| try out.writer.print("Trace saved at {s}. Review and redact it before sharing.", .{path}),
         .unavailable => try out.writer.writeAll("Could not create trace."),
-    }
-    return out.toOwnedSlice();
-}
-
-fn formatMcpPublishedReload(
-    alloc: std.mem.Allocator,
-    published: app_mcp_runtime.PublishedReload,
-) ![]u8 {
-    if (published.health == .ready) {
-        return alloc.dupe(
-            u8,
-            if (published.configured_server_count == 0)
-                "MCP configuration reloaded. No servers are configured."
-            else
-                "MCP configuration reloaded successfully.",
-        );
-    }
-
-    if (published.unavailable_server_names.len == 0) {
-        return alloc.dupe(
-            u8,
-            "MCP configuration reloaded, but some servers are unavailable. Run /mcp list for details.",
-        );
-    }
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    if (published.unavailable_server_names.len == 1) {
-        try out.writer.print(
-            "MCP configuration reloaded, but server '{s}' is unavailable. Run /mcp list for details.",
-            .{published.unavailable_server_names[0]},
-        );
-        return out.toOwnedSlice();
-    }
-
-    try out.writer.print(
-        "MCP configuration reloaded, but {d} servers are unavailable: ",
-        .{published.unavailable_server_names.len},
-    );
-    for (published.unavailable_server_names, 0..) |name, index| {
-        if (index > 0) try out.writer.writeAll(", ");
-        try out.writer.print("'{s}'", .{name});
-    }
-    try out.writer.writeAll(". Run /mcp list for details.");
-    return out.toOwnedSlice();
-}
-
-fn formatMcpIssuerMismatch(
-    alloc: std.mem.Allocator,
-    server_name: []const u8,
-    mismatch: mcp_auth.IssuerMismatch,
-) ![]u8 {
-    var expected = try text_utils.encodeTerminalSafe(alloc, mismatch.expected, 1024);
-    defer expected.deinit(alloc);
-    var returned = try text_utils.encodeTerminalSafe(alloc, mismatch.returned, 1024);
-    defer returned.deinit(alloc);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try out.writer.print("MCP authentication for '{s}' was rejected: expected issuer ", .{server_name});
-    try std.json.Stringify.value(expected.bytes, .{}, &out.writer);
-    switch (mismatch.source) {
-        .authorization_metadata => {
-            try out.writer.writeAll(" but metadata returned ");
-            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-            try out.writer.writeAll(". Add \"oauth\":{\"issuer\":");
-            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-            try out.writer.writeAll("} to this server's entry in ~/.fx/mcp.json and retry.");
-        },
-        .authorization_response => {
-            try out.writer.writeAll(" but the authorization response returned issuer ");
-            try std.json.Stringify.value(returned.bytes, .{}, &out.writer);
-            try out.writer.writeAll(
-                ". fx stopped before token exchange. Contact the MCP server provider; changing oauth.issuer is not a safe workaround.",
-            );
-        },
     }
     return out.toOwnedSlice();
 }
@@ -254,7 +174,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
     const action = maybe_action orelse {
         refreshWorkspaceAvailabilityForList(app) catch |err| {
             const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-            const message = try std.fmt.allocPrint(app.alloc, "Workspace refresh rejected: {s}", .{reason});
+            const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
             defer app.alloc.free(message);
             try app.writeDomainNotice(.{
                 .topic = "workspace",
@@ -290,7 +210,7 @@ fn handleWorkspaceCommand(app: anytype, rest: []const u8) !void {
             .commit => "Workspace settings were not changed",
             .reconcile => "Workspace settings are uncertain and could not be reloaded",
         };
-        const message = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ prefix, reason });
+        const message = try app.alloc.print("{s}: {s}", .{ prefix, reason });
         defer app.alloc.free(message);
         try app.writeDomainNotice(.{
             .topic = "workspace",
@@ -348,19 +268,6 @@ fn requestResumeExit(app: anytype) void {
     app.should_exit = true;
 }
 
-/// Masks a retained MCP protocol diagnostic for terminal command output. The
-/// model-facing protocol-error path stays verbatim; this display boundary is
-/// the only place CLI command output sees the diagnostic. Takes ownership of
-/// `diagnostic` and returns an owned masked copy.
-fn maskedDisplayDiagnostic(alloc: std.mem.Allocator, diagnostic: []u8) ![]u8 {
-    const masked = agent_execution_memory.maskTextForDisplay(alloc, diagnostic) catch |err| {
-        alloc.free(diagnostic);
-        return err;
-    };
-    alloc.free(diagnostic);
-    return masked;
-}
-
 pub fn Handlers(comptime App: type) type {
     return struct {
         pub fn route(app: *App, cmd: []const u8) !void {
@@ -376,6 +283,7 @@ pub fn Handlers(comptime App: type) type {
                 .new_session = commandNewSession,
                 .reset_session = commandResetSession,
                 .resume_session = commandResumeSession,
+                .fork_session = commandForkSession,
 
                 .show_help = commandShowHelp,
                 .login = commandLogin,
@@ -385,6 +293,7 @@ pub fn Handlers(comptime App: type) type {
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
+                .handle_effort = commandHandleEffort,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -412,7 +321,7 @@ pub fn Handlers(comptime App: type) type {
             };
         }
 
-        /// What MCP-v2 and `/mcp` have to say, and the reload a `/mcp` change asked for.
+        /// What the MCP host and `/mcp` have to say, and the reload a `/mcp` change asked for.
         fn closeOtherMenusForMcp(app: *App) void {
             closeModelMenuIfPresent(app);
             closeHelpMenuIfPresent(app);
@@ -431,7 +340,7 @@ pub fn Handlers(comptime App: type) type {
         pub fn collectMcpHostFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
             app.applyMcpHostReload() catch |err| {
-                debug_trace.logf("mcp", "MCP-v2 reload failed err={s}", .{@errorName(err)});
+                debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
             };
             const notices = app.takeMcpHostNotices();
@@ -445,192 +354,10 @@ pub fn Handlers(comptime App: type) type {
             app.refreshMcpHostStatus();
         }
 
-        pub fn collectMcpStartupHealthFacts(app: *App) !void {
-            if (comptime !@hasDecl(App, "takeMcpStartupHealthNotice")) return;
-            const notice = (try app.takeMcpStartupHealthNotice()) orelse return;
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
-        }
-
         pub fn collectShellSnapshotFacts(app: *App) !void {
             var buffer: [shell_snapshot.max_notice_bytes]u8 = undefined;
             const notice = shell_snapshot.processOwner().takeUiNotice(&buffer) orelse return;
             try app.writeDomainNotice(.{ .topic = "shell", .tone = .warning, .body = notice }, true);
-        }
-
-        pub fn collectMcpReloadFacts(app: *App) !void {
-            if (comptime !@hasDecl(App, "takeMcpReloadCompletion")) return;
-            var completion = (try app.takeMcpReloadCompletion()) orelse return;
-            defer completion.deinit(app.alloc);
-            if (comptime @hasDecl(App, "mcpReloadCompletionOrigin") and
-                @hasDecl(App, "applyMcpMenuReloadCompletion"))
-            {
-                switch (app.mcpReloadCompletionOrigin()) {
-                    .command => {},
-                    .slack_setup => {
-                        if (comptime @hasDecl(App, "acquireMcpRuntime")) {
-                            if (completion == .outcome and completion.outcome == .published) {
-                                try connectSlackAfterReload(app);
-                                return;
-                            }
-                        }
-                    },
-                    .menu => |generation| {
-                        try app.applyMcpMenuReloadCompletion(generation, &completion);
-                        return;
-                    },
-                }
-            }
-            var warning = false;
-            const body = switch (completion) {
-                .outcome => |outcome| switch (outcome) {
-                    .published => |published| published: {
-                        warning = published.health != .ready;
-                        if (published.generation) |generation| {
-                            debug_trace.logf(
-                                "mcp",
-                                "profile reload published health={s} runtime_generation={d} configured_servers={d} unavailable_servers={d}",
-                                .{
-                                    @tagName(published.health),
-                                    generation,
-                                    published.configured_server_count,
-                                    published.unavailable_server_names.len,
-                                },
-                            );
-                        } else {
-                            debug_trace.logf(
-                                "mcp",
-                                "profile reload published health={s} runtime_generation=none configured_servers={d} unavailable_servers={d}",
-                                .{
-                                    @tagName(published.health),
-                                    published.configured_server_count,
-                                    published.unavailable_server_names.len,
-                                },
-                            );
-                        }
-                        break :published try formatMcpPublishedReload(app.alloc, published);
-                    },
-                    .retained_required_failure => |failure| retained: {
-                        warning = true;
-                        debug_trace.logf(
-                            "mcp",
-                            "profile reload retained current runtime required_server_failure={s}",
-                            .{failure},
-                        );
-                        break :retained try std.fmt.allocPrint(
-                            app.alloc,
-                            "MCP configuration could not be reloaded. Your existing MCP servers are still active. {s} Check the configuration or run /mcp list for details.",
-                            .{failure},
-                        );
-                    },
-                },
-                .failed => |err| failed: {
-                    warning = true;
-                    if (err == error.McpAuthorityReducedReloadFailed) {
-                        debug_trace.logf(
-                            "mcp",
-                            "authority-reducing reload left MCP unavailable",
-                            .{},
-                        );
-                        break :failed try app.alloc.dupe(
-                            u8,
-                            "MCP configuration could not be reloaded after project authority was reduced. MCP is unavailable; check the configuration and run /mcp reload.",
-                        );
-                    }
-                    debug_trace.logf(
-                        "mcp",
-                        "profile reload retained current runtime err={s}",
-                        .{@errorName(err)},
-                    );
-                    break :failed try app.alloc.dupe(
-                        u8,
-                        "MCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
-                    );
-                },
-            };
-            defer app.alloc.free(body);
-            try app.writeDomainNotice(.{
-                .topic = "mcp",
-                .tone = if (warning) .warning else .neutral,
-                .body = body,
-            }, true);
-            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                try app.presentProjectMcpPrompt();
-            }
-        }
-
-        pub fn collectMcpAuthenticationFacts(app: *App) !void {
-            if (comptime !@hasDecl(App, "takeMcpAuthenticationCompletion")) return;
-            var completion = (try app.takeMcpAuthenticationCompletion()) orelse return;
-            defer completion.deinit(app.alloc);
-            if (comptime @hasDecl(App, "mcpAuthenticationCompletionOrigin") and
-                @hasDecl(App, "applyMcpMenuAuthenticationCompletion"))
-            {
-                switch (app.mcpAuthenticationCompletionOrigin()) {
-                    .command, .slack_setup => {},
-                    .menu => |generation| {
-                        try app.applyMcpMenuAuthenticationCompletion(generation, &completion);
-                        return;
-                    },
-                }
-            }
-
-            if (completion.result) |authentication| {
-                switch (authentication) {
-                    .authenticated => |authenticated| {
-                        const success = if (std.mem.eql(u8, completion.server_name, "slack") and completion.reconnect_error == null)
-                            try app.alloc.dupe(u8, "Slack connected. You can now use Slack.")
-                        else if (authenticated.repaired_entries == 0)
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "Authenticated MCP server '{s}'.",
-                                .{completion.server_name},
-                            )
-                        else
-                            try std.fmt.allocPrint(
-                                app.alloc,
-                                "Authenticated MCP server '{s}'.\nRemoved {d} unreadable MCP credential {s}.",
-                                .{
-                                    completion.server_name,
-                                    authenticated.repaired_entries,
-                                    if (authenticated.repaired_entries == 1) "entry" else "entries",
-                                },
-                            );
-                        defer app.alloc.free(success);
-                        if (completion.reconnect_error) |err| {
-                            const body = try std.fmt.allocPrint(app.alloc, "{s}\nThe server could not reconnect: {s}. Check /mcp list for details.", .{ success, @errorName(err) });
-                            defer app.alloc.free(body);
-                            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
-                        } else {
-                            try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = success }, true);
-                        }
-                    },
-                    .issuer_mismatch => |mismatch| {
-                        const body = try formatMcpIssuerMismatch(
-                            app.alloc,
-                            completion.server_name,
-                            mismatch,
-                        );
-                        defer app.alloc.free(body);
-                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
-                    },
-                }
-            } else |err| {
-                const body = if (err == error.Cancelled)
-                    try std.fmt.allocPrint(
-                        app.alloc,
-                        "MCP authentication for '{s}' was cancelled.",
-                        .{completion.server_name},
-                    )
-                else
-                    try std.fmt.allocPrint(
-                        app.alloc,
-                        "MCP authentication for '{s}' failed: {s}.",
-                        .{ completion.server_name, mcp_auth.authentication_error_message(err) },
-                    );
-                defer app.alloc.free(body);
-                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = body }, true);
-            }
         }
 
         fn handleFeedback(app: *App) !void {
@@ -678,7 +405,7 @@ pub fn Handlers(comptime App: type) type {
                 else
                     false;
                 if (copied) break :blk .{ .copied_file = path };
-                if (builtin.os.tag == .macos) break :blk .{ .copy_failed = path };
+                if (builtin.target.os.tag == .macos) break :blk .{ .copy_failed = path };
                 break :blk .{ .saved = path };
             } else blk: {
                 break :blk .unavailable;
@@ -723,6 +450,19 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
+        }
+
+        fn commandForkSession(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .warning,
+                    .body = "Session forking is owned by the embedding SDK for this host.",
+                }, true);
+                return;
+            }
+            try app_session_runtime.Runtime(App).openForkMenu(app);
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {
@@ -777,9 +517,37 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
+        /// `/status` opens its panel in the footer, like `/usage`, and
+        /// writes nothing to the transcript.
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).showStatus(app);
+            openInfoPanel(app, try session_commands.Commands(App).openStatusSnapshot(app));
+        }
+
+        /// Shows `snapshot` in place of any other footer menu. Takes ownership.
+        fn openInfoPanel(app: *App, snapshot: info_panel.Snapshot) void {
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            closeHelpMenuIfPresent(app);
+            app.input_runtime.settings_menu.close();
+            closeInlineCommandMenusIfPresent(app);
+            app.input_runtime.info_panel.open(snapshot);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Rebuilds the open `/status` or `/permissions` panel when a running
+        /// turn changed what it shows. Returns whether it did, so the footer
+        /// repaints.
+        pub fn collectInfoPanelFacts(app: *App) !bool {
+            const panel = &app.input_runtime.info_panel;
+            if (!panel.active) return false;
+            const shown = if (panel.snapshot) |*snapshot| snapshot else return false;
+            const next = (switch (shown.kind()) {
+                .status => try session_commands.Commands(App).refreshedStatusSnapshot(app, shown),
+                .permissions => try session_commands.Commands(App).refreshedPermissionsSnapshot(app, shown),
+            }) orelse return false;
+            panel.replace(next);
+            return true;
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -797,51 +565,34 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).handleModel(app, query);
         }
 
-        fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
+        /// Bare `/effort` opens the menu of the current model's reasoning
+        /// effort levels; `/effort <level>` applies one.
+        fn commandHandleEffort(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (try handlePermissionRuleManagement(app, rest)) return;
-            try session_commands.Commands(App).handlePermissions(app, rest);
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                try writeSessionPermissionRules(app);
+            switch (try session_commands.Commands(App).handleEffort(app, rest)) {
+                .done => {},
+                .open_menu => |capabilities| {
+                    if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+                    if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+                    closeHelpMenuIfPresent(app);
+                    app.input_runtime.settings_menu.close();
+                    closeInlineCommandMenusIfPresent(app);
+                    try app.input_runtime.effort_menu.open(app.alloc, provider_runtime.model(app), capabilities, app.effort);
+                    app.shell.render_requests.request(.footer);
+                },
             }
         }
 
-        fn writeSessionPermissionRules(app: *App) !void {
-            if (comptime !@hasField(App, "session") or
-                !@hasDecl(@TypeOf(app.session), "snapshotPermissionState"))
-            {
+        /// Bare `/permissions` opens its panel and writes nothing to the
+        /// transcript; a subcommand changes the mode or a saved-session rule.
+        fn commandHandlePermissions(ctx: *anyopaque, rest: []const u8) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            if (std.mem.trim(u8, rest, " \t").len == 0) {
+                openInfoPanel(app, try session_commands.Commands(App).openPermissionsSnapshot(app));
                 return;
-            } else {
-                var snapshot = try app.session.snapshotPermissionState(app.alloc);
-                defer snapshot.deinit(app.alloc);
-                var out: std.Io.Writer.Allocating = .init(app.alloc);
-                defer out.deinit();
-                if (snapshot.rules.items.len == 0) {
-                    try out.writer.writeAll("saved-session permission rules: none");
-                } else {
-                    try out.writer.print(
-                        "saved-session permission rules ({d}):",
-                        .{snapshot.rules.items.len},
-                    );
-                    for (snapshot.rules.items) |rule| {
-                        var identity = try text_utils.encodeTerminalSafe(
-                            app.alloc,
-                            rule.display_identity,
-                            session_permission_state.max_display_identity_bytes,
-                        );
-                        defer identity.deinit(app.alloc);
-                        try out.writer.print(
-                            "\n{d} {s} {s}",
-                            .{ rule.id.value, @tagName(rule.decision), identity.bytes },
-                        );
-                    }
-                }
-                try app.writeDomainNotice(.{
-                    .topic = "permissions",
-                    .tone = .neutral,
-                    .body = out.writer.buffered(),
-                }, true);
             }
+            if (try handlePermissionRuleManagement(app, rest)) return;
+            try session_commands.Commands(App).handlePermissions(app, rest);
         }
 
         fn handlePermissionRuleManagement(app: *App, rest: []const u8) !bool {
@@ -1042,7 +793,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowStats(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var buf: [256]u8 = undefined;
-            const body = try std.fmt.bufPrint(
+            const body = try std.mem.print(
                 &buf,
                 "ansi_bytes={d}, redraws={d}, debounced_resizes={d}, footer_updates={d}, stream_chunks={d}",
                 .{ app.metrics.ansi_bytes, app.metrics.full_redraws, app.metrics.debounced_resizes, app.metrics.footer_line_updates, app.metrics.stream_chunks },
@@ -1056,13 +807,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowUsage(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime !runtime_profile.allows(App, .profile_usage)) {
-                var usage = try app.session.usage.reportSnapshot(app.alloc);
-                defer usage.deinit(app.alloc);
+            if (comptime !@hasField(App, "usage_dashboard")) {
                 try app.writeDomainNotice(.{
                     .topic = "usage",
                     .tone = .neutral,
-                    .body = "Durable profile usage is unavailable in this host; active session usage remains in memory.",
+                    .body = "Usage is not available in this host.",
                 }, true);
                 return;
             }
@@ -1071,205 +820,58 @@ pub fn Handlers(comptime App: type) type {
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
-            if (comptime @hasField(App, "usage_dashboard")) {
-                try openUsageDashboard(app, .days_30);
-                return;
+            var label_buf: usage_host.LabelBuffer = undefined;
+            if (usage_host.credential(&app.auth, &label_buf)) |credential| {
+                app.usage_dashboard.open(credential);
+            } else {
+                app.usage_dashboard.openUnavailable(usage_host.missingReason(&app.auth));
             }
-            var usage = loadUsageSnapshot(app, .days_30) catch |err| {
-                debug_trace.logf(
-                    "usage",
-                    "usage dashboard open failed scope={s} reason={s}",
-                    .{ @tagName(usage_report.Scope.days_30), @errorName(err) },
-                );
-                try app.input_runtime.usage_menu.openError(
-                    app.alloc,
-                    .days_30,
-                    "Local usage data is unavailable",
-                );
-                app.shell.render_requests.request(.footer);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            app.shell.render_requests.request(.footer);
+            try installUsageSnapshot(app);
         }
 
-        pub fn refreshUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime @hasField(App, "usage_dashboard")) {
-                if (scope == .session) {
-                    var usage = loadUsageSnapshot(app, scope) catch |err| {
-                        try recordUsageRefreshFailure(app, scope, err);
-                        return;
-                    };
-                    errdefer usage.deinit(app.alloc);
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                    installUsageSnapshot(app, usage);
-                    return;
-                }
-                app.input_runtime.usage_menu.setLoadingScope(app.alloc, scope);
-                try requestUsageDashboardRefresh(app);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            var usage = loadUsageSnapshot(app, scope) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            errdefer usage.deinit(app.alloc);
-            installUsageSnapshot(app, usage);
+        /// Tab and ←→: lists `period` in the model table; never fetches.
+        pub fn refreshUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
         }
 
-        pub fn reloadUsageMenu(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            if (comptime !@hasField(App, "usage_dashboard")) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            if (scope == .session) {
-                try refreshUsageMenu(app, scope);
-                return;
-            }
-            app.input_runtime.usage_menu.requested_scope = scope;
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
-            app.shell.render_requests.request(.footer);
+        /// `r`: fetches unless a fetch is already running, then redraws.
+        pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
+            if (comptime !@hasField(App, "usage_dashboard")) return;
+            _ = period;
+            _ = app.usage_dashboard.refresh();
+            try installUsageSnapshot(app);
         }
 
+        /// Runs on every event-loop pass while `/usage` is open: starts the
+        /// periodic refresh when due, and redraws when the dashboard changed
+        /// or the minute turned ("updated 2m ago", and today at midnight).
         pub fn collectUsageDashboardFacts(app: *App) !bool {
             if (comptime !@hasField(App, "usage_dashboard")) return false;
-            const transition = app.usage_dashboard.pollTransition();
-            if (transition == .none) return false;
-            if (!app.input_runtime.usage_menu.active or
-                app.input_runtime.usage_menu.navigationScope() == .session)
-            {
-                return false;
-            }
-            const scope = app.input_runtime.usage_menu.navigationScope();
-            if (transition == .failed) {
-                const err = app.usage_dashboard.lastError() orelse
-                    error.ProfileUsageUnavailable;
-                try recordUsageRefreshFailure(app, scope, err);
-                return true;
-            }
-            if (try app.usage_dashboard.snapshot(app.alloc, scope)) |usage| {
-                installUsageSnapshot(app, usage);
-                return true;
-            }
-            const err = app.usage_dashboard.lastError() orelse
-                error.ProfileUsageUnavailable;
-            try recordUsageRefreshFailure(app, scope, err);
+            const menu = &app.input_runtime.usage_menu;
+            if (!menu.active) return false;
+            app.usage_dashboard.tick();
+            const changed = app.usage_dashboard.generationCount() != menu.generation;
+            const shown_minute = if (menu.snapshot) |*s| @divFloor(s.now_ms, std.time.ms_per_min) else 0;
+            const minute_turned = @divFloor(app.usage_dashboard.nowMs(), std.time.ms_per_min) != shown_minute;
+            if (!changed and !minute_turned) return false;
+            try installUsageSnapshot(app);
             return true;
         }
 
-        fn openUsageDashboard(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !void {
-            const cached = try app.usage_dashboard.snapshot(app.alloc, scope);
-            if (cached) |usage| {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openLoading(app.alloc, scope);
-            }
-            requestUsageDashboardRefresh(app) catch |err| {
-                try recordUsageRefreshFailure(app, scope, err);
-                return;
-            };
+        pub fn closeUsageMenu(app: *App) void {
+            app.input_runtime.usage_menu.close();
+            if (comptime @hasField(App, "usage_dashboard")) app.usage_dashboard.close();
+        }
+
+        fn installUsageSnapshot(app: *App) !void {
+            // Read the generation first, so a fetch finishing in between
+            // still triggers a redraw.
+            const generation = app.usage_dashboard.generationCount();
+            const snapshot = try app.usage_dashboard.snapshot(app.alloc);
+            const menu = &app.input_runtime.usage_menu;
+            if (menu.active) menu.replace(snapshot, generation) else menu.open(snapshot, generation);
             app.shell.render_requests.request(.footer);
-        }
-
-        fn requestUsageDashboardRefresh(app: *App) !void {
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            _ = try app.usage_dashboard.requestRefresh(
-                usage_dashboard_runtime.profileProvider(
-                    &app.session.profile_usage,
-                ),
-                home,
-                @max(io_mod.milliTimestamp(), 0),
-            );
-        }
-
-        fn installUsageSnapshot(
-            app: *App,
-            usage: usage_report.Snapshot,
-        ) void {
-            if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.replaceOwned(app.alloc, usage);
-            } else {
-                app.input_runtime.usage_menu.openOwned(app.alloc, usage);
-            }
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn recordUsageRefreshFailure(
-            app: *App,
-            scope: usage_report.Scope,
-            err: anyerror,
-        ) !void {
-            debug_trace.logf(
-                "usage",
-                "usage dashboard refresh failed scope={s} reason={s}",
-                .{ @tagName(scope), @errorName(err) },
-            );
-            try app.input_runtime.usage_menu.recordRefreshFailure(
-                app.alloc,
-                scope,
-                "Local usage data is unavailable",
-            );
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn loadUsageSnapshot(
-            app: *App,
-            scope: usage_report.Scope,
-        ) !usage_report.Snapshot {
-            if (scope == .session) {
-                return app.session.usage.reportSnapshot(app.alloc);
-            }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
-            const availability = try app.session.ensureProfileUsageReadable(
-                app.alloc,
-                home,
-            );
-            if (availability == .unavailable) {
-                return app.session.profile_usage.lastError() orelse
-                    error.ProfileUsageUnavailable;
-            }
-            const snapshot_time_ms = @max(io_mod.milliTimestamp(), 0);
-            var recovery = try usage_recovery.collectFromHomeConservative(
-                app.alloc,
-                home,
-            );
-            defer recovery.deinit(app.alloc);
-            return app.session.profile_usage.snapshot(
-                app.alloc,
-                scope,
-                snapshot_time_ms,
-                .{
-                    .facts = recovery.facts,
-                    .incidents = recovery.incidents,
-                    .pending = recovery.pending,
-                    .unknown_pending = recovery.unknown_pending,
-                },
-            );
         }
 
         fn commandUndoLast(ctx: *anyopaque) !void {
@@ -1283,7 +885,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(app.alloc, "Restored {s}", .{display_path.bytes});
+                    break :blk try app.alloc.print("Restored {s}", .{display_path.bytes});
                 },
                 .deleted => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -1292,7 +894,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(app.alloc, "Deleted {s} (was newly created)", .{display_path.bytes});
+                    break :blk try app.alloc.print("Deleted {s} (was newly created)", .{display_path.bytes});
                 },
                 .unavailable => |path| blk: {
                     var display_path = try text_utils.encodeTerminalSafe(
@@ -1301,8 +903,7 @@ pub fn Handlers(comptime App: type) type {
                         std.Io.Dir.max_path_bytes,
                     );
                     defer display_path.deinit(app.alloc);
-                    break :blk try std.fmt.allocPrint(
-                        app.alloc,
+                    break :blk try app.alloc.print(
                         "Could not undo {s}",
                         .{display_path.bytes},
                     );
@@ -1323,448 +924,24 @@ pub fn Handlers(comptime App: type) type {
             }, true);
         }
 
-        pub fn addSlack(app: *App) !void {
-            try commandHandleMcp(@ptrCast(app), "add slack");
-        }
-
-        fn connectSlackAfterReload(app: *App) !void {
-            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
-            defer lease.deinit();
-            var snapshot = try lease.runtime.snapshotHealth(app.alloc, @intCast(@max(io_mod.milliTimestamp(), 0)));
-            defer snapshot.deinit(app.alloc);
-            for (snapshot.servers) |server| {
-                if (!std.mem.eql(u8, server.identity(), "slack")) continue;
-                if (server.connection == .ready) {
-                    try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack connected. You can now use Slack." }, true);
-                    return;
-                }
-            }
-            try commandHandleMcp(@ptrCast(app), "auth slack --open");
-        }
-
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
+            if (comptime !@hasDecl(App, "runMcpVerbs")) return;
             const app: *App = @ptrCast(@alignCast(ctx));
-            const command = std.mem.trim(u8, rest, " \t");
-            // MCP-v2: `/mcp` alone opens the menu, and `/mcp
-            // VERB` runs the verbs `fx mcp` has.
-            if (comptime @hasDecl(App, "runMcpVerbs")) if (app.mcpHostSelected()) {
-                if (command.len > 0) return app.runMcpVerbs(command);
-                closeOtherMenusForMcp(app);
-                app.openMcpHostMenu();
-                app.shell.render_requests.request(.footer);
-                return;
-            };
-            if ((command.len == 0 or std.mem.eql(u8, command, "list")) and
-                comptime @hasDecl(App, "openMcpMenu"))
-            {
-                closeOtherMenusForMcp(app);
-                try app.openMcpMenu();
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            if (std.mem.eql(u8, std.mem.trim(u8, rest, " \t"), "add slack")) {
-                if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
-                    if (app.mcpAuthenticationPending("slack")) {
-                        try app.writeDomainNotice(.{ .topic = "mcp", .tone = .neutral, .body = "Slack authorization is already in progress. Finish it in your browser." }, true);
-                        return;
-                    }
-                }
-            }
-            const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
-                .list_ctx = @ptrCast(app),
-                .summarize_servers = summarizeMcpServers,
-                .list_servers_and_tools = listMcpServersAndTools,
-                .auth_ctx = @ptrCast(app),
-                .validate_authentication_server = validateMcpAuthenticationServer,
-                .authenticate_server = authenticateMcpServer,
-                .logout_server = logoutMcpServer,
-                .feature_ctx = @ptrCast(app),
-                .list_resources = listMcpResources,
-                .read_resource = readMcpResource,
-                .list_prompts = listMcpPrompts,
-                .get_prompt = getMcpPrompt,
-                .complete_prompt = completeMcpPrompt,
-                .complete_resource = completeMcpResource,
-            });
-            defer result.deinit(app.alloc);
-            const command_body = switch (result.display) {
-                .block => |text| text,
-                .line => |text| text,
-            };
-
-            var reload_notice: ?[]u8 = null;
-            defer if (reload_notice) |notice| app.alloc.free(notice);
-            var reload_warning = false;
-            if (result.project_action) |action| {
-                try applyProjectMcpAction(app, action, command_body);
-                return;
-            }
-            if (result.reload) {
-                const reload = if (result.connect_slack) reload: {
-                    if (comptime @hasDecl(App, "beginMcpSlackSetup")) break :reload app.beginMcpSlackSetup();
-                    break :reload error.McpAuthenticationUnavailable;
-                } else app.beginMcpReload();
-                reload catch |err| {
-                    reload_warning = true;
-                    reload_notice = if (result.report_reload)
-                        try app.alloc.dupe(
-                            u8,
-                            "MCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
-                        )
-                    else
-                        try std.fmt.allocPrint(
-                            app.alloc,
-                            "{s}\nMCP configuration could not be reloaded. Your existing MCP servers are still active. Check the configuration and run /mcp list for details before trying again.",
-                            .{command_body},
-                        );
-                    debug_trace.logf("mcp", "profile reload retained current runtime err={s}", .{@errorName(err)});
-                    const notice = reload_notice.?;
-                    try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = notice }, true);
-                    return;
-                };
-                const started = "MCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.";
-                reload_notice = if (result.report_reload)
-                    try app.alloc.dupe(u8, started)
-                else
-                    try std.fmt.allocPrint(
-                        app.alloc,
-                        "{s}\n{s}",
-                        .{ command_body, started },
-                    );
-            }
-            const body = reload_notice orelse command_body;
-            try app.writeDomainNotice(.{
-                .topic = noticeTopicForBody("mcp", body),
-                .tone = if (reload_warning) .warning else .neutral,
-                .body = body,
-            }, true);
-        }
-
-        pub fn applyProjectMcpAction(
-            app: *App,
-            action: @import("../mcp/project_config.zig").ProjectMcpAction,
-            success_body: []const u8,
-        ) !void {
-            if (comptime !@hasField(App, "workspace_root") or
-                !@hasDecl(App, "beginMcpAuthorityReduction"))
-            {
-                return error.McpProjectChoicesUnavailable;
-            } else {
-                const reducing_requested = switch (action) {
-                    .reject, .reset => true,
-                    .approve, .approve_all => false,
-                };
-                var attempt = config_runtime.attemptProjectMcpMutation(
-                    app.alloc,
-                    app.workspace_root,
-                    action,
-                );
-                defer attempt.deinit(app.alloc);
-                var warning = false;
-                var owned_notice: ?[]u8 = null;
-                defer if (owned_notice) |notice| app.alloc.free(notice);
-                switch (attempt) {
-                    .outcome => |outcome| switch (outcome) {
-                        .unchanged => {},
-                        .committed => |committed| {
-                            if (committed.authority_reduced) {
-                                try app.beginMcpAuthorityReduction(true);
-                            } else {
-                                try app.beginMcpReload();
-                            }
-                        },
-                    },
-                    .failure => |failure| {
-                        warning = true;
-                        if (failure.err == error.SettingsCommitIndeterminate and reducing_requested) {
-                            try app.beginMcpAuthorityReduction(false);
-                            owned_notice = try app.alloc.dupe(
-                                u8,
-                                "Project MCP choices may have been saved, so live MCP authority was retired. Run /mcp reload after checking settings.json.",
-                            );
-                        } else {
-                            owned_notice = try std.fmt.allocPrint(
-                                app.alloc,
-                                "Project MCP choices were not applied: {s}.",
-                                .{@errorName(failure.err)},
-                            );
-                        }
-                    },
-                }
+            if (comptime !runtime_profile.allows(App, .mcp)) {
                 try app.writeDomainNotice(.{
                     .topic = "mcp",
-                    .tone = if (warning) .warning else .neutral,
-                    .body = owned_notice orelse success_body,
+                    .tone = .warning,
+                    .body = "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
                 }, true);
-                if (warning and owned_notice != null and
-                    comptime @hasDecl(App, "presentProjectMcpPrompt"))
-                {
-                    try app.presentProjectMcpPrompt();
-                }
+                return;
             }
-        }
-
-        fn listMcpServersAndTools(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.listMcpServersAndTools(alloc);
-        }
-
-        fn summarizeMcpServers(ctx: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.summarizeMcpServers(alloc);
-        }
-
-        fn listMcpResources(
-            ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            server_name: []const u8,
-            templates: bool,
-        ) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var result = try lease.runtime.listResources(alloc, server_name, templates, null, .unrestricted);
-            defer result.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print("MCP {s} from {s} ({d}):\n", .{
-                if (templates) "resource templates" else "resources",
-                server_name,
-                result.items.len,
-            });
-            for (result.items) |item| {
-                try out.writer.print("  {s} :: {s}", .{ item.server_name, item.uri });
-                try out.writer.print(" — {s}", .{item.title orelse item.name});
-                try out.writer.writeByte('\n');
-            }
-            return try out.toOwnedSlice();
-        }
-
-        fn readMcpResource(
-            ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            server_name: []const u8,
-            uri: []const u8,
-        ) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var protocol_diagnostic: ?[]u8 = null;
-            defer if (protocol_diagnostic) |diagnostic| alloc.free(diagnostic);
-            var result = lease.runtime.readResource(alloc, server_name, uri, .{
-                .protocol_diagnostic = &protocol_diagnostic,
-            }) catch |err| {
-                if (err == error.McpProtocolError) {
-                    if (protocol_diagnostic) |diagnostic| {
-                        protocol_diagnostic = null;
-                        return try maskedDisplayDiagnostic(alloc, diagnostic);
-                    }
-                }
-                return err;
-            };
-            defer result.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print("[untrusted MCP resource content] {s} :: {s}\n", .{ result.server_name, result.uri });
-            for (result.contents) |content| {
-                try out.writer.print("\n{s}", .{content.uri});
-                if (content.mime_type) |mime_type| try out.writer.print(" ({s})", .{mime_type});
-                try out.writer.writeByte('\n');
-                switch (content.data) {
-                    .text => |text| try out.writer.writeAll(text),
-                    .blob => |blob| try out.writer.print("<base64 blob: {d} bytes encoded>", .{blob.len}),
-                }
-                try out.writer.writeByte('\n');
-            }
-            return try out.toOwnedSlice();
-        }
-
-        fn listMcpPrompts(ctx: *anyopaque, alloc: std.mem.Allocator, server_name: []const u8) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var result = try lease.runtime.listPrompts(alloc, server_name, null, .unrestricted);
-            defer result.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print("MCP prompts from {s} ({d}):\n", .{ server_name, result.items.len });
-            for (result.items) |item| {
-                try out.writer.print("  {s} :: {s}", .{ item.server_name, item.name });
-                if (item.title) |label| {
-                    try out.writer.print(" — {s}", .{label});
-                } else if (item.description) |label| {
-                    try out.writer.print(" — {s}", .{label});
-                }
-                if (item.arguments.len > 0) {
-                    try out.writer.writeAll(" [");
-                    for (item.arguments, 0..) |argument, index| {
-                        if (index > 0) try out.writer.writeAll(", ");
-                        try out.writer.print("{s}{s}", .{ argument.name, if (argument.required) "*" else "" });
-                    }
-                    try out.writer.writeByte(']');
-                }
-                try out.writer.writeByte('\n');
-            }
-            return try out.toOwnedSlice();
-        }
-
-        fn getMcpPrompt(
-            ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            server_name: []const u8,
-            prompt_name: []const u8,
-            arguments_json: []const u8,
-        ) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var protocol_diagnostic: ?[]u8 = null;
-            defer if (protocol_diagnostic) |diagnostic| alloc.free(diagnostic);
-            var result = lease.runtime.getPrompt(alloc, server_name, prompt_name, arguments_json, .{
-                .protocol_diagnostic = &protocol_diagnostic,
-            }) catch |err| {
-                if (err == error.McpProtocolError) {
-                    if (protocol_diagnostic) |diagnostic| {
-                        protocol_diagnostic = null;
-                        return try maskedDisplayDiagnostic(alloc, diagnostic);
-                    }
-                }
-                return err;
-            };
-            defer result.deinit(alloc);
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print("[untrusted MCP prompt content] {s} :: {s}\n", .{ result.server_name, result.name });
-            if (result.description) |description| try out.writer.print("{s}\n", .{description});
-            for (result.messages) |message| {
-                try out.writer.print("\n{s} ({s}):\n{s}\n", .{
-                    @tagName(message.role),
-                    @tagName(message.content_kind),
-                    message.content_json,
-                });
-            }
-            return try out.toOwnedSlice();
-        }
-
-        fn completeMcpPrompt(
-            ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            server_name: []const u8,
-            prompt_name: []const u8,
-            argument_name: []const u8,
-            value: []const u8,
-        ) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var result = try lease.runtime.completePromptArgument(
-                alloc,
-                server_name,
-                prompt_name,
-                .{ .name = argument_name, .value = value },
-                &.{},
-                null,
-                .unrestricted,
-            );
-            defer result.deinit(alloc);
-            return renderMcpCompletions(alloc, &result);
-        }
-
-        fn completeMcpResource(
-            ctx: *anyopaque,
-            alloc: std.mem.Allocator,
-            server_name: []const u8,
-            uri_template: []const u8,
-            variable_name: []const u8,
-            value: []const u8,
-        ) ![]u8 {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpRuntimeUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpRuntimeUnavailable;
-            defer lease.deinit();
-            var result = try lease.runtime.completeResourceTemplateArgument(
-                alloc,
-                server_name,
-                uri_template,
-                .{ .name = variable_name, .value = value },
-                &.{},
-                null,
-                .unrestricted,
-            );
-            defer result.deinit(alloc);
-            return renderMcpCompletions(alloc, &result);
-        }
-
-        fn renderMcpCompletions(alloc: std.mem.Allocator, result: *const mcp_runtime.CompletionResult) ![]u8 {
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            defer out.deinit();
-            try out.writer.print("MCP completions from {s} ({d}", .{ result.server_name, result.values.len });
-            if (result.total) |total| try out.writer.print(" of {d}", .{total});
-            try out.writer.writeAll("):\n");
-            for (result.values) |value| try out.writer.print("  {s}\n", .{value});
-            if (result.has_more == true) try out.writer.writeAll("  … more available\n");
-            return try out.toOwnedSlice();
-        }
-
-        fn authenticateMcpServer(
-            ctx: *anyopaque,
-            name: []const u8,
-        ) !mcp_command_provider.AuthenticationStart {
-            if (comptime !@hasDecl(App, "startMcpAuthentication")) {
-                return error.McpAuthenticationUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.startMcpAuthentication(name);
-        }
-
-        fn validateMcpAuthenticationServer(ctx: *anyopaque, name: []const u8) !void {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpAuthenticationUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
-            defer lease.deinit();
-            try lease.runtime.validateAuthenticationServer(name);
-        }
-
-        fn logoutMcpServer(
-            ctx: *anyopaque,
-            name: []const u8,
-        ) !mcp_command_provider.LogoutResult {
-            if (comptime !@hasDecl(App, "acquireMcpRuntime")) {
-                return error.McpAuthenticationUnavailable;
-            }
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "mcpAuthenticationPending")) {
-                if (app.mcpAuthenticationPending(name)) return .{ .busy = true };
-            }
-            var lease = app.acquireMcpRuntime() orelse return error.McpServerNotFound;
-            defer lease.deinit();
-            const result = try lease.runtime.logoutServer(name);
-            return .{
-                .removed = result.removed,
-                .revocation_failed = result.revocation_failed,
-                .repaired_entries = result.repaired_entries,
-                .local_only = result.local_only,
-            };
+            const command = std.mem.trim(u8, rest, " \t");
+            // `/mcp` alone opens the menu, and `/mcp VERB` runs the verbs
+            // `fx mcp` has.
+            if (command.len > 0) return app.runMcpVerbs(command);
+            closeOtherMenusForMcp(app);
+            app.openMcpHostMenu();
+            app.shell.render_requests.request(.footer);
         }
 
         noinline fn commandHandleSkills(ctx: *anyopaque, rest: []const u8) !void {
@@ -1846,7 +1023,7 @@ pub fn Handlers(comptime App: type) type {
 
             switch (command) {
                 .install => |install| {
-                    const install_notice = try std.fmt.allocPrint(app.alloc, "Installing from {s}...", .{install.source});
+                    const install_notice = try app.alloc.print("Installing from {s}...", .{install.source});
                     defer app.alloc.free(install_notice);
                     try app.writeDomainNotice(.{
                         .topic = "skills",
@@ -1998,8 +1175,10 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
+            if (comptime @hasField(InputRuntime, "info_panel")) app.input_runtime.info_panel.close();
+            if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
+            if (comptime @hasField(InputRuntime, "effort_menu")) app.input_runtime.effort_menu.close(app.alloc);
         }
 
         fn commandCopyLast(ctx: *anyopaque) !void {
@@ -2160,7 +1339,7 @@ pub fn Handlers(comptime App: type) type {
             if (std.mem.trim(u8, rest, " \t").len == 0) {
                 refreshWorkspaceAvailabilityForList(app) catch |err| {
                     const reason = output_contracts.workspaceErrorMessage(err) orelse "workspace refresh failed";
-                    const message = try std.fmt.allocPrint(app.alloc, "Workspace refresh rejected: {s}", .{reason});
+                    const message = try app.alloc.print("Workspace refresh rejected: {s}", .{reason});
                     defer app.alloc.free(message);
                     try app.writeDomainNotice(.{
                         .topic = "workspace",
@@ -2205,9 +1384,9 @@ const trace_transcript_max_line_bytes: usize = 300;
 
 fn traceFilePermissions() std.Io.File.Permissions {
     const builtin = @import("builtin");
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
-        else => std.Io.File.Permissions.fromMode(0o600),
+        else => io_mod.permissionsFromMode(0o600),
     };
 }
 
@@ -2225,7 +1404,7 @@ fn writeTraceReportFile(alloc: std.mem.Allocator, contents: []const u8) ![]u8 {
         var random_bytes: [6]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const path = try std.fmt.allocPrint(alloc, "{s}/fx-trace-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
+        const path = try alloc.print("{s}/fx-trace-{d}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{s}.md", .{
             trimmed,
             year_day.year,
             month_day.month.numeric(),
@@ -2285,8 +1464,13 @@ fn buildTraceReport(app: anytype) ![]u8 {
     }
     const build_options = @import("build_options");
     try out.writer.print("version: {s} ({s})\n", .{ App.app_version, build_options.git_commit });
-    try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
-    try out.writer.print("build: {s}\n", .{@tagName(builtin.mode)});
+    try out.writer.print("platform: {s}/{s}\n", .{ @tagName(builtin.target.os.tag), @tagName(builtin.target.cpu.arch) });
+    try out.writer.print("build: {s}\n", .{switch (builtin.optimize) {
+        .debug => "Debug",
+        .safe => "ReleaseSafe",
+        .fast => "ReleaseFast",
+        .small => "ReleaseSmall",
+    }});
     try out.writer.print("model: {s}\n", .{provider_runtime.model(app)});
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
@@ -2391,13 +1575,7 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
         try writer.print("tokens_total: {d}->{d}\n", .{ app.total_input_tokens, app.total_output_tokens });
     }
     if (comptime @hasField(App, "total_web_search_requests")) {
-        var usage = try app.session.usage.snapshot(alloc);
-        defer usage.deinit(alloc);
-        try writeSearchUsageSummary(
-            writer,
-            app.total_web_search_requests,
-            usage.billable_web_search_calls,
-        );
+        try writer.print("web_search_requests_total: {d}\n", .{app.total_web_search_requests});
     }
     try writeAuthStateSummary(writer, app);
     try writeProcessSummary(writer, alloc);
@@ -2473,12 +1651,12 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
 }
 
 fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
-    const pid = std.c.getpid();
+    const pid = io_mod.processId();
     try writer.print("process: pid={d}", .{pid});
     if (countOpenFileDescriptors()) |fd_count| try writer.print(" open_fds={d}", .{fd_count});
     try writer.writeByte('\n');
 
-    const ps = processMemorySnapshot(alloc, pid) catch null;
+    const ps = if (comptime @import("builtin").os.tag == .windows) null else processMemorySnapshot(alloc, @intCast(pid)) catch null;
     if (ps) |text| {
         defer alloc.free(text);
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -2496,7 +1674,7 @@ fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
 
 fn countOpenFileDescriptors() ?usize {
     const builtin = @import("builtin");
-    const fd_dir = switch (builtin.os.tag) {
+    const fd_dir = switch (builtin.target.os.tag) {
         .linux => "/proc/self/fd",
         .macos => "/dev/fd",
         else => return null,
@@ -2514,7 +1692,7 @@ fn countOpenFileDescriptors() ?usize {
 }
 
 fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
-    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{pid});
+    const pid_text = try alloc.print("{d}", .{pid});
     defer alloc.free(pid_text);
     const result = try std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{ "ps", "-o", "pid,ppid,rss,vsz,etime,stat", "-p", pid_text },
@@ -2694,38 +1872,6 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
 
     count += try writeMcpHostProblems(writer, app, alloc);
 
-    var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
-        app.acquireMcpRuntime()
-    else
-        null;
-    defer if (mcp_lease) |*lease| lease.deinit();
-    if (mcp_lease) |lease| {
-        const mcp = lease.runtime;
-        if (mcp.isDiscovering()) {
-            count += 1;
-            try writer.writeAll("- mcp discovery in progress\n");
-        } else {
-            var diagnostics_snapshot = try mcp.snapshotServerDiagnostics(alloc);
-            defer diagnostics_snapshot.deinit(alloc);
-            for (diagnostics_snapshot.items) |server| {
-                if (server.status == .needs_auth) {
-                    count += 1;
-                    try writer.print("- mcp server needs authentication name={s}", .{server.name});
-                } else if (server.status == .failed) {
-                    count += 1;
-                    try writer.print("- mcp server failed name={s}", .{server.name});
-                } else {
-                    continue;
-                }
-                if (server.last_error) |err| {
-                    try writer.writeAll(" error=");
-                    try writeMaskedInline(writer, alloc, err);
-                }
-                try writer.writeByte('\n');
-            }
-        }
-    }
-
     count += try writeModelCatalogProblems(writer);
 
     if (count == 0) try writer.writeAll("- no obvious errors captured in recent network, tool, compaction, MCP, or model catalog state\n");
@@ -2852,7 +1998,7 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     try writer.writeByte('\n');
 }
 
-/// MCP-v2's servers, one line each; false when there is no host to ask.
+/// The MCP servers, one line each; false when there is no host to ask.
 fn writeMcpHostServers(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !bool {
     if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return false;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2881,7 +2027,7 @@ fn writeMcpHostServers(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allo
     return true;
 }
 
-/// MCP-v2's servers that need someone to act: down, retrying, missing a
+/// The MCP servers that need someone to act: down, retrying, missing a
 /// variable, or waiting for a login.
 fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !usize {
     if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return 0;
@@ -2894,6 +2040,7 @@ fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
             .failed => "failed",
             .retrying => "retrying",
             .missing_env => "missing a variable",
+            .invalid_env => "can't use a variable",
             else => if (s.needs_login) "needs login" else continue,
         };
         count += 1;
@@ -2918,42 +2065,8 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
         boolLabel(io_mod.getenv("CMUX_WORKSPACE_ID") != null),
     });
 
-    if (comptime @hasDecl(@TypeOf(app.*), "mcpHostSelected")) {
-        try writer.print("mcp_engine: {s}\n", .{if (app.mcpHostSelected()) "v2" else "v1"});
-    }
     if (try writeMcpHostServers(writer, app, alloc)) return;
-
-    var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
-        app.acquireMcpRuntime()
-    else
-        null;
-    defer if (mcp_lease) |*lease| lease.deinit();
-    if (mcp_lease) |lease| {
-        const mcp = lease.runtime;
-        if (mcp.isDiscovering()) {
-            try writer.writeAll("mcp_servers: discovery in progress\n");
-        } else {
-            var diagnostics_snapshot = try mcp.snapshotServerDiagnostics(alloc);
-            defer diagnostics_snapshot.deinit(alloc);
-            if (diagnostics_snapshot.items.len == 0) {
-                try writer.writeAll("mcp_servers: none\n");
-            } else {
-                try writer.print("mcp_servers ({d}):\n", .{diagnostics_snapshot.items.len});
-                for (diagnostics_snapshot.items) |server| {
-                    try writer.print("  - {s} state={s} status={s} tools={d} command=", .{ server.name, @tagName(server.state), @tagName(server.status), server.tool_count });
-                    try writeMaskedInline(writer, alloc, server.command);
-                    try writer.writeByte('\n');
-                    if (server.last_error) |err| {
-                        try writer.writeAll("    error: ");
-                        try writeMaskedInline(writer, alloc, err);
-                        try writer.writeByte('\n');
-                    }
-                }
-            }
-        }
-    } else {
-        try writer.writeAll("mcp_servers: runtime not loaded\n");
-    }
+    try writer.writeAll("mcp_servers: none\n");
 }
 
 fn writeRendererState(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
@@ -3175,13 +2288,12 @@ fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
     if (comptime @hasField(App, "model_cache")) {
         const snapshot = app.model_cache.snapshotForTrace();
         try writer.print("state={s} entries={d}", .{ snapshot.state, snapshot.entries });
-        if (snapshot.last_attempt_ms > 0) {
-            const age_ms = io_mod.milliTimestamp() - snapshot.last_attempt_ms;
+        if (snapshot.last_attempt_age_ms) |age_ms| {
             try writer.print(" last_attempt={d}s ago", .{@divFloor(@max(age_ms, 0), @as(i64, 1000))});
         }
         if (snapshot.failure_category) |category| {
             try writer.print(" failure={s} retryable={s}", .{ category, boolLabel(snapshot.failure_retryable) });
-            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@intFromEnum(status)});
+            if (snapshot.failure_http_status) |status| try writer.print(" status={d}", .{@backingInt(status)});
             if (snapshot.anonymous_fallback) try writer.writeAll(" anonymous_fallback=true");
         }
         try writer.writeByte('\n');
@@ -3282,8 +2394,7 @@ fn projectProviderToolCalls(
                     output[count] = summary;
                     count += 1;
                 } else {
-                    std.mem.copyForwards(
-                        ProviderToolCallSummary,
+                    @memmove(
                         output[0 .. output.len - 1],
                         output[1..],
                     );
@@ -3300,11 +2411,6 @@ fn providerToolStatusLabel(status: ?types.PersistedToolStatus) []const u8 {
         .success => "ok",
         .failure => "err",
     } else "pending";
-}
-
-fn writeSearchUsageSummary(writer: *std.Io.Writer, observed: u64, billed: u64) !void {
-    try writer.print("web_search_requests_total: {d} (observed)\n", .{observed});
-    try writer.print("billable_web_search_calls: {d} (billed)\n", .{billed});
 }
 
 noinline fn writeToolCallsSummary(
@@ -3665,7 +2771,7 @@ fn renderThematicRuleTimelineBody(alloc: std.mem.Allocator, text: []const u8) ![
     const stripped = try stripAnsiEscapes(alloc, text);
     defer alloc.free(stripped);
     const trimmed = std.mem.trimEnd(u8, stripped, " \t\r\n");
-    return std.fmt.allocPrint(alloc, "  {s}\n", .{trimmed});
+    return alloc.print("  {s}\n", .{trimmed});
 }
 
 test "workspace slash parser preserves paths with spaces and rejects incomplete actions" {
@@ -3725,7 +2831,7 @@ test "workspace list refresh waits for an idle turn" {
         active: bool = true,
         index_refresh_count: usize = 0,
 
-        fn refreshWorkspaceAccess(self: *@This()) !bool {
+        pub fn refreshWorkspaceAccess(self: *@This()) !bool {
             self.available = false;
             self.active = false;
             self.index_refresh_count += 1;
@@ -3783,11 +2889,11 @@ test "workspace list reports refresh rejection without replacing access" {
             self.transcript.deinit(self.alloc);
         }
 
-        fn refreshWorkspaceAccess(_: *@This()) !bool {
+        pub fn refreshWorkspaceAccess(_: *@This()) !bool {
             return error.TooManyDirectories;
         }
 
-        fn workspaceAccess(self: *@This()) *const Access {
+        pub fn workspaceAccess(self: *@This()) *const Access {
             return &self.access;
         }
 
@@ -3924,8 +3030,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
             error.InvalidTitle => "title must be printable text",
             error.NoActiveSession => "no active session to rename",
             else => {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "renamed for this process but not saved ({s})",
                     .{@errorName(err)},
                 );
@@ -3947,7 +3052,7 @@ fn handleRenameCommand(app: anytype, rest: []const u8) !void {
 
     app.shell.render_requests.request(.footer);
     const title = SessionRuntime.cachedSessionTitle(app) orelse "";
-    const msg = try std.fmt.allocPrint(app.alloc, "renamed to \"{s}\"", .{title});
+    const msg = try app.alloc.print("renamed to \"{s}\"", .{title});
     defer app.alloc.free(msg);
     try app.writeDomainNotice(.{ .topic = "session", .tone = .neutral, .body = msg }, true);
 }
@@ -3956,8 +3061,9 @@ const StatuslineFeedback = enum { announce, silent };
 
 fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    inline for (std.meta.fields(config_runtime.StatuslineItem)) |field| {
-        if (std.mem.eql(u8, trimmed, field.name)) return @enumFromInt(field.value);
+    const statusline_item_info = @typeInfo(config_runtime.StatuslineItem).@"enum";
+    inline for (statusline_item_info.field_names, statusline_item_info.field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, trimmed, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -4009,8 +3115,7 @@ fn applyStatuslineItem(
     switch (feedback) {
         .announce => {
             try persistUserPreferences(app, "statusline", patch, runtime_changed);
-            const message = try std.fmt.allocPrint(
-                app.alloc,
+            const message = try app.alloc.print(
                 "{s}: {s}",
                 .{ @tagName(item), if (enabled) "on" else "off" },
             );
@@ -4263,8 +3368,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
                 return error.InvalidSettingsCatalogValue;
             const capabilities = app.resolvedModelCapabilities(provider_runtime.model(app));
             if (!model_capabilities.reasoningEffortSupported(capabilities, effort)) {
-                const message = try std.fmt.allocPrint(
-                    app.alloc,
+                const message = try app.alloc.print(
                     "{s} is not available for {s}",
                     .{ effort.displayLabel(), provider_runtime.model(app) },
                 );
@@ -4361,172 +3465,6 @@ const CreditsCommandFakeApp = struct {
     ) !void {
         self.notice_topic = notice.topic;
         self.notice_tone = notice.tone;
-        try self.notice_body.appendSlice(self.alloc, notice.body);
-    }
-};
-
-const McpCommandFakeApp = struct {
-    const ReloadBehavior = enum {
-        published_empty,
-        published_healthy,
-        published_degraded,
-        retained,
-        begin_failed,
-    };
-
-    alloc: std.mem.Allocator,
-    shell: transcript_runtime.TranscriptRuntime = .{},
-    notice_body: std.ArrayList(u8) = .empty,
-    list_count: usize = 0,
-    menu_open_count: usize = 0,
-    reload_count: usize = 0,
-    notice_count: usize = 0,
-    last_topic: ?[]const u8 = null,
-    last_tone: ?types.NoticeTone = null,
-    reload_behavior: ReloadBehavior = .published_empty,
-    reload_pending: bool = false,
-    authentication_pending: bool = false,
-    authentication_reconnect_error: ?anyerror = null,
-    completion_origin: app_mcp_runtime.PresentationOrigin = .command,
-    menu_reload_completions: usize = 0,
-    menu_authentication_completions: usize = 0,
-
-    fn deinit(self: *McpCommandFakeApp) void {
-        self.shell.deinit(self.alloc);
-        self.notice_body.deinit(self.alloc);
-    }
-
-    fn openMcpMenu(self: *McpCommandFakeApp) !void {
-        self.menu_open_count += 1;
-    }
-
-    fn mcpCommandProvider(_: *const McpCommandFakeApp) mcp_command_provider.Provider {
-        return .{ .handle_fn = handleMcpCommand };
-    }
-
-    fn handleMcpCommand(
-        alloc: std.mem.Allocator,
-        rest: []const u8,
-        request: mcp_command_provider.Request,
-    ) !mcp_command_provider.Result {
-        if (std.mem.eql(u8, rest, "reload")) {
-            return .{
-                .display = .{
-                    .line = try alloc.dupe(u8, "Evaluating trusted profile MCP configuration."),
-                },
-                .reload = true,
-                .report_reload = true,
-            };
-        }
-        try std.testing.expectEqualStrings("auth fixture --open", rest);
-        const self: *McpCommandFakeApp = @ptrCast(@alignCast(request.list_ctx));
-        self.authentication_pending = true;
-        return .{
-            .display = .{
-                .line = try alloc.dupe(
-                    u8,
-                    "Waiting for MCP authentication for 'fixture'. You can continue using fx while the browser flow completes.",
-                ),
-            },
-        };
-    }
-
-    fn listMcpServersAndTools(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
-        self.list_count += 1;
-        return alloc.dupe(u8, "configured server and tool\n");
-    }
-
-    fn summarizeMcpServers(self: *McpCommandFakeApp, alloc: std.mem.Allocator) ![]u8 {
-        return self.listMcpServersAndTools(alloc);
-    }
-
-    fn beginMcpReload(self: *McpCommandFakeApp) !void {
-        self.reload_count += 1;
-        if (self.reload_behavior == .begin_failed) return error.TestReloadFailed;
-        self.reload_pending = true;
-    }
-
-    fn takeMcpReloadCompletion(self: *McpCommandFakeApp) !?app_mcp_runtime.ReloadCompletion {
-        if (!self.reload_pending) return null;
-        self.reload_pending = false;
-        return switch (self.reload_behavior) {
-            .published_empty => .{ .outcome = .{ .published = .{
-                .generation = null,
-                .health = .ready,
-                .configured_server_count = 0,
-                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
-            } } },
-            .published_healthy => .{ .outcome = .{ .published = .{
-                .generation = 42,
-                .health = .ready,
-                .configured_server_count = 1,
-                .unavailable_server_names = try self.alloc.alloc([]u8, 0),
-            } } },
-            .published_degraded => degraded: {
-                const names = try self.alloc.alloc([]u8, 2);
-                errdefer self.alloc.free(names);
-                names[0] = try self.alloc.dupe(u8, "alpha");
-                errdefer self.alloc.free(names[0]);
-                names[1] = try self.alloc.dupe(u8, "beta");
-                break :degraded .{ .outcome = .{ .published = .{
-                    .generation = 43,
-                    .health = .degraded,
-                    .configured_server_count = 3,
-                    .unavailable_server_names = names,
-                } } };
-            },
-            .retained => .{ .outcome = .{
-                .retained_required_failure = try self.alloc.dupe(
-                    u8,
-                    "Required MCP server 'fixture' failed to start.",
-                ),
-            } },
-            .begin_failed => unreachable,
-        };
-    }
-
-    fn mcpReloadCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
-        return self.completion_origin;
-    }
-
-    fn applyMcpMenuReloadCompletion(
-        self: *McpCommandFakeApp,
-        generation: u64,
-        _: *const app_mcp_runtime.ReloadCompletion,
-    ) !void {
-        try std.testing.expectEqual(@as(u64, 77), generation);
-        self.menu_reload_completions += 1;
-    }
-
-    fn takeMcpAuthenticationCompletion(
-        self: *McpCommandFakeApp,
-    ) !?app_mcp_runtime.AuthenticationCompletion {
-        if (!self.authentication_pending) return null;
-        self.authentication_pending = false;
-        return .{
-            .server_name = try self.alloc.dupe(u8, "fixture"),
-            .reconnect_error = self.authentication_reconnect_error,
-            .result = .{ .authenticated = .{} },
-        };
-    }
-
-    fn mcpAuthenticationCompletionOrigin(self: *const McpCommandFakeApp) app_mcp_runtime.PresentationOrigin {
-        return self.completion_origin;
-    }
-
-    fn applyMcpMenuAuthenticationCompletion(
-        self: *McpCommandFakeApp,
-        generation: u64,
-        _: *const app_mcp_runtime.AuthenticationCompletion,
-    ) !void {
-        try std.testing.expectEqual(@as(u64, 77), generation);
-        self.menu_authentication_completions += 1;
-    }
-
-    noinline fn writeDomainNotice(self: *McpCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.notice_count += 1;
-        self.last_topic = notice.topic;
-        self.last_tone = notice.tone;
         try self.notice_body.appendSlice(self.alloc, notice.body);
     }
 };
@@ -4667,7 +3605,7 @@ const SkillsInstallReplayApp = struct {
         self.shell.deinit(self.alloc);
     }
 
-    fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
+    pub fn requestSkillsRefresh(self: *SkillsInstallReplayApp) !u64 {
         self.reload_count += 1;
         self.skills.fresh_through_generation = self.reload_count;
         return self.reload_count;
@@ -4700,7 +3638,7 @@ const ChangeCommandFakeApp = struct {
 };
 
 fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
@@ -4815,7 +3753,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     const Snapshot = struct {
         state: []const u8,
         entries: usize,
-        last_attempt_ms: i64,
+        last_attempt_age_ms: ?i64,
         failure_category: ?[]const u8,
         failure_http_status: ?std.http.Status,
         failure_retryable: bool,
@@ -4834,7 +3772,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     var stub: StubApp = .{ .model_cache = .{ .snapshot = .{
         .state = "failed",
         .entries = 0,
-        .last_attempt_ms = 0,
+        .last_attempt_age_ms = null,
         .failure_category = "transport",
         .failure_http_status = .service_unavailable,
         .failure_retryable = true,
@@ -4848,7 +3786,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     stub.model_cache.snapshot = .{
         .state = "ready",
         .entries = 41,
-        .last_attempt_ms = 0,
+        .last_attempt_age_ms = null,
         .failure_category = null,
         .failure_http_status = null,
         .failure_retryable = false,
@@ -4858,6 +3796,12 @@ test "trace model catalog summary renders cache state and failure detail" {
     defer ready.deinit();
     try writeModelCatalogSummary(&ready.writer, &stub);
     try std.testing.expect(std.mem.find(u8, ready.written(), "state=ready entries=41\n") != null);
+
+    stub.model_cache.snapshot.last_attempt_age_ms = 12_500;
+    var aged: std.Io.Writer.Allocating = .init(alloc);
+    defer aged.deinit();
+    try writeModelCatalogSummary(&aged.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, aged.written(), "state=ready entries=41 last_attempt=12s ago\n") != null);
 }
 
 test "trace report file uses private randomized markdown path" {
@@ -4873,7 +3817,7 @@ test "trace report file uses private randomized markdown path" {
     defer file.close(std.testing.io);
     const stat = try file.stat(std.testing.io);
     try std.testing.expectEqual(@as(u64, 6), stat.size);
-    if (@import("builtin").os.tag != .windows) {
+    if (@import("builtin").target.os.tag != .windows) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
     }
 }
@@ -5174,19 +4118,6 @@ test "trace provider tool projection keeps the most recent bounded calls" {
     try std.testing.expectEqualStrings("newest", summaries[count - 1].call_id);
 }
 
-test "trace labels observed and billed search usage independently" {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-
-    try writeSearchUsageSummary(&out.writer, 3, 1);
-
-    try std.testing.expectEqualStrings(
-        "web_search_requests_total: 3 (observed)\n" ++
-            "billable_web_search_calls: 1 (billed)\n",
-        out.written(),
-    );
-}
-
 test "trace renders web search request count without content" {
     const alloc = std.testing.allocator;
     diagnostics.resetForTest();
@@ -5272,7 +4203,7 @@ test "trace network section reports session totals and window coverage" {
 
     const total = diagnostics.network_ring_capacity + 2;
     var expect_buf: [160]u8 = undefined;
-    const session_line = try std.fmt.bufPrint(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
+    const session_line = try std.mem.print(&expect_buf, "session: calls={d} ok={d} errors=1", .{ total, total - 1 });
     try std.testing.expect(std.mem.find(u8, text, session_line) != null);
     try std.testing.expect(std.mem.find(u8, text, "coverage: window holds only the last") != null);
     try std.testing.expect(std.mem.find(u8, text, "turns:\n") != null);
@@ -5321,7 +4252,7 @@ test "trace tool section reports session totals and window coverage" {
 
     const total = diagnostics.tool_call_ring_capacity + 2;
     var expect_buf: [200]u8 = undefined;
-    const session_line = try std.fmt.bufPrint(
+    const session_line = try std.mem.print(
         &expect_buf,
         "session: calls={d} succeeded={d} rejected=1 command_failed=0 tool_failed=0 runtime_failed=0",
         .{ total, total - 1 },
@@ -5344,13 +4275,13 @@ test "app_commands exposes active handler API surface" {
     const HandlerSurface = Handlers(SurfaceOnlyApp);
 
     const route_info = @typeInfo(@TypeOf(HandlerSurface.route)).@"fn";
-    try std.testing.expectEqual(@as(usize, 2), route_info.params.len);
-    try std.testing.expect(route_info.params[0].type.? == *SurfaceOnlyApp);
-    try std.testing.expect(route_info.params[1].type.? == []const u8);
+    try std.testing.expectEqual(@as(usize, 2), route_info.param_types.len);
+    try std.testing.expect(route_info.param_types[0].? == *SurfaceOnlyApp);
+    try std.testing.expect(route_info.param_types[1].? == []const u8);
 
     const handlers_info = @typeInfo(@TypeOf(HandlerSurface.commandHandlers)).@"fn";
-    try std.testing.expectEqual(@as(usize, 1), handlers_info.params.len);
-    try std.testing.expect(handlers_info.params[0].type.? == *SurfaceOnlyApp);
+    try std.testing.expectEqual(@as(usize, 1), handlers_info.param_types.len);
+    try std.testing.expect(handlers_info.param_types[0].? == *SurfaceOnlyApp);
     try std.testing.expect(handlers_info.return_type.? == command_router.CommandHandlers);
 }
 
@@ -5412,122 +4343,6 @@ test "copy command reports missing replies and host failures" {
     try std.testing.expectEqual(@as(usize, 2), app.copy_calls);
 }
 
-test "MCP list opens the menu without writing a transcript notice" {
-    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), " list ");
-
-    try std.testing.expectEqual(@as(usize, 1), app.menu_open_count);
-    try std.testing.expectEqual(@as(usize, 0), app.list_count);
-    try std.testing.expectEqual(@as(usize, 0), app.notice_count);
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "app_commands renders transactional status for explicit MCP reload" {
-    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "reload");
-
-    try std.testing.expectEqual(@as(usize, 0), app.list_count);
-    try std.testing.expectEqual(@as(usize, 1), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
-    try std.testing.expectEqualStrings("mcp", app.last_topic.?);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expectEqualStrings(
-        "MCP reconnection started. Your existing MCP servers will stay active while the new configuration is checked.",
-        app.notice_body.items,
-    );
-    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
-    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        app.notice_body.items,
-        "MCP configuration reloaded. No servers are configured.",
-    ));
-}
-
-test "menu-origin MCP completions never publish transcript notices" {
-    var reload_app = McpCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .reload_pending = true,
-        .completion_origin = .{ .menu = 77 },
-    };
-    defer reload_app.deinit();
-    try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&reload_app);
-    try std.testing.expectEqual(@as(usize, 1), reload_app.menu_reload_completions);
-    try std.testing.expectEqual(@as(usize, 0), reload_app.notice_count);
-
-    var authentication_app = McpCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .authentication_pending = true,
-        .completion_origin = .{ .menu = 77 },
-    };
-    defer authentication_app.deinit();
-    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&authentication_app);
-    try std.testing.expectEqual(@as(usize, 1), authentication_app.menu_authentication_completions);
-    try std.testing.expectEqual(@as(usize, 0), authentication_app.notice_count);
-}
-
-test "app_commands explains healthy and degraded MCP reloads without internal state" {
-    const cases = [_]struct {
-        behavior: McpCommandFakeApp.ReloadBehavior,
-        tone: types.NoticeTone,
-        expected: []const u8,
-    }{
-        .{
-            .behavior = .published_healthy,
-            .tone = .neutral,
-            .expected = "MCP configuration reloaded successfully.",
-        },
-        .{
-            .behavior = .published_degraded,
-            .tone = .warning,
-            .expected = "MCP configuration reloaded, but 2 servers are unavailable: 'alpha', 'beta'. Run /mcp list for details.",
-        },
-    };
-
-    for (cases) |case| {
-        var app = McpCommandFakeApp{
-            .alloc = std.testing.allocator,
-            .reload_behavior = case.behavior,
-        };
-        defer app.deinit();
-
-        try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "reload");
-        try Handlers(McpCommandFakeApp).collectMcpReloadFacts(&app);
-
-        try std.testing.expectEqual(case.tone, app.last_tone.?);
-        try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, case.expected));
-        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "runtime 42") == null);
-        try std.testing.expect(std.mem.find(u8, app.notice_body.items, "degraded") == null);
-    }
-}
-
-test "MCP authentication completion does not reload unrelated servers" {
-    var app = McpCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
-    try std.testing.expectEqual(@as(usize, 1), app.notice_count);
-    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.reload_count);
-    try std.testing.expectEqual(@as(usize, 2), app.notice_count);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    try std.testing.expect(std.mem.endsWith(u8, app.notice_body.items, "Authenticated MCP server 'fixture'."));
-}
-
-test "MCP authentication reports saved credentials when targeted reconnection fails" {
-    var app = McpCommandFakeApp{ .alloc = std.testing.allocator, .authentication_reconnect_error = error.McpConnectionTimedOut };
-    defer app.deinit();
-    try Handlers(McpCommandFakeApp).commandHandleMcp(@ptrCast(&app), "auth fixture --open");
-    try Handlers(McpCommandFakeApp).collectMcpAuthenticationFacts(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.reload_count);
-    try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
-    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "Authenticated MCP server 'fixture'.") != null);
-    try std.testing.expect(std.mem.find(u8, app.notice_body.items, "McpConnectionTimedOut") != null);
-}
-
 test "skills install groups command notice fragments for entry replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5545,7 +4360,7 @@ test "skills install groups command notice fragments for entry replay" {
     var app = SkillsInstallReplayApp{ .alloc = alloc, .skills = .{ .dir = dest_dir } };
     defer app.deinit();
 
-    const args = try std.fmt.allocPrint(alloc, "install {s}", .{pack_dir});
+    const args = try alloc.print("install {s}", .{pack_dir});
     defer alloc.free(args);
     try Handlers(SkillsInstallReplayApp).commandHandleSkills(@ptrCast(&app), args);
 
@@ -5556,7 +4371,7 @@ test "skills install groups command notice fragments for entry replay" {
     try std.testing.expect(app.shell.entries.items[0] == .semantic_notice);
     try std.testing.expect(app.shell.entries.items[1] == .semantic_notice);
     try std.testing.expectEqualStrings("skills", app.shell.entries.items[0].semantic_notice.topic);
-    const installing_body = try std.fmt.allocPrint(alloc, "Installing from {s}...", .{pack_dir});
+    const installing_body = try alloc.print("Installing from {s}...", .{pack_dir});
     defer alloc.free(installing_body);
     try std.testing.expectEqualStrings(installing_body, app.shell.entries.items[0].semantic_notice.body);
     try std.testing.expectEqualStrings(

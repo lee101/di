@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
+import { sessionDir } from "./saved-sessions";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -312,6 +313,7 @@ async function runTerminalToolScenario(args: {
   name: string;
   input: object;
   unsetHome?: boolean;
+  home?: string;
   expectedResultRequest: string[];
 }) {
   const gateway = startFakeGateway([
@@ -326,7 +328,7 @@ async function runTerminalToolScenario(args: {
         env: gatewayEnv(
           args.root,
           gateway,
-          args.unsetHome ? undefined : args.root.home,
+          args.unsetHome ? undefined : (args.home ?? args.root.home),
         ),
         timeoutMs: TIMEOUT,
       },
@@ -497,11 +499,28 @@ touch backend-searched
     }
   }, TIMEOUT);
 
-  for (const supportsImages of [true, false]) {
+  const readImageCases = [
+    {
+      name: "read_file attaches a workspace image inline for a vision model",
+      modelTags: ["tool-use", "vision", "file-input"],
+      inline: true,
+    },
+    {
+      // The catalog lists the default model, spacexai/grok-4.7, with vision
+      // and without file-input, which covers documents rather than images.
+      name: "read_file attaches a workspace image inline for a vision model without file input",
+      modelTags: ["reasoning", "tool-use", "implicit-caching", "vision", "structured-output"],
+      inline: true,
+    },
+    {
+      name: "read_file image is withheld with guidance for a text-only model",
+      modelTags: ["tool-use"],
+      inline: false,
+    },
+  ];
+  for (const imageCase of readImageCases) {
     test(
-      supportsImages
-        ? "read_file attaches a workspace image inline for a vision model"
-        : "read_file image is withheld with guidance for a text-only model",
+      imageCase.name,
       async () => {
         const root = createIsolatedRoot();
         const pngBase64 =
@@ -511,11 +530,7 @@ touch backend-searched
             toolCall("read_image_1", "read_file", { path: "pixel.png" }),
             finalText("image inspected"),
           ],
-          {
-            modelTags: supportsImages
-              ? ["tool-use", "vision", "file-input"]
-              : ["tool-use"],
-          },
+          { modelTags: imageCase.modelTags },
         );
         try {
           writeFileSync(
@@ -546,7 +561,7 @@ touch backend-searched
             ) as Record<string, unknown> | undefined;
           expect(part).toBeDefined();
           const output = part!.output as Record<string, unknown>;
-          if (supportsImages) {
+          if (imageCase.inline) {
             expect(output.type).toBe("content");
             expect(contentText(output)).toContain("image attached");
             expect(contentText(output)).not.toContain("binary or non-utf8");
@@ -850,8 +865,12 @@ touch backend-searched
       } finally {
         firstGateway.stop();
       }
-      const artifact = join(root.home, ".fx", "sessions", sessionId, "tool-results", handle);
-      expect(existsSync(artifact)).toBe(true);
+      // The stored image is one of the session's blobs; damage it on disk.
+      const blobs = join(sessionDir(root.home, sessionId), "blobs");
+      const stored = readdirSync(blobs).filter((name) => readFileSync(join(blobs, name), "utf8").includes(pngBase64));
+      expect(stored).toHaveLength(1);
+      const artifact = join(blobs, stored[0]!);
+      chmodSync(artifact, 0o600);
       writeFileSync(artifact, "this is not valid stored image json");
 
       const secondGateway = startFakeGateway(
@@ -911,14 +930,6 @@ touch backend-searched
       } finally {
         firstGateway.stop();
       }
-      // The edit snapshots are large, so they live behind a handle and stay
-      // out of the log that resume reads.
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
-      expect(events).toMatch(/"content_handle":"diff-[0-9a-f]{16}-[0-9a-f]{16}\.json"/);
-      expect(events).not.toContain("PARITY_LINE_001_");
 
       const secondGateway = startFakeGateway([finalText("parity follow-up done")]);
       try {
@@ -1740,6 +1751,38 @@ touch backend-searched
   );
 
   test(
+    "grep_files searches a file larger than 200 KiB by path and by include",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        // 3,000 lines of 100 bytes, then the match on line 3,001.
+        writeFileSync(
+          join(root.workspace, "src", "big.txt"),
+          `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
+        );
+        const cases = [
+          { id: "grep_large_path_1", input: { pattern: "LARGE_FILE_NEEDLE", path: "src/big.txt" } },
+          { id: "grep_large_include_1", input: { pattern: "LARGE_FILE_NEEDLE", include: "src/*.txt" } },
+        ];
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: "grep_files",
+            input: scenario.input,
+            expectedResultRequest: [],
+            expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "glob pattern cannot escape the separately approved search root",
     async () => {
       const root = createIsolatedRoot();
@@ -1863,6 +1906,31 @@ touch backend-searched
         });
 
         expect(existsSync(literalWorkspacePath)).toBe(false);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relative HOME is treated like a missing HOME instead of aborting",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        await runTerminalToolScenario({
+          root,
+          id: "read_relative_home_1",
+          name: "read_file",
+          input: { path: "~/fx-path-fixture.txt" },
+          home: "relative/home",
+          expectedResultRequest: ["HomeNotSet"],
+        });
+
+        // Nothing resolves against the workspace: no tilde folder, and no
+        // profile written under the relative path.
+        expect(existsSync(join(root.workspace, "~"))).toBe(false);
+        expect(existsSync(join(root.workspace, "relative"))).toBe(false);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

@@ -43,7 +43,6 @@ pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
-    durable: bool,
 ) !void {
     try writer.writeAll("{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":");
     const recovery = status orelse {
@@ -86,7 +85,7 @@ pub fn writeModelRecoveryInfoUpdate(
     if (recovery.delay_seconds != 0) {
         try writer.print(",\"delaySeconds\":{d}", .{recovery.delay_seconds});
     }
-    try writer.print(",\"durable\":{s},\"message\":", .{if (durable) "true" else "false"});
+    try writer.writeAll(",\"message\":");
     var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try writeJsonStr(recovery.label(&label_buf), writer);
     try writer.writeAll("}}}}");
@@ -305,7 +304,7 @@ pub const AgentCapabilities = struct {
     system_prompt: bool = false,
     /// Serves `type: "acp"` MCP servers over this connection.
     mcp_over_acp: bool = false,
-    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which MCP-v2 doesn't.
+    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which fx's MCP engine doesn't.
     mcp_sse: bool = true,
 };
 
@@ -353,12 +352,14 @@ pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delive
     try w.writeAll("}}}");
 }
 
-/// Replays delivered steering where the agent inserted it into the turn.
+/// Replays delivered steering where the agent inserted it into the turn. A
+/// libfx steer carries the input id its host gave it.
 pub fn writeSteeringUserMessageChunk(
     w: *std.Io.Writer,
     message_id: []const u8,
     text: []const u8,
     request_id: ?jsonrpc.RequestId,
+    input_id: ?[]const u8,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
     try writeJsonStr(message_id, w);
@@ -366,7 +367,27 @@ pub fn writeSteeringUserMessageChunk(
     try writeJsonStr(text, w);
     try w.writeAll("},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":");
     try jsonrpc.Writer.writeId(w, request_id);
+    if (input_id) |id| {
+        try w.writeAll(",\"inputId\":");
+        try writeJsonStr(id, w);
+    }
     try w.writeAll("}}}}");
+}
+
+test "steering replay carries a libfx input id only when it has one" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":4}}}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1");
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":null,\"inputId\":\"s1\"}}}}",
+        out.written(),
+    );
 }
 
 pub fn writePromptResponseWithUsage(
@@ -409,12 +430,8 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll("}");
 }
 
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
-    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
-    if (complete_cost) |amount| {
-        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
-    }
-    try w.writeAll("}");
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64) !void {
+    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}}}", .{ used, size });
 }
 
 test "writeAgentMessageChunk produces valid json" {
@@ -602,11 +619,11 @@ test "writeUserMessageChunk produces valid json" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "User says hello") != null);
 }
 
-test "writeUsageUpdate omits unproven cost" {
+test "writeUsageUpdate reports context used and size" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000, null);
+    try writeUsageUpdate(&out.writer, 8, 128_000);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
         out.writer.buffered(),
@@ -635,13 +652,13 @@ test "model recovery info update is structured and clearable" {
         .required_action = .continue_later,
         .delay_seconds = 4,
         .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
-    }, true);
+    });
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"delaySeconds\":4") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
+    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\"") == null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
 
     out.writer.end = 0;
@@ -649,12 +666,12 @@ test "model recovery info update is structured and clearable" {
         .kind = .auto_recovered,
         .succeeded_attempt = 5,
         .attempt_limit = 10,
-    }, true);
+    });
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"recovered\"") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":5") != null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") == null);
 
     out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, null, false);
+    try writeModelRecoveryInfoUpdate(&out.writer, null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"modelResponseRecovery\":null") != null);
 }

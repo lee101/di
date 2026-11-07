@@ -1,8 +1,11 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const types = @import("../../shared/types.zig");
 const checkpoint_codec = @import("checkpoint.zig");
+const session_codec = @import("../../session/session_codec.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -40,6 +43,17 @@ pub const Agent = struct {
     /// agent that saves them. Caller owns the bytes.
     pub fn checkpoint(self: *const Agent, alloc: Allocator, meta: checkpoint_codec.Meta) checkpoint_codec.Error![]u8 {
         return checkpoint_codec.encode(alloc, self.history.items, self.turn_usage, meta);
+    }
+
+    /// Like `checkpoint`, but names the images a libfx host's store holds
+    /// instead of holding their bytes.
+    pub fn checkpointNamingImages(
+        self: *const Agent,
+        alloc: Allocator,
+        meta: checkpoint_codec.Meta,
+        stored: *const session_codec.StoredImages,
+    ) checkpoint_codec.Error![]u8 {
+        return checkpoint_codec.encodeNamingImages(alloc, self.history.items, self.turn_usage, meta, stored);
     }
 
     /// Restores `bytes` into this fresh agent. Returns what the checkpoint
@@ -225,7 +239,7 @@ test "Agent request token calibration survives startTurn and dies with cleared h
     try std.testing.expect(agent.request_token_calibration != null);
 
     // An unmatchable model id clears rather than stores.
-    agent.storeRequestTokenCalibration("x" ** (max_request_calibration_model_bytes + 1), cost);
+    agent.storeRequestTokenCalibration(text_utils.repeat("x", max_request_calibration_model_bytes + 1), cost);
     try std.testing.expectEqual(@as(?RequestTokenCalibrationState, null), agent.request_token_calibration);
 
     agent.storeRequestTokenCalibration("fixture/model", cost);
@@ -255,7 +269,7 @@ test "Agent request size limit only lowers, follows the model, and dies with cle
     try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
     try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("fixture/model"));
 
-    agent.lowerRequestByteLimit("x" ** (max_request_calibration_model_bytes + 1), 10);
+    agent.lowerRequestByteLimit(text_utils.repeat("x", max_request_calibration_model_bytes + 1), 10);
     try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
 
     agent.clearHistory(alloc);
@@ -290,7 +304,7 @@ test "Agent accumulates per-turn usage with saturation" {
 }
 
 test "Agent history restore is transactional" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var agent: Agent = .{};
     defer agent.deinit(alloc);
 

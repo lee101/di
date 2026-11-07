@@ -1,10 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const types = @import("../../../shared/types.zig");
 const debug_trace = @import("../../../shared/debug_trace.zig");
 const io_mod = @import("../../../shared/io.zig");
 const tool_result_errors = @import("../../../tooling/tool_result_errors.zig");
 const lifecycle_hooks = @import("../../../hooks/hooks.zig");
 const session_runtime = @import("../../../session/session.zig");
+const worker_runtime = @import("../../worker_runtime.zig");
 
 const test_support = @import("support.zig");
 const runtime_finalization = @import("../finalization.zig");
@@ -648,7 +650,7 @@ test "processQueuedPrompt emits exactly one structured prompt finish per termina
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "finish-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "finish-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -712,7 +714,7 @@ test "processQueuedPrompt step limit writes active debug trace" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1334,6 +1336,115 @@ test "common Stop handler errors fail open" {
     }
 }
 
+/// A prompt the worker owns, allocated the way its queue frees it.
+fn ownedWorkerPrompt(alloc: std.mem.Allocator, text: []const u8) !worker_runtime.QueuedPrompt {
+    return .{
+        .prompt = try alloc.dupe(u8, text),
+        .images = &.{},
+        .model = try alloc.dupe(u8, "provider/model"),
+        .api_key = try alloc.dupe(u8, "key"),
+        .permission_mode = .auto,
+        .history = try alloc.alloc(types.HistoryTurn, 0),
+        .grants = try alloc.alloc(types.PermissionGrant, 0),
+    };
+}
+
+/// A Stop hook during whose first run the user submits a steer, admitted the
+/// way the terminal admits a prompt typed while a turn runs.
+const SteerDuringStop = struct {
+    alloc: std.mem.Allocator,
+    worker: *worker_runtime.WorkerRuntime,
+    calls: usize = 0,
+
+    fn run(
+        raw: *anyopaque,
+        _: lifecycle_hooks.StopInput,
+    ) lifecycle_hooks.HandlerError!lifecycle_hooks.StopAction {
+        const self: *SteerDuringStop = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.calls == 1) {
+            const steer = ownedWorkerPrompt(self.alloc, "also check the docs") catch return error.Failed;
+            self.worker.admitInteractivePrompt(self.alloc, steer) catch {
+                worker_runtime.freeQueuedPrompt(self.alloc, steer);
+                return error.Failed;
+            };
+        }
+        return .allow;
+    }
+};
+
+test "common Stop steer submitted during the hook joins the turn for every final reply" {
+    const alloc = std.testing.allocator;
+    const provider_calls = [_]ToolCall{.{
+        .id = "call_search",
+        .name = "perplexity_search",
+        .arguments_json = "{}",
+        .provider_result = "search result",
+        .provenance = .provider_executed,
+    }};
+    const Case = struct { name: []const u8, first: FakeCompletion };
+    const cases = [_]Case{
+        .{ .name = "plain reply", .first = .{ .content = "First answer" } },
+        .{ .name = "provider tool reply", .first = .{
+            .content = "First answer",
+            .tool_calls = &provider_calls,
+            .finish_reason = .stop,
+        } },
+        .{ .name = "provider tool reply with a streamed start", .first = .{
+            .content = "First answer",
+            .tool_calls = &provider_calls,
+            .streamed_tool_starts = &provider_calls,
+            .finish_reason = .stop,
+        } },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case.name});
+        // The turn starts the way the worker loop starts one, and the agent
+        // takes its steering, cancel flag, and events from that worker.
+        var worker = worker_runtime.WorkerRuntime{};
+        defer worker.deinit(alloc);
+        try worker.admitInteractivePrompt(alloc, try ownedWorkerPrompt(alloc, "user prompt"));
+        const work = (try worker.tryTakeNextWork(alloc)) orelse return error.TestExpectedQueuedWork;
+        defer worker_runtime.freeWorkItem(alloc, work);
+
+        var gateway = FakeGateway.init(alloc, &.{ case.first, .{ .content = "Updated answer" } });
+        defer gateway.deinit();
+        var deps = FakeAgentRuntimeDeps.init(alloc);
+        defer deps.deinit();
+        deps.steering_worker = &worker;
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        config.cancel_flag = &worker.worker_cancel_requested;
+        var job = fixture.job();
+        job.turn_id = work.prompt.turn_id;
+        var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
+        defer lifecycle_runtime.deinit();
+        var handler = SteerDuringStop{ .alloc = alloc, .worker = &worker };
+        try lifecycle_runtime.registerStop(.{ .name = "steer-during-stop", .ctx = &handler, .run = SteerDuringStop.run });
+
+        try runFakePromptWithLifecycle(
+            &gateway,
+            &deps,
+            config,
+            job,
+            testLifecycleContext(lifecycle_runtime.freeze(), alloc, fixture.workspace_root),
+        );
+        worker.finishProcessing();
+
+        // The steer reaches the turn's next request, and the turn ends once,
+        // with the updated reply.
+        try std.testing.expectEqual(@as(usize, 2), handler.calls);
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try expectBodyContainsInOrder(&gateway, 1, &.{ "First answer", "user_steering", "also check the docs" });
+        try std.testing.expectEqual(@as(usize, 0), deps.interrupted_history_count);
+        try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+        try std.testing.expect(deps.history_turns.items[0] == .assistant);
+        try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items[0].assistant.execution.steering.len);
+        // Nothing is left over to run as a later turn.
+        try std.testing.expectEqual(@as(usize, 0), worker.queuedPromptCount());
+    }
+}
+
 test "common Stop does not run for silent-tool auto-continuation" {
     const alloc = std.testing.allocator;
     const first_calls = [_]ToolCall{
@@ -1559,7 +1670,7 @@ test "common Stop interruption keeps only completed calls from a partially attem
     defer tmp.cleanup();
     const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(result_dir);
-    const trace_path = try std.fs.path.join(alloc, &.{ result_dir, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ result_dir, "trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();
@@ -1624,20 +1735,25 @@ test "common Stop interruption keeps only completed calls from a partially attem
         turn.execution.tool_steps[1].tool_results[0].output,
     );
 
-    const session_log = @import("../../../session/session_log.zig");
-    var dir = try io_mod.openOrCreateVerifiedPrivateDirFromDir(tmp.dir, "session");
-    defer dir.close();
-    {
-        const file = try dir.dir.createFile(std.testing.io, "events.jsonl", .{
-            .read = true,
-            .permissions = .fromMode(0o600),
-        });
-        var writer = try session_log.ConversationWriter.init(alloc, file);
-        defer writer.deinit();
-        try writer.appendHistoryTurn(alloc, 1, deps.history_turns.items[0]);
-    }
-    const history = try session_log.loadConversationHistoryRange(alloc, &dir, 0, 1);
-    defer types.freeHistoryTurnSlice(alloc, history);
+    // The interrupted turn is saved and read back the way a resume reads it.
+    const session_adapter = @import("../../../session/session_adapter.zig");
+    var store = try session_adapter.Store.open(alloc, result_dir);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const saved = try session_adapter.Session.create(alloc, &store, fixture.workspace_root, .ask, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    });
+    try saved.commitTurn(deps.history_turns.items[0], types.ConversationLanguage.default());
+    const id = try alloc.dupe(u8, saved.id());
+    defer alloc.free(id);
+    saved.close();
+    const resumed = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = id }, fixture.workspace_root, .ask);
+    defer resumed.close();
+    var restored = try resumed.restore(alloc);
+    defer restored.deinit(alloc);
+    const history = restored.history;
     try std.testing.expectEqual(@as(usize, 1), history.len);
     var follow_gateway = FakeGateway.init(alloc, &.{.{ .content = "resumed" }});
     defer follow_gateway.deinit();
@@ -1996,7 +2112,7 @@ test "common Stop finish event failure wins and is not retried" {
 }
 
 test "common Stop terminal payload construction failure leaves guard open for one fallback" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"README.md\"}"),
     };

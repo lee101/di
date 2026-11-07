@@ -250,7 +250,7 @@ pub fn catalogAccessForCredentialAndAccount(
 }
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
-pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
 /// di login session is refreshed first.
@@ -1146,18 +1146,6 @@ test "credential clone owns every secret and authority field independently" {
     try std.testing.expectEqual(original.refresh_after_ms, cloned.refresh_after_ms);
 }
 
-var stable_credential_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCredentialTestEnviron() !*const std.process.Environ.Map {
-    if (stable_credential_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_credential_test_environ = map;
-    return map;
-}
-
 const CredentialTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
@@ -1169,8 +1157,6 @@ const CredentialTestEnv = struct {
     /// migrates into the developer's real `FX_OAUTH_SESSION_V1` item and
     /// destroys their fx login.
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
-        _ = try stableCredentialTestEnviron();
-
         const self = try alloc.create(CredentialTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -1186,7 +1172,7 @@ const CredentialTestEnv = struct {
     }
 
     fn deinit(self: *CredentialTestEnv) void {
-        if (stable_credential_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -1411,15 +1397,15 @@ test "credential source presence reads metadata without parsing session secrets"
         .{ .source = .grok_subscription, .file_name = profile_paths.grok_auth_file_name },
     };
     for (cases) |case| {
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const relative_path = try std.fmt.bufPrint(
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const relative_path = try std.mem.print(
             &path_buffer,
             ".fx/{s}",
             .{case.file_name},
         );
         var file = try tmp.dir.createFile(io_mod.getIo(), relative_path, .{
             .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         });
         defer file.close(io_mod.getIo());
         try file.writeStreamingAll(io_mod.getIo(), "not valid session JSON");
@@ -1430,7 +1416,7 @@ test "credential source presence reads metadata without parsing session secrets"
         );
         try file.setPermissions(
             io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o644),
+            io_mod.permissionsFromMode(0o644),
         );
         try std.testing.expectEqual(
             host.SecretStorePresence.unavailable,
@@ -1516,11 +1502,11 @@ const ExpiredFxLoginFixture = struct {
         errdefer alloc.free(home);
 
         try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.fs.path.join(alloc, &.{ home, ".fx", "auth.json" });
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
         defer alloc.free(auth_path);
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
             .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         });
         defer file.close(io_mod.getIo());
         try file.writeStreamingAll(
@@ -1570,7 +1556,7 @@ const FxLoginRefreshProbe = struct {
                     defer file.close(io_mod.getIo());
                     try file.setPermissions(
                         io_mod.getIo(),
-                        std.Io.File.Permissions.fromMode(0o400),
+                        io_mod.permissionsFromMode(0o400),
                     );
                 }
                 break :blk self.token_body;
@@ -1658,7 +1644,7 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
     defer alloc.free(auth_path);
     var refresh = FxLoginRefreshProbe{
         .token_disposition = .accepted,

@@ -16,6 +16,8 @@ import {
   type FxEngineTurn,
   type FxEngineTurnResult,
   type FxHostTool,
+  type FxHooks,
+  type FxHookEvent,
   type FxToolResult,
   type JournalRecord,
   type Persistence,
@@ -27,6 +29,40 @@ function assertType<T extends true>(): void {}
 
 declare const process: { env: Record<string, string | undefined> };
 declare const apiKey: string;
+
+const hooks: FxHooks = {
+  captureContent: true,
+  onEvent(event: FxHookEvent) {
+    if (event.type === "model.start") {
+      assertType<Equal<typeof event.data.modelCallId, number>>();
+      assertType<Equal<typeof event.data.messages, import("libfx").FxHookMessage[] | undefined>>();
+    }
+    if (event.type === "tool.result") {
+      assertType<Equal<typeof event.data.call.callId, string>>();
+      // @ts-expect-error accepted tool results have no transport response headers
+      void event.data.headers;
+    }
+  },
+  async onError(_error: unknown) {},
+};
+void createFxEngine({ apiKey, hooks });
+void createFxAgent({ apiKey, hooks });
+const interactiveTool: FxHostTool = {
+  name: "confirm",
+  description: "Ask the host",
+  inputSchema: { type: "object" },
+  async execute(_input, context) {
+    if (!context.observation) return "no observer";
+    const response = await context.observation.wait<number>({ kind: "approval", prompt: "Continue?" }, async () => ({ outcome: "accepted", value: 42 }));
+    assertType<Equal<typeof response.value, number | undefined>>();
+    const childHooks: import("libfx/browser").FxHooks = context.observation.childHooks();
+    const wasmObserver: import("libfx/wasm").FxToolObservation = context.observation;
+    void childHooks;
+    void wasmObserver;
+    return response.outcome;
+  },
+};
+void interactiveTool;
 declare const model: string;
 declare const file: File;
 declare const pngBytes: Uint8Array;
@@ -205,7 +241,7 @@ export async function models(): Promise<void> {
   await createFxEngine({ apiKey, backend: "wasm", wasm: fetch("https://cdn.example.com/fx-core.wasm") });
   await createFxEngine({ apiKey, backend: "native", nativeAddon: "./libfx.darwin-arm64.node" });
 
-  assertType<Equal<typeof libfxApiVersion, 2>>();
+  assertType<Equal<typeof libfxApiVersion, 3>>();
   assertType<Equal<typeof fxSdkApiVersion, 2>>();
   assertType<Equal<ReturnType<typeof supportsJspi>, boolean>>();
 }
@@ -242,6 +278,8 @@ export async function codexEngine(): Promise<FxEngine> {
   });
   // @ts-expect-error a Codex engine needs credentials()
   await createFxEngine({ provider: "codex", model });
+  // @ts-expect-error a Codex engine needs a model: fx's default is an AI Gateway id
+  await createFxEngine({ provider: "codex", credentials: ({ provider, sessionId }) => tokenStore.load(provider, sessionId) });
   // @ts-expect-error credentials() needs provider "codex"
   await createFxEngine({ apiKey, model, credentials: () => tokenStore.load("codex") });
   // @ts-expect-error onCredentials needs provider "codex"
@@ -292,5 +330,7 @@ export async function grokEngine(): Promise<FxEngine> {
   });
   // @ts-expect-error a Grok request names provider "grok"
   await createFxEngine({ provider: "grok", model, credentials: ({ provider }) => tokenStore.load(provider) });
+  // @ts-expect-error a Grok engine needs a model: fx's default is an AI Gateway id
+  await createFxEngine({ provider: "grok", credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId) });
   return engine;
 }

@@ -38,8 +38,9 @@ pub const Fault = struct {
     /// Descriptors that wrote since they were opened.
     writers: std.ArrayList(std.posix.fd_t) = .empty,
     /// Mutating storage calls made so far (writes, syncs, creates, renames,
-    /// links, cuts, deletes).
-    steps: u64 = 0,
+    /// links, cuts, deletes). Atomic: threads appending to one session can
+    /// write and sync at once, and each call gets its own step.
+    steps: std.atomic.Value(u64) = .init(0),
     /// A real `kill -9`: the process sends itself SIGKILL just before this
     /// mutating call (counting from 1). The driver's crash matrix sets it.
     kill_at_step: ?u64 = null,
@@ -146,11 +147,11 @@ pub const Fault = struct {
     /// Counts one mutating call. Dies for real at `kill_at_step`; at
     /// `power_at_step` loses power and returns true: the call must fail.
     pub fn mutate(f: *Fault) bool {
-        f.steps += 1;
-        if (f.kill_at_step) |n| if (f.steps == n) {
+        const step = f.steps.fetchAdd(1, .monotonic) + 1;
+        if (f.kill_at_step) |n| if (step == n) {
             std.posix.kill(std.c.getpid(), .KILL) catch {};
         };
-        if (f.power_at_step) |n| if (f.steps == n) {
+        if (f.power_at_step) |n| if (step == n) {
             _ = f.powerLoss();
             return true;
         };
@@ -288,7 +289,7 @@ fn cutUnsynced(io: Io, random: std.Random, tracked: Fault.Tracked) bool {
     tracked.dup.setLength(io, keep) catch return false;
     if (keep < len and random.uintLessThan(u8, 4) == 0) {
         const zeros_len = random.intRangeAtMost(u64, 1, @min(len - keep, 64));
-        const zeros = [_]u8{0} ** 64;
+        const zeros: [64]u8 = @splat(0);
         tracked.dup.writePositionalAll(io, zeros[0..@intCast(zeros_len)], keep) catch {};
     }
     return true;
@@ -324,21 +325,21 @@ fn freeOp(gpa: std.mem.Allocator, op: Fault.NameOp) void {
 }
 
 fn realPath(gpa: std.mem.Allocator, io: Io, dir: storage.Dir) storage.Error![]u8 {
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = dir.handle.realPath(io, &buffer) catch return error.Io;
     return gpa.dupe(u8, buffer[0..n]) catch error.Io;
 }
 
 fn join(gpa: std.mem.Allocator, parent: []const u8, name: []const u8) storage.Error![]u8 {
-    return std.fs.path.join(gpa, &.{ parent, name }) catch error.Io;
+    return std.Io.Dir.path.join(gpa, &.{ parent, name }) catch error.Io;
 }
 
 /// Silent damage: flips one bit of a file without the fault layer noticing.
 /// A read-only blob (D49) is made writable for the flip and then restored.
 pub fn flipBit(io: Io, dir: storage.Dir, name: []const u8, offset: u64, bit: u3) !void {
     const before = try dir.handle.statFile(io, name, .{ .follow_symlinks = false });
-    const read_only = before.permissions.toMode() & 0o200 == 0;
-    if (read_only) try dir.handle.setFilePermissions(io, name, .fromMode(storage.file_mode), .{ .follow_symlinks = false });
+    const read_only = storage.permsReadOnly(before.permissions);
+    if (read_only) try dir.handle.setFilePermissions(io, name, storage.permsFromMode(storage.file_mode), .{ .follow_symlinks = false });
     defer if (read_only) dir.handle.setFilePermissions(io, name, before.permissions, .{ .follow_symlinks = false }) catch {};
     var file = try dir.handle.openFile(io, name, .{ .mode = .read_write, .follow_symlinks = false });
     defer file.close(io);
@@ -378,7 +379,7 @@ test "a power loss never loses a synced byte" {
                 synced = written.items.len;
             } else {
                 var line: [24]u8 = undefined;
-                const text = try std.fmt.bufPrint(&line, "line {d}\n", .{written.items.len});
+                const text = try std.mem.print(&line, "line {d}\n", .{written.items.len});
                 try s.writeAt(file, text, written.items.len);
                 try written.appendSlice(testing.allocator, text);
             }

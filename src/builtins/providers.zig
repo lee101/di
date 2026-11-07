@@ -44,7 +44,6 @@ pub const native = provider_set.Set{
         .agent_stream = openpaths.agent_stream_provider,
         .cli_model_catalog = openpaths.cli_model_catalog_provider,
         .model_catalog = openpaths.model_catalog_provider,
-        .deferred_usage = openpaths.generation_usage_provider,
     },
 };
 

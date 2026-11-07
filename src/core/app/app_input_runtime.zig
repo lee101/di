@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const question_prompt = @import("../agent/question_prompt.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
@@ -7,7 +8,6 @@ const app_session_runtime = @import("app_session_runtime.zig");
 const app_workspace_runtime = @import("app_workspace_runtime.zig");
 const app_commands = @import("app_commands.zig");
 const project_config = @import("../mcp/project_config.zig");
-const mcp_menu_state = @import("../mcp/menu_state.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_render_runtime = @import("app_render_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -38,8 +38,8 @@ const permissions = @import("../permissions/permissions.zig");
 const session_commands = @import("../session/session_commands.zig");
 const session_catalog = @import("../session/session_catalog.zig");
 const session_runtime = @import("../session/session.zig");
-const session_store = @import("../session/session_store.zig");
-const usage_report = @import("../session/usage_report.zig");
+const session_adapter = @import("../session/session_adapter.zig");
+const usage = @import("../../usage/usage.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const file_index = @import("../workspace/file_index.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
@@ -54,8 +54,8 @@ const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
-const mcp_menu_presentation = @import("../../ui/footer/mcp_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const info_panel_presentation = @import("../../ui/footer/info_panel_presentation.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -112,24 +112,6 @@ const ExplicitModelSelectionParse = union(enum) {
     invalid,
     selection: ExplicitModelSelection,
 };
-
-const ProjectMcpPromptInputState = struct {
-    active: bool,
-    question_active: bool,
-    approval_active: bool,
-    subagent_active: bool,
-    menu_active: bool,
-    authentication_active: bool,
-};
-
-fn projectMcpPromptMayOwnInput(state: ProjectMcpPromptInputState) bool {
-    return state.active and
-        !state.question_active and
-        !state.approval_active and
-        !state.subagent_active and
-        !state.menu_active and
-        !state.authentication_active;
-}
 
 fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
@@ -640,11 +622,6 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var replay_byte = ingress.replay_byte_after_routing;
-            if (replay_byte) |byte| {
-                if (byte != 0x1b and try routeProjectMcpPromptByte(app, byte)) {
-                    replay_byte = null;
-                }
-            }
             if (ingress.event) |event| {
                 switch (event) {
                     .paste_byte => |byte| {
@@ -838,6 +815,8 @@ pub fn Runtime(comptime App: type) type {
 
         pub const prepareFilePicker = completion_rt.prepareFilePicker;
         pub const collectFilePickerFacts = completion_rt.collectFilePickerFacts;
+        pub const holdFrameForFileListing = completion_rt.holdFrameForFileListing;
+        pub const fileListingHoldPending = completion_rt.fileListingHoldPending;
 
         pub fn handleByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
@@ -857,87 +836,6 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             return false;
-        }
-
-        fn projectMcpPromptOwnsInput(app: *App) bool {
-            if (comptime !@hasDecl(App, "projectMcpPromptActive")) return false;
-            const menu_active = activeCompactCommandMenu(app) != null or
-                settingsMenuActive(app) or
-                skillsMenuActive(app) or
-                modelMenuActive(app) or
-                sessionMenuActive(app) or
-                mcpMenuActive(app) or
-                mcpHostMenuActive(app) or
-                helpMenuActive(app);
-            var authentication_active = false;
-            if (comptime runtime_profile.allows(App, .native_auth)) {
-                authentication_active = app.auth.apiKeyEntryActive();
-            }
-            return projectMcpPromptMayOwnInput(.{
-                .active = app.projectMcpPromptActive(),
-                .question_active = app.question_prompt.isActive(),
-                .approval_active = app.approval_prompt.isActive(),
-                .subagent_active = false,
-                .menu_active = menu_active,
-                .authentication_active = authentication_active,
-            });
-        }
-
-        fn routeProjectMcpPromptByte(app: *App, byte: u8) !bool {
-            if (comptime !@hasDecl(App, "projectMcpPromptName")) return false;
-            const owns_input = projectMcpPromptOwnsInput(app);
-            debug_trace.logf(
-                "mcp",
-                "project prompt input byte={d} owns_input={s}",
-                .{ byte, if (owns_input) "true" else "false" },
-            );
-            if (!owns_input) return false;
-            const action: project_config.ProjectMcpAction = switch (byte) {
-                '1' => {
-                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
-                    defer app.alloc.free(name);
-                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
-                    defer app.alloc.free(display.bytes);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "Approving project MCP server '{s}'.",
-                        .{display.bytes},
-                    );
-                    defer app.alloc.free(body);
-                    try app_commands.Handlers(App).applyProjectMcpAction(
-                        app,
-                        .{ .approve = name },
-                        body,
-                    );
-                    return true;
-                },
-                '2' => .approve_all,
-                '3' => {
-                    const name = (try app.projectMcpPromptName(app.alloc)) orelse return true;
-                    defer app.alloc.free(name);
-                    const display = try text_utils.encodeTerminalSafe(app.alloc, name, 256);
-                    defer app.alloc.free(display.bytes);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
-                        "Rejecting project MCP server '{s}'.",
-                        .{display.bytes},
-                    );
-                    defer app.alloc.free(body);
-                    try app_commands.Handlers(App).applyProjectMcpAction(
-                        app,
-                        .{ .reject = name },
-                        body,
-                    );
-                    return true;
-                },
-                else => return true,
-            };
-            try app_commands.Handlers(App).applyProjectMcpAction(
-                app,
-                action,
-                "Approving all project MCP servers for this workspace.",
-            );
-            return true;
         }
 
         fn handleRawTerminalInputWithLimits(
@@ -973,7 +871,6 @@ pub fn Runtime(comptime App: type) type {
                 if (try app_auth_runtime.Runtime(App).routeAuthPickerByte(app, byte)) return;
             }
             if (try full_transcript_rt.routeByte(app, byte)) return;
-            if (try routeProjectMcpPromptByte(app, byte)) return;
             if (try routeActiveModalInput(app, raw, input_limits.decision_bytes)) return;
             if (byte >= 0x80) {
                 try handleTextByte(app, .composer, byte, max_input_len);
@@ -1020,18 +917,6 @@ pub fn Runtime(comptime App: type) type {
                 if (try full_transcript_rt.routeAction(app, resolved)) {
                     _ = disarmEscapeInterrupt(app, "full_transcript");
                     return .done;
-                }
-                if (comptime @hasDecl(App, "suppressProjectMcpPrompts")) {
-                    if (projectMcpPromptOwnsInput(app)) {
-                        _ = disarmEscapeInterrupt(app, "mcp_prompt_suppressed");
-                        app.suppressProjectMcpPrompts();
-                        try app.writeDomainNotice(.{
-                            .topic = "mcp",
-                            .tone = .neutral,
-                            .body = "Project MCP approval prompts dismissed for this process.",
-                        }, true);
-                        return .done;
-                    }
                 }
                 const now = io_mod.milliTimestamp();
                 expireEscClearArm(app, now);
@@ -1097,21 +982,6 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
-            if (mcpMenuActive(app)) {
-                switch (resolved) {
-                    .cursor_up => _ = moveMcpMenu(app, -1),
-                    .cursor_down => _ = moveMcpMenu(app, 1),
-                    .cursor_left => _ = try cycleMcpMenuSection(app, -1),
-                    .cursor_right => _ = try cycleMcpMenuSection(app, 1),
-                    else => {},
-                }
-                if (resolved == .cursor_up or resolved == .cursor_down or
-                    resolved == .cursor_left or resolved == .cursor_right)
-                {
-                    return .done;
-                }
-            }
-
             if (settingsMenuActive(app) and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
@@ -1122,10 +992,12 @@ pub fn Runtime(comptime App: type) type {
                 return .done;
             }
 
+            if (resolved == .cursor_left and try backMcpHostMenuScreen(app)) return .done;
+            if (resolved == .cursor_right and try enterMcpHostMenuItem(app)) return .done;
+
             if (try full_transcript_rt.routeComposerAction(app, resolved)) return .done;
 
             if (composer_shortcut) |action| {
-                if (routeMcpFilterShortcut(app, action)) return .done;
                 try routeComposerShortcutAction(app, action, max_input_len);
                 return .done;
             }
@@ -1317,59 +1189,6 @@ pub fn Runtime(comptime App: type) type {
                 return true;
             }
             if (try routeMcpHostMenuByte(app, byte)) return true;
-            if (mcpMenuActive(app)) {
-                if (comptime @hasField(App, "mcp")) {
-                    if (app.mcp.menu.screen == .add) {
-                        return try handleMcpAddInput(app, byte, max_input_len);
-                    }
-                    if (app.mcp.menu.screen == .arguments) {
-                        return try handleMcpArgumentInput(app, byte, max_input_len);
-                    }
-                    if (app.mcp.menu.filter_active) {
-                        if (byte == 0x7f) {
-                            _ = applyMcpMenuEvent(app, .delete_filter_byte);
-                            return true;
-                        }
-                        if (byte >= 0x20 and byte < 0x7f and byte != '\r') {
-                            _ = applyMcpMenuEvent(app, .{ .append_filter_byte = byte });
-                            return true;
-                        }
-                    }
-                }
-                if (byte >= 0x80) {
-                    input_reset.resetPendingTextScalarWithTrace(
-                        &app.input_runtime.text_scalar,
-                        "mcp_menu_active",
-                    );
-                    return true;
-                }
-                switch (byte) {
-                    '\t' => _ = try cycleMcpMenuSection(app, 1),
-                    '\r' => _ = try submitMcpMenuSelection(app),
-                    'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
-                    's', 'S' => {
-                        if (comptime @hasDecl(App, "addMcpSlack") and @hasField(App, "mcp")) {
-                            if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
-                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-                                try app.addMcpSlack();
-                            }
-                        }
-                    },
-                    'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
-                    'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
-                    'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
-                    'p', 'P' => _ = confirmMcpMenuAction(app, .trust_approve_all),
-                    'z', 'Z' => _ = confirmMcpMenuAction(app, .trust_reset),
-                    'c', 'C' => _ = applyMcpMenuEvent(app, .show_info),
-                    'r', 'R' => _ = try refreshMcpMenu(app),
-                    'i', 'I' => _ = try insertMcpMenuPreview(app, max_input_len),
-                    '/' => _ = applyMcpMenuEvent(app, .begin_filter),
-                    10 => _ = moveMcpMenu(app, 1),
-                    11 => _ = moveMcpMenu(app, -1),
-                    else => {},
-                }
-                return true;
-            }
             if (activeCompactCommandMenu(app)) |menu| {
                 if (byte >= 0x80) {
                     input_reset.resetPendingTextScalarWithTrace(
@@ -1380,15 +1199,12 @@ pub fn Runtime(comptime App: type) type {
                 }
                 switch (byte) {
                     '\t' => if (menu == .usage) {
-                        try cycleUsageMenuScope(app, 1);
+                        try refreshUsageMenu(app, app.input_runtime.usage_menu.period.next());
                     },
                     '\r' => try submitCompactCommandMenuSelection(app, menu, max_input_len),
                     'r', 'R' => if (menu == .usage) {
                         if (comptime runtime_profile.allows(App, .profile_usage)) {
-                            try reloadUsageMenu(
-                                app,
-                                app.input_runtime.usage_menu.navigationScope(),
-                            );
+                            try reloadUsageMenu(app, app.input_runtime.usage_menu.period);
                         }
                     },
                     10 => {
@@ -1554,6 +1370,8 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                     } else if (picker_state.isBareModelCommandAtCursor(&app.input_runtime.edit_state)) {
                         try completion_rt.openCurrentModelPicker(app);
+                    } else if (picker_state.isBareEffortCommandAtCursor(&app.input_runtime.edit_state)) {
+                        try completion_rt.openCurrentEffortPicker(app);
                     } else if (completion_rt.hasFileQuery(app)) {
                         if ((try completion_rt.autocompleteFilePickerSelection(app, max_input_len)) == .limit_exceeded) {
                             try input_limit_feedback.report(App, app, .composer, 1);
@@ -1582,7 +1400,7 @@ pub fn Runtime(comptime App: type) type {
                             } else if (command_specs.nthSlashCompletion(app.slashRegistry(), prefix, idx)) |completion| {
                                 if (command_specs.slashCompletionHasArgs(app.slashRegistry(), completion)) {
                                     var buf: [128]u8 = undefined;
-                                    const with_space = std.fmt.bufPrint(&buf, "{s} ", .{completion}) catch completion;
+                                    const with_space = std.mem.print(&buf, "{s} ", .{completion}) catch completion;
                                     try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
@@ -1632,6 +1450,7 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
                 '\r' => {
+                    if (try submitEffortMenuSelection(app)) return;
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
                     if (try submitMcpHostMenu(app)) return;
@@ -1641,6 +1460,7 @@ pub fn Runtime(comptime App: type) type {
                     if (try submitSlashPickerSelection(app)) return;
                     if (comptime runtime_profile.allows(App, .durable_sessions)) {
                         if (try submitSessionPickerSelection(app)) return;
+                        if (try submitForkMenuSelection(app, max_input_len)) return;
                     }
                     if (try completion_rt.submitFilePickerOnEnter(app, max_input_len)) |result| {
                         if (result == .limit_exceeded) {
@@ -1881,8 +1701,7 @@ pub fn Runtime(comptime App: type) type {
             if (!app.session_persistence.session_picker.active) return false;
 
             if (app.loadMoreSessionPicker() catch |err| {
-                const notice = try std.fmt.allocPrint(
-                    app.alloc,
+                const notice = try app.alloc.print(
                     "unable to load more saved sessions: {s}",
                     .{@errorName(err)},
                 );
@@ -1913,6 +1732,30 @@ pub fn Runtime(comptime App: type) type {
                 app.shell.render_requests.request(.footer);
                 return true;
             };
+            return true;
+        }
+
+        /// Forks before the selected prompt and puts its text in the composer.
+        fn submitForkMenuSelection(app: *App, max_input_len: usize) !bool {
+            if (comptime !@hasDecl(App, "forkBeforeSelectedPrompt")) return false;
+            if (!forkMenuActive(app)) return false;
+            const prompt = app.forkBeforeSelectedPrompt() catch |err| {
+                debug_trace.logf("session", "fork failed err={s}", .{@errorName(err)});
+                try app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .@"error",
+                    .body = "Unable to fork the session.",
+                }, true);
+                app.shell.render_requests.request(.footer);
+                return true;
+            };
+            defer app.alloc.free(prompt);
+            if (prompt.len > max_input_len) {
+                debug_trace.logf("input", "fork prompt not restored bytes={d} reason=input_limit", .{prompt.len});
+                return true;
+            }
+            try app.input_runtime.textReplacementState().replace(app.alloc, prompt);
+            app.shell.render_requests.request(.footer);
             return true;
         }
 
@@ -1959,6 +1802,11 @@ pub fn Runtime(comptime App: type) type {
             return app.session_persistence.session_picker.active;
         }
 
+        fn forkMenuActive(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            return app.session_persistence.fork_menu.active();
+        }
+
         fn helpMenuActive(app: *App) bool {
             return app.input_runtime.help_menu.active;
         }
@@ -1967,17 +1815,66 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.settings_menu.active;
         }
 
-        fn mcpMenuActive(app: *App) bool {
-            if (comptime @hasField(App, "mcp")) {
-                return app.mcp.menu.active;
-            }
-            return false;
-        }
-
-        /// The `/mcp` menu on MCP-v2.
+        /// The `/mcp` menu.
         fn mcpHostMenuActive(app: *App) bool {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
             return app.mcp.hostMenuActive();
+        }
+
+        fn cancelMcpHostMenu(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            // Back a screen; closing the list clears its filter too.
+            try app.mcpHostMenuKey(.escape);
+            if (!mcpHostMenuActive(app)) {
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            }
+            return true;
+        }
+
+        /// Whether the menu asks Remove or Reject on the choice's row, where
+        /// ← and → choose between yes and no.
+        fn mcpHostMenuAsksOnRow(app: *App) bool {
+            const menu_state = &app.mcp.host_menu;
+            if (menu_state.screen != .confirm) return false;
+            const c = menu_state.confirm orelse return false;
+            return c.asksOnRow();
+        }
+
+        /// ← goes back a screen, like Esc, from a server's screen or an
+        /// approval; on a question asked on its row it chooses yes. With a
+        /// filter typed it moves the composer's cursor, and on the list there
+        /// is nothing to go back to.
+        fn backMcpHostMenuScreen(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.left);
+                return true;
+            }
+            if (app.input_runtime.edit_state.input.items.len > 0) return false;
+            try app.mcpHostMenuKey(.escape);
+            return true;
+        }
+
+        /// → acts like Enter on the list and on a server's screen: it opens
+        /// the server or runs the selected choice. On a question asked on its
+        /// row it chooses no, and an approval still takes Enter, so → never
+        /// confirms by accident. With the cursor inside a typed filter, →
+        /// moves it instead.
+        fn enterMcpHostMenuItem(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            if (mcpHostMenuAsksOnRow(app)) {
+                try app.mcpHostMenuKey(.right);
+                return true;
+            }
+            if (app.mcp.host_menu.screen == .confirm) return false;
+            const edit = &app.input_runtime.edit_state;
+            if (edit.cursor != edit.input.items.len) return false;
+            try app.mcpHostMenuKey(.enter);
+            return true;
         }
 
         /// On the list and on a server's screen, typing goes to the composer,
@@ -2005,412 +1902,16 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
-            if (comptime @hasField(App, "mcp")) {
-                const view = app.mcp.menuView();
-                return .{
-                    .state = view.state,
-                    .servers = if (view.health) |health| health.servers else &.{},
-                    .tools = view.tools,
-                    .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
-                    .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
-                    .prompts = if (view.prompts) |catalog| catalog.items else &.{},
-                    .configuration_issues = if (view.health) |health| health.configuration_issues else &.{},
-                    .preview = view.preview,
-                    .feedback = view.feedback,
-                    .add_name = view.add_form.name.items,
-                    .add_target = view.add_form.target.items,
-                    .add_arguments = view.add_form.arguments.items,
-                    .add_draft = app.input_runtime.edit_state.input.items,
-                    .arguments = view.argument_fields,
-                    .argument_draft = app.input_runtime.edit_state.input.items,
-                };
-            }
-            return .{};
-        }
-
-        fn applyMcpMenuEvent(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
-            const effect = applyMcpMenuEventDeferred(app, event);
-            app.shell.render_requests.request(.footer);
-            return effect;
-        }
-
-        fn applyMcpMenuEventDeferred(app: *App, event: mcp_menu_state.Event) ?mcp_menu_state.Effect {
-            if (comptime @hasField(App, "mcp")) {
-                return mcp_menu_state.apply(&app.mcp.menu, event);
-            }
-            return null;
-        }
-
-        fn routeMcpFilterShortcut(app: *App, action: input_action.ShortcutAction) bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (!app.mcp.menu.filter_active) return false;
-                switch (action) {
-                    .delete_backward => _ = applyMcpMenuEvent(app, .delete_filter_byte),
-                    .delete_word_left, .delete_whitespace_word_left, .delete_to_line_start => _ = applyMcpMenuEvent(app, .clear_filter_text),
-                    else => return false,
-                }
-                return true;
-            }
-            return false;
-        }
-
-        fn startMcpMenuEffect(app: *App, effect: mcp_menu_state.Effect) !void {
-            if (comptime !@hasDecl(App, "beginMcpMenuEffect")) return;
-            app.beginMcpMenuEffect(effect) catch |err| {
-                const generation = switch (effect) {
-                    .load_catalog => |request| request.generation,
-                    .load_preview => |request| request.generation,
-                    .complete_argument => |request| request.generation,
-                    .action => |request| request.generation,
-                    .cancel => |value| value,
-                };
-                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                    try app.recordMcpMenuEffectFailure(generation, err);
-                }
-            };
-        }
-
-        fn moveMcpMenu(app: *App, delta: i8) bool {
-            if (!mcpMenuActive(app)) return false;
-            const projection = mcpMenuProjection(app);
-            if (projection.state.screen == .preview) {
-                _ = applyMcpMenuEvent(app, .{ .scroll_preview = .{
-                    .delta = delta,
-                    .row_count = mcp_menu_presentation.previewVisualRowCount(
-                        projection.preview,
-                        app.shell.layout.cols,
-                    ),
-                } });
-                return true;
-            }
-            _ = applyMcpMenuEvent(app, .{ .move = .{
-                .delta = delta,
-                .item_count = projection.itemCount(),
-                .visible_count = mcp_menu_presentation.visibleItemsForBudget(
-                    mcp_menu_presentation.max_inline_rows,
-                ),
-            } });
-            return true;
-        }
-
-        fn cycleMcpMenuSection(app: *App, delta: i8) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (applyMcpMenuEventDeferred(app, .{ .cycle_section = delta })) |effect| {
-                try startMcpMenuEffect(app, effect);
-            }
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.load_state == .loading) return true;
-            }
-            app.shell.render_requests.request(.footer);
-            return true;
-        }
-
-        fn submitMcpMenuSelection(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                const state = app.mcp.menu;
-                if (state.screen == .browse and state.section == .servers and
-                    mcpMenuProjection(app).itemCount() > 0)
-                {
-                    _ = applyMcpMenuEvent(app, .show_details);
-                } else if (state.screen == .browse and state.section != .servers and
-                    mcpMenuProjection(app).itemCount() > 0)
-                {
-                    if (try app.mcp.prepareMenuArguments(app.alloc)) {
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                        app.shell.render_requests.request(.footer);
-                    } else {
-                        if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
-                            try startMcpMenuEffect(app, effect);
-                        }
-                    }
-                } else if (state.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (mcp_menu_state.serverActionAvailable(.authenticate, server)) {
-                        try authenticateMcpMenuServer(app);
-                    }
-                } else if (state.screen == .confirm) {
-                    if (state.confirmation_action) |action| {
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = action },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| try executeMcpMenuAction(app, request),
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
-        fn insertMcpMenuPreview(app: *App, max_input_len: usize) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                const view = app.mcp.menuView();
-                const insert = view.insert orelse return true;
-                const effect = applyMcpMenuEvent(
-                    app,
-                    .{ .request_action = .insert_preview },
-                ) orelse return true;
-                switch (effect) {
-                    .action => |request| {
-                        if (request.action != .insert_preview) return true;
-                        switch (try insertComposerSliceBounded(
-                            app,
-                            insert,
-                            max_input_len,
-                            false,
-                        )) {
-                            .inserted => {
-                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-                                if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                                    if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
-                                }
-                            },
-                            .limit_exceeded => try input_limit_feedback.report(
-                                App,
-                                app,
-                                .composer,
-                                insert.len,
-                            ),
-                            .inactive => {},
-                        }
-                        app.shell.render_requests.request(.footer);
-                    },
-                    .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                }
-            }
-            return true;
-        }
-
-        fn refreshMcpMenu(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen != .browse or app.mcp.menu.section != .servers) return true;
-            }
-            const effect = applyMcpMenuEvent(
-                app,
-                .{ .request_action = .refresh },
-            ) orelse return true;
-            switch (effect) {
-                .action => |request| {
-                    if (request.action != .refresh) return true;
-                    if (comptime @hasDecl(App, "beginMcpMenuReload")) {
-                        app.beginMcpMenuReload(request.generation) catch |err| {
-                            if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                                try app.recordMcpMenuEffectFailure(request.generation, err);
-                            }
-                        };
-                    }
-                },
-                .load_catalog, .load_preview, .complete_argument, .cancel => {},
-            }
-            return true;
-        }
-
-        fn authenticateMcpMenuServer(app: *App) !void {
-            const effect = applyMcpMenuEvent(
-                app,
-                .{ .request_action = .authenticate },
-            ) orelse return;
-            switch (effect) {
-                .action => |request| {
-                    if (request.action == .authenticate) try executeMcpMenuAction(app, request);
-                },
-                .load_catalog, .load_preview, .complete_argument, .cancel => {},
-            }
-        }
-
-        fn confirmMcpMenuAction(app: *App, action: mcp_menu_state.Action) bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen != .details and
-                    !(app.mcp.menu.screen == .browse and
-                        app.mcp.menu.section == .servers and
-                        (action == .trust_approve_all or action == .trust_reset))) return true;
-                if (app.mcp.menu.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (!mcp_menu_state.serverActionAvailable(action, server)) return true;
-                }
-                _ = applyMcpMenuEvent(app, .{ .show_confirmation = action });
-            }
-            return true;
-        }
-
-        fn executeMcpMenuAction(
-            app: *App,
-            request: mcp_menu_state.ActionRequest,
-        ) !void {
-            const result = switch (request.action) {
-                .authenticate => if (comptime @hasDecl(App, "beginMcpMenuAuthentication"))
-                    app.beginMcpMenuAuthentication(request.generation)
-                else
-                    error.McpMenuActionUnavailable,
-                .remove => if (comptime @hasDecl(App, "removeMcpMenuServer"))
-                    app.removeMcpMenuServer(request.generation)
-                else
-                    error.McpMenuActionUnavailable,
-                .logout => if (comptime @hasDecl(App, "beginMcpMenuEffect"))
-                    app.beginMcpMenuEffect(.{ .action = request })
-                else
-                    error.McpMenuActionUnavailable,
-                .trust_approve, .trust_reject, .trust_approve_all, .trust_reset => if (comptime @hasDecl(App, "applyMcpMenuTrustAction"))
-                    app.applyMcpMenuTrustAction(request.generation, request.action)
-                else
-                    error.McpMenuActionUnavailable,
-                else => error.McpMenuActionUnavailable,
-            };
-            result catch |err| {
-                if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                    try app.recordMcpMenuEffectFailure(request.generation, err);
-                }
-            };
-        }
-
-        fn handleMcpMenuPrimaryAction(app: *App) !bool {
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                if (app.mcp.menu.screen == .details) {
-                    const server = mcpMenuProjection(app).selectedServer() orelse return true;
-                    if (mcp_menu_state.serverActionAvailable(.trust_approve, server)) {
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = .trust_approve },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| try executeMcpMenuAction(app, request),
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                    return true;
-                }
-                if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
-                    _ = applyMcpMenuEvent(app, .show_add);
-                }
-            }
-            return true;
-        }
-
-        fn handleMcpAddInput(app: *App, byte: u8, max_input_len: usize) !bool {
-            if (comptime !@hasField(App, "mcp")) return false;
-            switch (byte) {
-                '\t' => {
-                    try commitMcpAddDraft(app);
-                    _ = applyMcpMenuEvent(app, .cycle_add_transport);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                },
-                '\r' => {
-                    try commitMcpAddDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const field_count: usize = if (app.mcp.menu.add_transport == .local) 3 else 2;
-                    if (app.mcp.menu.add_field_index + 1 < field_count) {
-                        _ = applyMcpMenuEvent(app, .{ .move_add_field = .{
-                            .delta = 1,
-                            .field_count = field_count,
-                        } });
-                    } else {
-                        const action: mcp_menu_state.Action = if (app.mcp.menu.add_transport == .local)
-                            .add_local
-                        else
-                            .add_http;
-                        const effect = applyMcpMenuEvent(
-                            app,
-                            .{ .request_action = action },
-                        ) orelse return true;
-                        switch (effect) {
-                            .action => |request| {
-                                if (comptime @hasDecl(App, "saveMcpMenuAdd")) {
-                                    app.saveMcpMenuAdd(
-                                        request.generation,
-                                        app.mcp.menu.add_transport,
-                                    ) catch |err| {
-                                        if (comptime @hasDecl(App, "recordMcpMenuEffectFailure")) {
-                                            try app.recordMcpMenuEffectFailure(request.generation, err);
-                                        }
-                                    };
-                                }
-                            },
-                            .load_catalog, .load_preview, .complete_argument, .cancel => {},
-                        }
-                    }
-                    app.shell.render_requests.request(.footer);
-                },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
-            }
-            return true;
-        }
-
-        fn commitMcpAddDraft(app: *App) !void {
-            if (comptime @hasField(App, "mcp")) {
-                try app.mcp.setMenuAddField(
-                    app.alloc,
-                    app.mcp.menu.add_field_index,
-                    app.input_runtime.edit_state.input.items,
-                );
-            }
-        }
-
-        fn handleMcpArgumentInput(app: *App, byte: u8, max_input_len: usize) !bool {
-            if (comptime !@hasField(App, "mcp")) return false;
-            if (app.mcp.menu.pending_generation != null) return true;
-            switch (byte) {
-                '\t' => {
-                    try commitMcpArgumentDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const effect = applyMcpMenuEvent(app, .request_completion) orelse return true;
-                    try startMcpMenuEffect(app, effect);
-                },
-                '\r' => {
-                    try commitMcpArgumentDraft(app);
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    const field_count = mcpMenuProjection(app).arguments.len;
-                    if (app.mcp.menu.argument_index + 1 < field_count) {
-                        _ = applyMcpMenuEvent(app, .{ .move_argument = .{
-                            .delta = 1,
-                            .field_count = field_count,
-                        } });
-                    } else if (!app.mcp.menuArgumentsValid()) {
-                        try app.mcp.setMenuFeedback(app.alloc, "Complete every required MCP argument.");
-                        app.shell.render_requests.request(.footer);
-                    } else if (applyMcpMenuEvent(app, .begin_preview)) |effect| {
-                        try startMcpMenuEffect(app, effect);
-                    }
-                },
-                else => try handleTextByte(app, .composer, byte, max_input_len),
-            }
-            return true;
-        }
-
-        fn commitMcpArgumentDraft(app: *App) !void {
-            if (comptime @hasField(App, "mcp")) {
-                const draft = app.input_runtime.edit_state.input.items;
-                const arguments = mcpMenuProjection(app).arguments;
-                if (draft.len == 0 and
-                    app.mcp.menu.argument_index < arguments.len and
-                    arguments[app.mcp.menu.argument_index].value.items.len > 0)
-                {
-                    return;
-                }
-                try app.mcp.setMenuArgumentField(
-                    app.alloc,
-                    app.mcp.menu.argument_index,
-                    draft,
-                );
-            }
-        }
-
         const CompactCommandMenuKind = enum {
             statusline,
+            info_panel,
             usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
+            if (app.input_runtime.info_panel.active) return .info_panel;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
             return null;
@@ -2465,11 +1966,17 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Opens the model picker on the cached catalog and revalidates it in
+        /// the background, so models released mid-session appear once it lands.
+        fn openModelMenu(app: *App) !void {
+            if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
+            try app.model_cache.openMenu();
+        }
+
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
-            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            try app.model_cache.openMenu();
+            try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
@@ -2529,7 +2036,7 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or mcpHostMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -2547,7 +2054,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn dismissActiveMenusForComposerEdit(app: *App) bool {
-            return dismissAuthPickerForComposerEdit(app);
+            // The fork and effort menus read no query from the composer, so
+            // an edit closes them.
+            const fork_menu_closed = cancelForkMenu(app);
+            const effort_menu_closed = cancelEffortMenu(app);
+            return dismissAuthPickerForComposerEdit(app) or fork_menu_closed or effort_menu_closed;
         }
 
         fn dismissActiveMenusThenRedraw(app: *App) void {
@@ -2622,8 +2133,7 @@ pub fn Runtime(comptime App: type) type {
             const item = menu.selectedItem(&snapshot, query) orelse return;
             if (item.id == .model) {
                 if (delta > 0 and comptime @hasField(App, "model_cache")) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
                 return;
@@ -2671,8 +2181,7 @@ pub fn Runtime(comptime App: type) type {
                     app.input_runtime.edit_state.input.items,
                 ) orelse return true;
                 if (selected.id == .model) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
             }
@@ -2688,17 +2197,20 @@ pub fn Runtime(comptime App: type) type {
                 try prepareWorkspaceMenuCommand(app, max_input_len);
                 return;
             }
-            if (menu == .usage) {
-                _ = app.input_runtime.usage_menu.toggleExpanded(
-                    usageMenuVisibleModelItems(app),
-                );
+            // The panel only shows; Enter closes it as Esc does.
+            if (menu == .info_panel) {
+                app.input_runtime.info_panel.close();
                 app.shell.render_requests.request(.footer);
+                return;
+            }
+            if (menu == .usage) {
+                if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
                 return;
             }
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .usage, .workspace => unreachable,
+                .info_panel, .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2740,6 +2252,7 @@ pub fn Runtime(comptime App: type) type {
         fn moveCompactCommandMenu(app: *App, menu: CompactCommandMenuKind, delta: i32) bool {
             return switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
+                .info_panel => scrollInfoPanel(app, delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
                     usageMenuVisibleModelItems(app),
@@ -2752,6 +2265,18 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        /// ↑↓ in a read-only panel, over the lines the footer shows it.
+        fn scrollInfoPanel(app: *App, delta: i32) bool {
+            const cols = app.shell.layout.cols;
+            const projection = render_input.infoPanelProjection(&app.input_runtime.info_panel, cols, app.shell.layout.rows);
+            const visible_rows = info_panel_presentation.footerRows(projection, cols, app.shell.layout.rows);
+            return app.input_runtime.info_panel.scrollBy(
+                delta,
+                info_panel_presentation.lineCount(projection.rows, cols),
+                info_panel_presentation.visibleLineCount(visible_rows),
+            );
         }
 
         fn usageMenuVisibleModelItems(app: *App) u16 {
@@ -2768,11 +2293,10 @@ pub fn Runtime(comptime App: type) type {
                 ),
                 app.shell.layout.rows -| 3,
             );
-            return compact_command_menu_presentation.usageVisibleModelItems(
+            return std.math.cast(u16, compact_command_menu_presentation.usageVisibleModelItems(
                 projection,
                 visible_rows,
-                app.shell.layout.cols,
-            );
+            )) orelse std.math.maxInt(u16);
         }
 
         fn routeCompactCommandMenuEscapeAction(
@@ -2783,7 +2307,7 @@ pub fn Runtime(comptime App: type) type {
             if (menu == .usage and
                 (resolved == .cursor_left or resolved == .cursor_right))
             {
-                const current = app.input_runtime.usage_menu.navigationScope();
+                const current = app.input_runtime.usage_menu.period;
                 const next = if (resolved == .cursor_left)
                     current.previous()
                 else
@@ -2794,7 +2318,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             if (menu == .usage and resolved == .toggle_permission_mode) {
-                try cycleUsageMenuScope(app, -1);
+                try refreshUsageMenu(app, app.input_runtime.usage_menu.period.previous());
                 return;
             }
             if (menu == .statusline and
@@ -2804,7 +2328,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .usage, .workspace => unreachable,
+                    .info_panel, .usage, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2820,7 +2344,7 @@ pub fn Runtime(comptime App: type) type {
             app.shell.render_requests.request(.footer);
         }
 
-        fn refreshUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn refreshUsageMenu(app: *App, scope: usage.Period) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "refreshUsageMenu")) {
                 try app.refreshUsageMenu(scope);
@@ -2829,7 +2353,7 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        fn reloadUsageMenu(app: *App, scope: usage_report.Scope) !void {
+        fn reloadUsageMenu(app: *App, scope: usage.Period) !void {
             if (comptime !runtime_profile.allows(App, .profile_usage)) return;
             if (comptime @hasDecl(App, "reloadUsageMenu")) {
                 try app.reloadUsageMenu(scope);
@@ -2838,24 +2362,6 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try app_commands.Handlers(App).reloadUsageMenu(app, scope);
             }
-        }
-
-        fn cycleUsageMenuScope(app: *App, delta: i32) !void {
-            const current = app.input_runtime.usage_menu.navigationScope();
-            const next: usage_report.Scope = if (delta < 0)
-                switch (current) {
-                    .days_30 => .session,
-                    .days_7 => .days_30,
-                    .hours_24 => .days_7,
-                    .session => .hours_24,
-                }
-            else switch (current) {
-                .days_30 => .days_7,
-                .days_7 => .hours_24,
-                .hours_24 => .session,
-                .session => .days_30,
-            };
-            try refreshUsageMenu(app, next);
         }
 
         fn submitHelpMenuSelection(app: *App, max_input_len: usize, max_prompt_history: usize) !bool {
@@ -3124,7 +2630,17 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return;
             const picker = &app.session_persistence.session_picker;
             if (!picker.active) return;
-            picker.setQuery(app.input_runtime.edit_state.input.items);
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            app_session_runtime.Runtime(App).searchSessionPicker(app) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "session picker search dropped the listed sessions err={s}",
+                    .{@errorName(err)},
+                );
+            };
         }
 
         fn skillTokenEnd(items: []const u8, start: usize) usize {
@@ -3299,7 +2815,7 @@ pub fn Runtime(comptime App: type) type {
                     _ = disarmEscapeInterrupt(app, "approval_prompt");
                     return;
                 }
-                if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+                if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                     _ = disarmEscapeClear(app);
                     _ = disarmEscapeInterrupt(app, "menu");
                     app.shell.render_requests.request(.footer);
@@ -3346,7 +2862,7 @@ pub fn Runtime(comptime App: type) type {
                 _ = disarmEscapeClear(app);
                 return;
             }
-            if (cancelCompactCommandMenu(app) or (try cancelMcpMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app)) {
+            if (cancelCompactCommandMenu(app) or (try cancelMcpHostMenu(app)) or cancelSettingsMenu(app) or cancelHelpMenu(app) or cancelModelMenu(app) or cancelSkillsMenu(app) or cancelSessionMenu(app) or cancelForkMenu(app) or cancelEffortMenu(app)) {
                 _ = disarmEscapeClear(app);
                 app.shell.render_requests.request(.footer);
                 return;
@@ -3402,8 +2918,17 @@ pub fn Runtime(comptime App: type) type {
                 app.input_runtime.statusline_menu.close();
                 return true;
             }
+            if (app.input_runtime.info_panel.active) {
+                app.input_runtime.info_panel.close();
+                return true;
+            }
             if (app.input_runtime.usage_menu.active) {
-                app.input_runtime.usage_menu.close(app.alloc);
+                // Esc on a model's detail screen goes back to the tables.
+                if (app.input_runtime.usage_menu.closeDetail()) {
+                    app.shell.render_requests.request(.footer);
+                } else {
+                    app_commands.Handlers(App).closeUsageMenu(app);
+                }
                 return true;
             }
             if (app.input_runtime.workspace_menu.active) {
@@ -3415,43 +2940,6 @@ pub fn Runtime(comptime App: type) type {
 
         fn cancelHelpMenu(app: *App) bool {
             return closeHelpMenu(app, true);
-        }
-
-        fn cancelMcpMenu(app: *App) !bool {
-            if (comptime @hasDecl(App, "mcpHostMenuKey")) if (mcpHostMenuActive(app)) {
-                // Back a screen; closing the list clears its filter too.
-                try app.mcpHostMenuKey(.escape);
-                if (!mcpHostMenuActive(app)) {
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-                }
-                return true;
-            };
-            if (!mcpMenuActive(app)) return false;
-            if (comptime @hasField(App, "mcp")) {
-                debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
-                if (app.mcp.menu.filter_active) {
-                    _ = applyMcpMenuEvent(app, .clear_filter);
-                    return true;
-                }
-                if (app.mcp.menu.screen != .browse) {
-                    if (app.mcp.menu.screen == .add or app.mcp.menu.screen == .arguments) {
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    }
-                    if (applyMcpMenuEvent(app, .back)) |effect| switch (effect) {
-                        .cancel => app.mcp.cancelMenuOperation(),
-                        .load_catalog, .load_preview, .complete_argument, .action => {},
-                    };
-                    return true;
-                }
-            }
-            if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
-            app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
-            if (comptime @hasDecl(App, "presentProjectMcpPrompt")) {
-                if (projectMcpPromptOwnsInput(app)) try app.presentProjectMcpPrompt();
-            }
-            return true;
         }
 
         fn cancelSettingsMenu(app: *App) bool {
@@ -3468,6 +2956,29 @@ pub fn Runtime(comptime App: type) type {
             app_session_runtime.Runtime(App).cancelSessionPickerToComposer(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            return true;
+        }
+
+        fn cancelForkMenu(app: *App) bool {
+            if (comptime !@hasField(App, "session_persistence")) return false;
+            if (!forkMenuActive(app)) return false;
+            app.session_persistence.fork_menu.close(app.alloc);
+            return true;
+        }
+
+        fn cancelEffortMenu(app: *App) bool {
+            if (!app.input_runtime.effort_menu.active) return false;
+            app.input_runtime.effort_menu.close(app.alloc);
+            return true;
+        }
+
+        /// Applies the level highlighted in the `/effort` menu and closes it.
+        fn submitEffortMenuSelection(app: *App) !bool {
+            const menu = &app.input_runtime.effort_menu;
+            const effort = menu.selectedEffort() orelse return false;
+            menu.close(app.alloc);
+            try session_commands.Commands(App).selectEffort(app, effort);
+            app.shell.render_requests.request(.footer);
             return true;
         }
     };
@@ -3733,7 +3244,6 @@ const RoutingSubagents = struct {
         switch (self.manager_paste.paste.settleDeliveryEpoch()) {
             .none => return false,
             .finish => self.manager_paste.paste.resetWithTrace(.decision_prompt_active),
-            .reject => self.manager_paste.paste.resetWithTrace(.unsafe_suffix),
         }
         return true;
     }
@@ -3950,36 +3460,6 @@ fn armEscapeClearForTest(input_runtime: *core_input_runtime.Runtime, armed_ms: i
     ).next;
 }
 
-test "project MCP prompt waits for every existing modal owner" {
-    const base = ProjectMcpPromptInputState{
-        .active = true,
-        .question_active = false,
-        .approval_active = false,
-        .subagent_active = false,
-        .menu_active = false,
-        .authentication_active = false,
-    };
-    try std.testing.expect(projectMcpPromptMayOwnInput(base));
-    var blocked = base;
-    blocked.question_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.approval_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.subagent_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.menu_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    blocked = base;
-    blocked.authentication_active = true;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(blocked));
-    var inactive = base;
-    inactive.active = false;
-    try std.testing.expect(!projectMcpPromptMayOwnInput(inactive));
-}
-
 const RoutingFakeApp = struct {
     pub const input_byte_limit: usize = 4096;
 
@@ -4131,7 +3611,7 @@ const RoutingFakeApp = struct {
         var count: usize = 0;
         for (self.model_completion_values) |value| {
             if (count == out.len) break;
-            if (query.len > 0 and std.ascii.indexOfIgnoreCase(value, query) == null) continue;
+            if (query.len > 0 and std.ascii.findIgnoreCase(value, query) == null) continue;
             out[count] = value;
             count += 1;
         }
@@ -4187,9 +3667,9 @@ const RoutingFakeApp = struct {
 
     pub fn refreshUsageMenu(
         self: *RoutingFakeApp,
-        scope: usage_report.Scope,
+        period: usage.Period,
     ) !void {
-        self.input_runtime.usage_menu.requested_scope = scope;
+        self.input_runtime.usage_menu.period = period;
     }
 
     pub fn isCurrentFileCompletion(self: *RoutingFakeApp, _: []const u8, _: []const u8, kind: file_index.CandidateKind) bool {
@@ -4259,13 +3739,13 @@ const RoutingFakeApp = struct {
         self.notice_tone = notice.tone;
         self.notice_visibility = notice.visibility;
         const rendered = if (notice.topic.len > 0)
-            try std.fmt.allocPrint(self.alloc, "{s} {s}: {s}", .{
+            try self.alloc.print("{s} {s}: {s}", .{
                 types.noticeGlyph(notice.tone),
                 notice.topic,
                 notice.body,
             })
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
+            try self.alloc.print("{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body });
         defer self.alloc.free(rendered);
         try self.transcript.appendSlice(self.alloc, rendered);
     }
@@ -4478,13 +3958,13 @@ fn appendRoutingSessionPickerSummary(
     picker: *app_session_runtime.SessionPicker,
     index: usize,
 ) !void {
-    const id = try std.fmt.allocPrint(alloc, "session-{d}", .{index});
+    const id = try alloc.print("session-{d}", .{index});
     errdefer alloc.free(id);
-    const workspace_root = try std.fmt.allocPrint(alloc, "/tmp/workspace-{d}", .{index});
+    const workspace_root = try alloc.print("/tmp/workspace-{d}", .{index});
     errdefer alloc.free(workspace_root);
-    const title = try std.fmt.allocPrint(alloc, "session {d}", .{index});
+    const title = try alloc.print("session {d}", .{index});
     errdefer alloc.free(title);
-    const preview = try std.fmt.allocPrint(alloc, "session {d} preview", .{index});
+    const preview = try alloc.print("session {d} preview", .{index});
     errdefer alloc.free(preview);
     try picker.summaries.append(alloc, .{
         .id = id,
@@ -4772,7 +4252,7 @@ test "app_input_runtime workspace add handoff dismisses argument completion" {
 }
 
 test "help menu whole replacement preserves the prior draft when staging fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -4796,7 +4276,7 @@ test "help menu whole replacement preserves the prior draft when staging fails" 
 }
 
 test "workspace menu whole replacement preserves the prior draft when staging fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -5524,21 +5004,18 @@ test "app_input_runtime Tab advances help categories before autocomplete" {
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.help_menu.window_start);
 }
 
-test "app_input_runtime Tab cycles usage scopes in both directions" {
+test "app_input_runtime Tab cycles usage periods in both directions" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try Runtime(RoutingFakeApp).handleByte(&app, '\t', 4096, 100);
-    try std.testing.expectEqual(usage_report.Scope.days_7, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage.Period.today, app.input_runtime.usage_menu.period);
 
     try feedRoutingBytes(&app, "\x1b[Z");
-    try std.testing.expectEqual(usage_report.Scope.days_30, app.input_runtime.usage_menu.navigationScope());
+    try std.testing.expectEqual(usage.Period.month, app.input_runtime.usage_menu.period);
 }
 
 test "app_input_runtime Tab toggles session picker scope before autocomplete" {
@@ -5555,7 +5032,7 @@ test "app_input_runtime Tab toggles session picker scope before autocomplete" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.workspace_root = workspace;
-    app.session_persistence.store = try session_store.Store.initFromHome(alloc, home, workspace);
+    _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, home));
     app.session_persistence.session_picker.active = true;
     app.session_persistence.session_picker.scope = .current_workspace;
     try app.input_runtime.textReplacementState().replace(alloc, "/sk");
@@ -5767,7 +5244,7 @@ test "app_input_runtime redraws a closed skill picker when the input limit notic
 }
 
 test "app_input_runtime keeps the skill picker open when binding allocation fails" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -6028,7 +5505,7 @@ test "app_input_runtime ctrl-l preserves an active inline picker" {
 }
 
 test "app_input_runtime Enter keeps backslash newline semantics when history allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "draft\\");
@@ -7127,8 +6604,8 @@ test "app_input_runtime bare model Tab keeps current selection across catalog re
 
 test "app_input_runtime bare model Tab keeps current selection beyond completion window" {
     const alloc = std.testing.allocator;
-    const current_model = "anthropic/claude-opus-4.8";
-    var completions = [_][]const u8{"anthropic/claude-opus-4.8-preview"} ** 33;
+    const current_model = "provider/current-model";
+    var completions: [33][]const u8 = @splat("provider/current-model-preview");
     completions[completions.len - 1] = current_model;
 
     var app = try RoutingFakeApp.init(alloc);
@@ -7365,30 +6842,37 @@ test "app_input_runtime file picker reuses one existing terminator and preserves
     }
 }
 
-test "app_input_runtime accepts typed directories with one synthetic slash" {
+test "app_input_runtime opens typed directories with Tab and selects them with Enter" {
     const alloc = std.testing.allocator;
     const completions = [_]file_index.Candidate{.{ .path = "src/nested", .kind = .directory }};
     const cases = [_]struct {
         input: []const u8,
         cursor: usize,
-        expected: []const u8,
-        expected_cursor: usize,
+        opened: []const u8,
+        opened_cursor: usize,
+        selected: []const u8,
+        selected_cursor: usize,
     }{
         .{
             .input = "@srcn",
             .cursor = "@srcn".len,
-            .expected = "@src/nested/",
-            .expected_cursor = "@src/nested/".len,
+            .opened = "@src/nested/",
+            .opened_cursor = "@src/nested/".len,
+            .selected = "@src/nested/ ",
+            .selected_cursor = "@src/nested/ ".len,
         },
         .{
             .input = "before @srcn tail",
             .cursor = "before @srcn".len,
-            .expected = "before @src/nested/ tail",
-            .expected_cursor = "before @src/nested/".len,
+            .opened = "before @src/nested/ tail",
+            .opened_cursor = "before @src/nested/".len,
+            .selected = "before @src/nested/ tail",
+            .selected_cursor = "before @src/nested/ ".len,
         },
     };
 
     for ([_]u8{ '\t', '\r' }) |byte| {
+        const opens = byte == '\t';
         for (cases) |case| {
             var app = try RoutingFakeApp.init(alloc);
             defer app.deinit();
@@ -7400,10 +6884,10 @@ test "app_input_runtime accepts typed directories with one synthetic slash" {
             presentRoutingFilePicker(&app);
             try Runtime(RoutingFakeApp).handleByte(&app, byte, 4096, 100);
 
-            try std.testing.expectEqualStrings(case.expected, app.input_runtime.edit_state.input.items);
-            try std.testing.expectEqual(case.expected_cursor, app.input_runtime.edit_state.cursor);
+            try std.testing.expectEqualStrings(if (opens) case.opened else case.selected, app.input_runtime.edit_state.input.items);
+            try std.testing.expectEqual(if (opens) case.opened_cursor else case.selected_cursor, app.input_runtime.edit_state.cursor);
             try std.testing.expectEqual(file_index.CandidateKind.directory, app.validated_file_completion_kind.?);
-            try std.testing.expect(app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
+            try std.testing.expectEqual(opens, app.input_runtime.picker.activeFilePickerQuery(&app.input_runtime.edit_state) != null);
             try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
         }
     }
@@ -8481,14 +7965,26 @@ test "app_input_runtime Ghostty Escape press closes the usage dashboard" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try feedRoutingBytes(&app, "\x1b[27;1:1u");
 
+    try std.testing.expect(!app.input_runtime.usage_menu.active);
+}
+
+test "app_input_runtime Escape on a usage detail screen goes back to the tables" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.detail = true;
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
+    try std.testing.expect(app.input_runtime.usage_menu.active);
+    try std.testing.expect(!app.input_runtime.usage_menu.detail);
+
+    try feedRoutingBytes(&app, "\x1b[27;1:1u");
     try std.testing.expect(!app.input_runtime.usage_menu.active);
 }
 
@@ -8496,11 +7992,8 @@ test "app_input_runtime Ghostty Escape release leaves the usage dashboard open" 
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
-    try app.input_runtime.usage_menu.openError(
-        alloc,
-        .days_30,
-        "usage is unavailable",
-    );
+    app.input_runtime.usage_menu.active = true;
+    app.input_runtime.usage_menu.period = .month;
 
     try feedRoutingBytes(&app, "\x1b[27;1:3u");
 
@@ -8875,7 +8368,7 @@ test "app_input_runtime owns pending image discard and release" {
     defer alloc.free(source_path);
     const snapshot_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(snapshot_root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ snapshot_root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ snapshot_root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = PendingImageLifecycleApp{ .alloc = alloc };
@@ -8980,7 +8473,7 @@ fn openRoutingModelMenu(app: *RoutingFakeApp, model_ids: []const []const u8) !vo
         const owned_id = try app.alloc.dupe(u8, model_id);
         var item_owns_id = false;
         errdefer if (!item_owns_id) app.alloc.free(owned_id);
-        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
+        const provider_end = std.mem.findScalar(u8, owned_id, '/') orelse owned_id.len;
         const provider = owned_id[0..provider_end];
         try menu.items.append(app.alloc, .{
             .id = owned_id,
@@ -9118,7 +8611,7 @@ fn setRoutingModelMenuReady(app: *RoutingFakeApp, model_ids: []const []const u8)
     for (model_ids) |model_id| {
         const owned_id = try app.alloc.dupe(u8, model_id);
         errdefer app.alloc.free(owned_id);
-        const provider_end = std.mem.indexOfScalar(u8, owned_id, '/') orelse owned_id.len;
+        const provider_end = std.mem.findScalar(u8, owned_id, '/') orelse owned_id.len;
         try app.model_cache.menu.items.append(app.alloc, .{
             .id = owned_id,
             .provider = owned_id[0..provider_end],
@@ -9265,7 +8758,7 @@ test "app_input_runtime ctrl+p model stage never submits the borrowed composer" 
 }
 
 test "app_input_runtime ctrl+p catalog enter failure restores the draft without later input" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9387,7 +8880,7 @@ test "app_input_runtime ctrl+d while the picker borrows the composer closes inst
 }
 
 test "app_input_runtime ctrl+p catalog enter failure still closes and restores the draft" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing.allocator();
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9449,7 +8942,7 @@ test "app_input_runtime image path paste stays text while ctrl+p inline stages b
     try writeTestImage(&tmp, "staged.png");
     const image_path = try realTmpPath(alloc, &tmp, "staged.png");
     defer alloc.free(image_path);
-    const paste = try std.fmt.allocPrint(alloc, "\x1b[200~{s}\x1b[201~", .{image_path});
+    const paste = try alloc.print("\x1b[200~{s}\x1b[201~", .{image_path});
     defer alloc.free(paste);
 
     var app = try RoutingFakeApp.init(alloc);
@@ -10008,7 +9501,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "decision-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "decision-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -10035,7 +9528,7 @@ test "app_input_runtime decision prompt owns and discards bracketed paste" {
 
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    const needle = try std.fmt.allocPrint(alloc, "decision prompt paste dropped bytes={d} reason=decision_prompt_active", .{payload.len});
+    const needle = try alloc.print("decision prompt paste dropped bytes={d} reason=decision_prompt_active", .{payload.len});
     defer alloc.free(needle);
     try std.testing.expect(std.mem.find(u8, trace, needle) != null);
 }
@@ -10061,7 +9554,7 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqualStrings("keep", app.submitted_prompt[0..app.submitted_prompt_len]);
 }
 
-test "app_input_runtime rejects a same-epoch enter after an otherwise valid paste" {
+test "app_input_runtime keeps a paste but not a same-epoch enter after it" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -10069,7 +9562,7 @@ test "app_input_runtime rejects a same-epoch enter after an otherwise valid past
 
     try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-    try std.testing.expectEqualStrings("prior", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("priornew", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
@@ -10165,7 +9658,7 @@ test "app_input_runtime keeps composer and decision input limits independent" {
 }
 
 test "app_input_runtime approval amendment paste finalization resets state after allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
@@ -10232,7 +9725,7 @@ test "app_input_runtime zero-content decision paste logs once" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "zero-decision-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "zero-decision-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -10327,7 +9820,7 @@ test "app_input_runtime question freeform accepts bracketed paste atomically" {
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
-test "app_input_runtime rejects unsafe suffixes for every root modal paste owner" {
+test "app_input_runtime keeps a modal paste but never runs its same-epoch suffix" {
     const alloc = std.testing.allocator;
 
     {
@@ -10354,7 +9847,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
 
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-        try std.testing.expectEqualStrings("keep", app.approval_prompt.decision.selectedDraft());
+        try std.testing.expectEqualStrings("keepnew", app.approval_prompt.decision.selectedDraft());
         try std.testing.expect(app.worker.submitted_permission == null);
         try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     }
@@ -10376,7 +9869,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
         try std.testing.expectEqualStrings(
-            "keep",
+            "keepnew",
             app.question_prompt.entries.items[0].freeform_buffer.items,
         );
         try std.testing.expect(app.question_prompt.isActive());
@@ -10399,7 +9892,7 @@ test "app_input_runtime question freeform rejects paste beyond input limit" {
     app.question_prompt.moveChoice(-1);
 
     try feedRoutingBytes(&app, "\x1b[200~");
-    try feedRoutingBytes(&app, "x" ** 4097);
+    try feedRoutingBytes(&app, text_utils.repeat("x", 4097));
     try feedRoutingBytes(&app, "\x1b[201~");
 
     try std.testing.expectEqual(paste_framing.Owner.none, app.input_runtime.paste.owner);
@@ -11235,7 +10728,7 @@ test "app_input_runtime new paste traces and clears stale inactive state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "stale-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "stale-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -11303,7 +10796,7 @@ test "app_input_runtime modal disappearance keeps decision-owned paste pinned" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "modal-disappear-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "modal-disappear-paste.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -12105,7 +11598,7 @@ test "primary composer pointer press places the caret without starting a drag se
 
     const prefix_cells: u16 = @intCast(visual_layout.inputPrefix(0).cell_width);
     var report: [48]u8 = undefined;
-    const click = try std.fmt.bufPrint(
+    const click = try std.mem.print(
         &report,
         "\x1b[<0;{d};22M\x1b[<0;{d};22m",
         .{ prefix_cells + 4, prefix_cells + 4 },
@@ -12167,7 +11660,7 @@ test "file approval digit submits the mapped choice when the modal is ready" {
 }
 
 test "file approval keeps the active review when feedback materialization fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     try installReadyRoutingFileApproval(&app);
@@ -12412,7 +11905,7 @@ test "bare escape trace captures approval interrupt context" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "escape-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "escape-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -13556,7 +13049,7 @@ test "app_input_runtime routes image slash commands before inline attachment ext
     for ([_][]const u8{ "/image", "/img" }) |command| {
         var app = FakeSubmitApp{ .alloc = alloc, .prompt_admitted = false };
         defer app.deinit();
-        const input = try std.fmt.allocPrint(alloc, "{s} {s}", .{ command, image_path });
+        const input = try alloc.print("{s} {s}", .{ command, image_path });
         defer alloc.free(input);
         try app.input_runtime.edit_state.input.appendSlice(alloc, input);
         app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
@@ -13611,7 +13104,7 @@ test "app_input_runtime keeps a repeated image command local while an image is p
         defer app.deinit();
         try appendOwnedPendingImage(&app, 1, "/tmp/first.png");
         app.next_image_id_counter = 2;
-        const input = try std.fmt.allocPrint(alloc, "[Image #1]{s} {s}", .{ command, second_path });
+        const input = try alloc.print("[Image #1]{s} {s}", .{ command, second_path });
         defer alloc.free(input);
         try app.input_runtime.edit_state.input.appendSlice(alloc, input);
         try appendImageTokenForPlaceholderAt(&app, 1, 0);
@@ -13653,7 +13146,7 @@ test "app_input_runtime attaches three sequential image commands in appearance o
     for (names, 1..) |name, expected_id| {
         const path = try realTmpPath(alloc, &tmp, name);
         defer alloc.free(path);
-        const suffix = try std.fmt.allocPrint(alloc, "/image {s}", .{path});
+        const suffix = try alloc.print("/image {s}", .{path});
         defer alloc.free(suffix);
         try app.input_runtime.insertionState().insertSlice(alloc, suffix, .preserve);
 
@@ -13682,7 +13175,7 @@ test "app_input_runtime submits one prompt carrying every image attached by repe
     defer app.deinit();
     try appendOwnedPendingImage(&app, 1, "/tmp/first.png");
     app.next_image_id_counter = 2;
-    const attach = try std.fmt.allocPrint(alloc, "[Image #1]/image {s}", .{second_path});
+    const attach = try alloc.print("[Image #1]/image {s}", .{second_path});
     defer alloc.free(attach);
     try app.input_runtime.edit_state.input.appendSlice(alloc, attach);
     try appendImageTokenForPlaceholderAt(&app, 1, 0);
@@ -13722,7 +13215,7 @@ test "app_input_runtime rejected second image keeps the first pending image and 
         .snapshot_dir = snapshot_dir,
     };
     defer app.deinit();
-    const attach_first = try std.fmt.allocPrint(alloc, "/image {s}", .{first_path});
+    const attach_first = try alloc.print("/image {s}", .{first_path});
     defer alloc.free(attach_first);
     try app.input_runtime.insertionState().insertSlice(alloc, attach_first, .preserve);
     try Runtime(FakeSubmitApp).submit(&app, 100);
@@ -13732,7 +13225,7 @@ test "app_input_runtime rejected second image keeps the first pending image and 
 
     const missing = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(missing);
-    const attach_missing = try std.fmt.allocPrint(alloc, "/image {s}/absent.png", .{missing});
+    const attach_missing = try alloc.print("/image {s}/absent.png", .{missing});
     defer alloc.free(attach_missing);
     try app.input_runtime.insertionState().insertSlice(alloc, attach_missing, .preserve);
 
@@ -13749,20 +13242,20 @@ test "app_input_runtime rejected second image keeps the first pending image and 
     try std.testing.expectEqual(@as(usize, 0), app.queue_accept_count);
     try std.testing.expect(app.last_prompt == null);
 
-    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.lastIndexOfScalar(u8, first_snapshot, '/').?], .{});
+    var probe = try std.Io.Dir.openDirAbsolute(std.testing.io, first_snapshot[0..std.mem.findScalarLast(u8, first_snapshot, '/').?], .{});
     defer probe.close(std.testing.io);
-    var snapshot_file = try probe.openFile(std.testing.io, std.fs.path.basename(first_snapshot), .{});
+    var snapshot_file = try probe.openFile(std.testing.io, std.Io.Dir.path.basename(first_snapshot), .{});
     snapshot_file.close(std.testing.io);
 }
 
 test "app_input_runtime repeated image command releases every allocation on failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTestImage(&tmp, "second.png");
     const second_path = try realTmpPath(alloc, &tmp, "second.png");
     defer alloc.free(second_path);
-    const input = try std.fmt.allocPrint(alloc, "[Image #1]/image {s}", .{second_path});
+    const input = try alloc.print("[Image #1]/image {s}", .{second_path});
     defer alloc.free(input);
 
     var counting = std.testing.FailingAllocator.init(alloc, .{});
@@ -14037,7 +13530,7 @@ test "app_input_runtime disabled prompt history skips composer recall recording"
 test "app_input_runtime accepted large paste recalls compact and editable" {
     const alloc = std.testing.allocator;
     const placeholder = "[Pasted text #7, 1 line]";
-    const backing = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const backing = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
@@ -14090,7 +13583,7 @@ test "app_input_runtime recalled image and skill resubmit with fresh provenance"
     defer alloc.free(image_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14098,7 +13591,7 @@ test "app_input_runtime recalled image and skill resubmit with fresh provenance"
         .snapshot_dir = snapshot_dir,
     };
     defer app.deinit();
-    const input = try std.fmt.allocPrint(alloc, "{s} $review", .{image_path});
+    const input = try alloc.print("{s} $review", .{image_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     app.input_runtime.edit_state.cursor = input.len;
@@ -14166,7 +13659,7 @@ test "app_input_runtime recalls image after post-ack finalization failure" {
     defer alloc.free(image_path);
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14225,7 +13718,7 @@ test "app_input_runtime terminal pending cleanup preserves image history" {
         defer alloc.free(image_path);
         const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(root);
-        const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+        const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
         defer alloc.free(snapshot_dir);
 
         var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -14324,7 +13817,7 @@ test "app_input_runtime preflight rejection removes captured inline snapshot" {
     defer alloc.free(image_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14442,7 +13935,7 @@ test "app_input_runtime queue rejection removes captured inline snapshot" {
     defer alloc.free(image_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{
@@ -14480,14 +13973,14 @@ fn checkAcceptedPromptCleanupAcrossAllocationFailures(failing: *std.testing.Fail
 }
 
 test "app_input_runtime accepted prompt cleanup survives allocation failures" {
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try checkAcceptedPromptCleanupAcrossAllocationFailures(&probe);
     const allocation_count = probe.alloc_index;
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         checkAcceptedPromptCleanupAcrossAllocationFailures(&failing) catch |err| {
@@ -14573,7 +14066,7 @@ test "app_input_runtime inline image edits retain draft IDs and snapshots on fai
     defer alloc.free(root);
     const existing = try realTmpPath(alloc, &tmp, "existing.png");
     defer alloc.free(existing);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     const input = " \t[Image #8]\n@./first.png @./second.png  \r\n";
     const cases = [_]struct { capture_error: ?anyerror = null, queue_admitted: bool = true, enqueue_failure: bool = false, first_id: usize = 9, expected_error: ?anyerror = null }{
@@ -14664,13 +14157,13 @@ test "app_input_runtime inline image edits roll back across allocation failures"
     try writeTestImage(&tmp, "first.png");
     const root = try realTmpPath(std.testing.allocator, &tmp, ".");
     defer std.testing.allocator.free(root);
-    const snapshot_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "snapshots" });
     defer std.testing.allocator.free(snapshot_dir);
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try check_inline_image_edit_allocation_failure(&probe, root, snapshot_dir);
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
     for (0..probe.alloc_index) |index| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = index });
         check_inline_image_edit_allocation_failure(&failing, root, snapshot_dir) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
         };
@@ -14701,8 +14194,7 @@ test "app_input_runtime submit projects selected skill spans onto transformed pr
         },
     });
 
-    const prefix = try std.fmt.allocPrint(
-        alloc,
+    const prefix = try alloc.print(
         "  [Pasted text #7, 1 line] {s}, ",
         .{image_path},
     );
@@ -14816,7 +14308,7 @@ test "app_input_runtime submit keeps selected skill on its exact marker after im
             },
         });
         var path_buf: [32]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "/tmp/image-{d}.png", .{id});
+        const path = try std.mem.print(&path_buf, "/tmp/image-{d}.png", .{id});
         try appendOwnedPendingImage(&app, id, path);
     }
 
@@ -14977,7 +14469,7 @@ test "app_input_runtime submits nonexistent relative and absolute image paths as
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const absolute_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
+    const absolute_path = try std.Io.Dir.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(absolute_path);
 
     for ([_][]const u8{ "fx-missing-image.png", absolute_path }) |missing_path| {
@@ -15041,7 +14533,7 @@ test "app_input_runtime preserves punctuation after a submitted image path" {
 
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
-    const input = try std.fmt.allocPrint(alloc, "inspect {s},", .{image_path});
+    const input = try alloc.print("inspect {s},", .{image_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     app.input_runtime.edit_state.cursor = input.len;
@@ -15092,7 +14584,7 @@ test "app_input_runtime queues existing and typed images in placeholder order" {
     defer app.deinit();
     try appendOwnedPendingImage(&app, 7, "/tmp/existing.png");
     app.next_image_id_counter = 8;
-    const input = try std.fmt.allocPrint(alloc, "before [Image #7] then {s}", .{typed_path});
+    const input = try alloc.print("before [Image #7] then {s}", .{typed_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     try app.input_runtime.entities.image_tokens.append(alloc, .{
@@ -15131,7 +14623,7 @@ test "app_input_runtime restores composer and pending images after late enqueue 
     try appendOwnedPendingImage(&app, 7, "/tmp/original-a.png");
     try appendOwnedPendingImage(&app, 11, "/tmp/original-b.png");
     app.next_image_id_counter = 12;
-    const input = try std.fmt.allocPrint(alloc, "[Image #11] {s} [Image #7]", .{typed_path});
+    const input = try alloc.print("[Image #11] {s} [Image #7]", .{typed_path});
     defer alloc.free(input);
     try app.input_runtime.edit_state.input.appendSlice(alloc, input);
     try app.input_runtime.entities.image_tokens.append(alloc, .{
@@ -15175,10 +14667,9 @@ test "app_input_runtime inline image rejection preserves the draft and rolls bac
     defer alloc.free(second_path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
-    const input = try std.fmt.allocPrint(
-        alloc,
+    const input = try alloc.print(
         "draft [Image #7] {s} {s}",
         .{ first_path, second_path },
     );
@@ -15243,7 +14734,7 @@ test "app_input_runtime pasted image rejection preserves the raw paste and exist
 
     const path = try realTmpPath(alloc, &tmp, "rejected.png");
     defer alloc.free(path);
-    const expected = try std.fmt.allocPrint(alloc, "draft {s}", .{path});
+    const expected = try alloc.print("draft {s}", .{path});
     defer alloc.free(expected);
 
     var app = FakeSubmitApp{
@@ -15278,7 +14769,7 @@ test "app_input_runtime pasted image rejection preserves the raw paste and exist
         " next",
         FakeSubmitApp.input_byte_limit,
     );
-    const expected_after = try std.fmt.allocPrint(alloc, "{s} next", .{expected});
+    const expected_after = try alloc.print("{s} next", .{expected});
     defer alloc.free(expected_after);
     try std.testing.expectEqualStrings(
         expected_after,
@@ -15535,7 +15026,7 @@ test "app_input_runtime image path paste rejects the complete edit without chang
     defer alloc.free(path_a);
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
-    const paste = try std.fmt.allocPrint(alloc, "{s} {s}", .{ path_a, path_b });
+    const paste = try alloc.print("{s} {s}", .{ path_a, path_b });
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15579,15 +15070,14 @@ test "app_input_runtime image path paste commits complete text and attachments i
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
 
-    const paste = try std.fmt.allocPrint(
-        alloc,
+    const paste = try alloc.print(
         "before {s} middle {s} after",
         .{ path_a, path_b },
     );
     defer alloc.free(paste);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -15677,7 +15167,7 @@ test "app_input_runtime image path paste keeps trailing punctuation outside the 
     try writeTestImage(&tmp, "punctuated.png");
     const path = try realTmpPath(alloc, &tmp, "punctuated.png");
     defer alloc.free(path);
-    const paste = try std.fmt.allocPrint(alloc, "{s},", .{path});
+    const paste = try alloc.print("{s},", .{path});
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15732,14 +15222,14 @@ test "app_input_runtime image path paste stays atomic across allocation failures
     const path = try realTmpPath(std.testing.allocator, &tmp, "oom.png");
     defer std.testing.allocator.free(path);
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     try checkImagePathPasteAllocationFailureIsAtomic(&probe, path);
     const allocation_count = probe.alloc_index;
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
     for (0..allocation_count) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         checkImagePathPasteAllocationFailureIsAtomic(&failing, path) catch |err| {
@@ -15764,7 +15254,7 @@ test "app_input_runtime oversized image path paste reports rejection without a s
     defer alloc.free(path);
     const root = try realTmpPath(alloc, &tmp, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
 
     var app = FakeSubmitApp{ .alloc = alloc, .snapshot_dir = snapshot_dir };
@@ -15791,7 +15281,7 @@ test "app_input_runtime repeated image path paste appends keep pending images so
     defer alloc.free(path_a);
     const path_b = try realTmpPath(alloc, &tmp, "b.png");
     defer alloc.free(path_b);
-    const paste = try std.fmt.allocPrint(alloc, "{s} {s}", .{ path_a, path_b });
+    const paste = try alloc.print("{s} {s}", .{ path_a, path_b });
     defer alloc.free(paste);
 
     var app = FakeSubmitApp{ .alloc = alloc };
@@ -15810,7 +15300,7 @@ test "app_input_runtime finalizePastedBlock registers large text placeholder ato
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     try app.input_runtime.insertionState().insertByte(alloc, 'a', .clear);
     try app.input_runtime.paste.buffer.appendSlice(alloc, large_paste);
@@ -15828,7 +15318,7 @@ test "app_input_runtime finalizePastedBlock registers large text placeholder ato
 
 test "app_input_runtime large paste replaces selection within its expanded byte budget" {
     const alloc = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
     try app.input_runtime.textReplacementState().replace(alloc, "abcde");
@@ -15849,7 +15339,7 @@ test "app_input_runtime rejects a large paste when its backing text does not fit
     const alloc = std.testing.allocator;
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     try app.input_runtime.textReplacementState().replace(alloc, "draft");
     try app.input_runtime.paste.buffer.appendSlice(alloc, large_paste);
 
@@ -15866,7 +15356,7 @@ test "app_input_runtime rejects a large paste when its backing text does not fit
 
 test "app_input_runtime multiple large pastes share one expanded byte budget" {
     const alloc = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
     var app = FakeSubmitApp{ .alloc = alloc };
     defer app.deinit();
 
@@ -15884,8 +15374,8 @@ test "app_input_runtime multiple large pastes share one expanded byte budget" {
 }
 
 test "app_input_runtime finalizePastedBlock leaves large paste unchanged on allocation failure" {
-    const base = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const base = testing_allocator.no_resize;
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     var saw_failure = false;
     var fail_index: usize = 0;
@@ -15914,8 +15404,8 @@ test "app_input_runtime finalizePastedBlock leaves large paste unchanged on allo
 }
 
 test "app_input_runtime finishPaste leaves no orphan placeholder after late finalization failure" {
-    const base = std.testing.allocator;
-    const large_paste = "x" ** (paste_blocks.large_paste_char_threshold + 1);
+    const base = testing_allocator.no_resize;
+    const large_paste = text_utils.repeat("x", paste_blocks.large_paste_char_threshold + 1);
 
     var saw_failure = false;
     var fail_index: usize = 0;
@@ -15924,7 +15414,7 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
         defer tmp.cleanup();
         const root = try io_mod.dirRealpathAlloc(base, tmp.dir, ".");
         defer base.free(root);
-        const trace_path = try std.fs.path.join(base, &.{ root, "late-finalize-failed.log" });
+        const trace_path = try std.Io.Dir.path.join(base, &.{ root, "late-finalize-failed.log" });
         defer base.free(trace_path);
 
         debug_trace.resetForTest();
@@ -15956,8 +15446,7 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
 
             const trace = try readTraceFileForTest(base, trace_path);
             defer base.free(trace);
-            const needle = try std.fmt.allocPrint(
-                base,
+            const needle = try base.print(
                 "composer paste dropped bytes={d} reason=finalize_failed error=OutOfMemory",
                 .{large_paste.len},
             );
@@ -15969,12 +15458,12 @@ test "app_input_runtime finishPaste leaves no orphan placeholder after late fina
 }
 
 test "app_input_runtime composer paste finalization failure clears inactive state" {
-    const base = std.testing.allocator;
+    const base = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(base, tmp.dir, ".");
     defer base.free(root);
-    const trace_path = try std.fs.path.join(base, &.{ root, "finalize-failed-paste.log" });
+    const trace_path = try std.Io.Dir.path.join(base, &.{ root, "finalize-failed-paste.log" });
     defer base.free(trace_path);
 
     debug_trace.resetForTest();
@@ -16033,7 +15522,7 @@ test "app input bridge loads the most recent durable history in chronological or
     defer seed.deinit(alloc);
     for (0..101) |index| {
         var text_buf: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&text_buf, "prompt-{d}", .{index});
+        const text = try std.mem.print(&text_buf, "prompt-{d}", .{index});
         _ = try seed.append(alloc, @intCast(index), "/tmp/workspace", text);
     }
 

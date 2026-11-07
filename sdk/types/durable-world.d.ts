@@ -15,9 +15,12 @@ export interface World {
     list(params: unknown): unknown;
   };
   readonly streams: {
-    write(runId: string, name: string, chunk: string): unknown;
+    /** A session's view is written as text; each prompt image as one chunk of bytes. */
+    write(runId: string, name: string, chunk: string | Uint8Array): unknown;
     writeMulti?(runId: string, name: string, chunks: string[]): unknown;
     get(runId: string, name: string, startIndex?: number): unknown;
+    /** Read for a session's images: a page of chunks, `{ data: { data }[] }`. */
+    getChunks(runId: string, name: string, options?: { limit?: number; cursor?: string }): unknown;
     getInfo(runId: string, name: string): unknown;
   };
   queue(queueName: string, message: unknown, options?: unknown): unknown;
@@ -41,10 +44,32 @@ export type WorldSource = World | (() => World | Promise<World>);
 export type WorldOptions = {
   /** The durability's name in errors. Default `"world"`. */
   name?: string;
-  /** The queue keeps a message until a delivery acknowledges it, across crashes. When false, `prompt()` stores the prompt first. Default false. */
+  /**
+   * The store this World keeps sessions in. Queue messages name it, so one route hands each delivery to the agents on
+   * its store, and on one store an agent name belongs to one configuration. Give each customer of an app a store of its
+   * own. Default the durability's `name`.
+   */
+  store?: string;
+  /** The queue keeps a message until a delivery acknowledges it, across crashes. `prompt()` stores the prompt first either way. Default false. */
   queueDurable?: boolean;
   /** How often a waiting worker reads the session again. Default 1000. */
   pollMs?: number;
+  /**
+   * The queue keeps a message from every other delivery while one handles it, and delivers it again once that
+   * delivery's process is gone, as Vercel Queues does. Without liveness, a worker then holds its session for as long as
+   * its delivery runs, up to its deadline, and renews nothing: the next delivery of the same message takes the session
+   * over. The World must pass each handler call the queue's `messageId` and delivery `attempt`. A worker with no
+   * deadline renews its lease all the same. Default false.
+   */
+  queueLeases?: boolean;
+  /**
+   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session, and the queue keeps
+   * the prompt as a backstop it delivers only after that request's deadline. The request's lease names the backstop, so
+   * if the request died, the backstop takes the session over. Default true with `queueLeases`.
+   */
+  runInRequest?: boolean;
+  /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */
+  waitUntil?(work: Promise<void>): void;
   /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
   leaseMs?: number;
   /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. No limit by default. */

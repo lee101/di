@@ -1,4 +1,6 @@
 const std = @import("std");
+const execution_observation = @import("../agent/runtime/observation.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const authority = @import("authority.zig");
 const child_state = @import("child_state.zig");
@@ -60,6 +62,15 @@ fn unavailableChildRun(
     return error.ProviderFailed;
 }
 
+test "managed execution receipts retain the pending contract" {
+    var runtime: Runtime = undefined;
+    for ([_]bool{ false, true }) |pending| {
+        const result = try runtime.encodeManaged(std.testing.allocator, .{ .ok = true, .pending = pending });
+        defer std.testing.allocator.free(result.body);
+        try std.testing.expectEqual(pending, result.pending);
+    }
+}
+
 pub const ProgressSink = struct {
     context: *anyopaque,
     publish_fn: *const fn (*anyopaque, types.SubagentStatus) void,
@@ -90,6 +101,7 @@ pub const ModelOverrideResolver = struct {
 };
 
 pub const ExecuteOptions = struct {
+    observer: ?*execution_observation.Observer = null,
     caller_id: []const u8,
     invocation_id: []const u8,
     parent_permission_mode: types.PermissionMode = .yolo,
@@ -108,6 +120,7 @@ pub const ExecuteOptions = struct {
 };
 
 pub const ManagedExecutionResult = struct {
+    pending: bool = false,
     success: bool,
     body: []u8,
     /// The final status model is owned by the result allocator.
@@ -124,7 +137,8 @@ pub const ApprovalResolveOptions = struct {
 
 pub const Runtime = struct {
     alloc: Allocator,
-    backend: child_state.Backend,
+    /// The parent's children, borrowed until deinit (D22).
+    children: *child_state.V2Children,
     root_id: []u8,
     host_authority: authority.HostResolver,
     child_runner: ChildRunner,
@@ -138,38 +152,18 @@ pub const Runtime = struct {
     const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
     pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
 
-    /// Returns a host only after abandoned child work has been recovered.
-    /// Borrows the store and callback contexts until deinit.
-    pub fn create(
-        alloc: Allocator,
-        sessions: *session_store.Store,
-        root_id: []const u8,
-        host_authority: authority.HostResolver,
-        child_runner: ChildRunner,
-    ) !*Runtime {
-        return createWith(alloc, .{ .v1 = sessions }, root_id, host_authority, child_runner);
-    }
-
-    /// A host over a v2 parent, whose children live in its log (D22).
-    /// Borrows `children` and the callback contexts until deinit; the
-    /// parent stays open until then (`tla/Wiring.tla`
+    /// A host over a parent whose children live in its log (D22), returned
+    /// only after abandoned child work has been recovered. Borrows
+    /// `children` and the callback contexts until deinit; the parent stays
+    /// open until then (`tests/tla/session_manager/Wiring.tla`
     /// ParentOutlivesChildren).
-    pub fn createV2(
+    pub fn create(
         alloc: Allocator,
         children: *child_state.V2Children,
         host_authority: authority.HostResolver,
         child_runner: ChildRunner,
     ) !*Runtime {
-        return createWith(alloc, .{ .v2 = children }, children.parent.id(), host_authority, child_runner);
-    }
-
-    fn createWith(
-        alloc: Allocator,
-        backend: child_state.Backend,
-        root_id: []const u8,
-        host_authority: authority.HostResolver,
-        child_runner: ChildRunner,
-    ) !*Runtime {
+        const root_id = children.parent.id();
         try domain.validateId(root_id);
         const runtime = try alloc.create(Runtime);
         errdefer alloc.destroy(runtime);
@@ -177,7 +171,7 @@ pub const Runtime = struct {
         errdefer alloc.free(owned_root);
         runtime.* = .{
             .alloc = alloc,
-            .backend = backend,
+            .children = children,
             .root_id = owned_root,
             .host_authority = host_authority,
             .child_runner = child_runner,
@@ -189,7 +183,7 @@ pub const Runtime = struct {
             .alloc = alloc,
         };
         runtime.authority_resolver = .{
-            .backend = backend,
+            .children = children,
             .root_id = runtime.root_id,
             .host = host_authority,
         };
@@ -211,18 +205,8 @@ pub const Runtime = struct {
         alloc.destroy(self);
     }
 
-    pub fn rebind(
-        self: *Runtime,
-        sessions: *session_store.Store,
-        child_runner_context: ?*anyopaque,
-        host_authority: authority.HostResolver,
-    ) void {
-        self.backend = .{ .v1 = sessions };
-        self.rebindHost(child_runner_context, host_authority);
-    }
-
     /// Points the host's callbacks at a host context that moved; the
-    /// backend stays as it is.
+    /// children stay as they are.
     pub fn rebindHost(
         self: *Runtime,
         child_runner_context: ?*anyopaque,
@@ -230,11 +214,11 @@ pub const Runtime = struct {
     ) void {
         self.host_authority = host_authority;
         self.child_runner.context = child_runner_context;
-        self.authority_resolver.backend = self.backend;
+        self.authority_resolver.children = self.children;
         self.authority_resolver.root_id = self.root_id;
         self.authority_resolver.host = host_authority;
-        self.managed.backend = self.backend;
-        self.managed.state_store.backend = self.backend;
+        self.managed.children = self.children;
+        self.managed.state_store.children = self.children;
         self.managed.services.context = self;
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
@@ -340,6 +324,17 @@ pub const Runtime = struct {
                             };
                             switch (result) {
                                 .receipt => |delivery| {
+                                    if (options.observer) |observer| observer.emit(.{ .delegation = .{
+                                        .call_id = options.invocation_id,
+                                        .child_id = target.child_id,
+                                        .work_id = target.work_id,
+                                        .operation_id = operation_id,
+                                        .phase = switch (delivery) {
+                                            .queued => .feedback_queued,
+                                            .applied => .feedback_applied,
+                                            .not_applied => .feedback_not_applied,
+                                        },
+                                    } });
                                     if (delivery == .queued) {
                                         const queued = queued_receipt.?;
                                         queued_receipt = null;
@@ -370,7 +365,8 @@ pub const Runtime = struct {
                             });
                         },
                         .ready => |ready| {
-                            const result = try self.observeManagedState(
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
+                            const result = self.observeManagedState(
                                 alloc,
                                 ready.child_id,
                                 operation_id,
@@ -379,15 +375,22 @@ pub const Runtime = struct {
                                 options.cancel_flag,
                                 options.steering_worker,
                                 options.model_capability_resolver,
-                            );
+                            ) catch |err| {
+                                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (err == error.Cancelled) .cancelled else .failed } });
+                                return err;
+                            };
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (result.pending) .yielded else if (result.success) .completed else .failed } });
                             break :blk result;
                         },
-                        .completed => |completed| break :blk self.completeManagedResult(
-                            alloc,
-                            completed.child_id,
-                            operation_id,
-                            completed.observation,
-                        ),
+                        .completed => |completed| {
+                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
+                            break :blk self.completeManagedResult(
+                                alloc,
+                                completed.child_id,
+                                operation_id,
+                                completed.observation,
+                            );
+                        },
                     }
                 }
             },
@@ -467,7 +470,7 @@ pub const Runtime = struct {
     fn managedOwnerValue(self: *Runtime) managed_owner.Owner {
         return .{
             .alloc = self.alloc,
-            .backend = self.backend,
+            .children = self.children,
             .state_store = self.childStateStore(),
             .services = .{
                 .context = self,
@@ -480,10 +483,7 @@ pub const Runtime = struct {
     }
 
     fn childStateStore(self: *Runtime) child_state.Store {
-        return .{
-            .backend = self.backend,
-            .parent_id = self.root_id,
-        };
+        return .{ .children = self.children, .parent_id = self.root_id };
     }
 
     const ManagedAdmission = union(enum) {
@@ -561,7 +561,7 @@ pub const Runtime = struct {
                 if (request.override().present()) "yes" else "no",
             },
         );
-        var lock = try self.managed.state_store.acquireLock(alloc);
+        var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(alloc);
         defer registry.deinit(alloc);
@@ -587,7 +587,6 @@ pub const Runtime = struct {
                 );
             }
             try self.ensureManagedChildSession(
-                alloc,
                 existing.id,
                 operation_id,
                 defaults,
@@ -619,12 +618,7 @@ pub const Runtime = struct {
                 defer alloc.free(child_id);
                 try registry.appendOneOff(alloc, child_id, active);
                 try self.managed.state_store.save(alloc, registry);
-                try self.ensureManagedChildSession(
-                    alloc,
-                    child_id,
-                    active.id,
-                    defaults,
-                );
+                try self.ensureManagedChildSession(child_id, active.id, defaults);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -663,9 +657,9 @@ pub const Runtime = struct {
                         active,
                     );
                     try self.managed.state_store.save(alloc, registry);
-                    // A v2 child lost before its first turn has no log to
+                    // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
-                    if (self.backend == .v2) try self.ensureManagedChildSession(alloc, started.id, active.id, defaults);
+                    try self.ensureManagedChildSession(started.id, active.id, defaults);
                     return managedAdmissionReady(alloc, started.id);
                 }
                 const child_id = try session_store.generateSessionId(alloc);
@@ -678,12 +672,7 @@ pub const Runtime = struct {
                     active,
                 );
                 try self.managed.state_store.save(alloc, registry);
-                try self.ensureManagedChildSession(
-                    alloc,
-                    child_id,
-                    active.id,
-                    defaults,
-                );
+                try self.ensureManagedChildSession(child_id, active.id, defaults);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
@@ -694,65 +683,27 @@ pub const Runtime = struct {
 
     fn ensureManagedChildSession(
         self: *Runtime,
-        alloc: Allocator,
         child_id: []const u8,
         work_id: []const u8,
         defaults: Defaults,
     ) !void {
-        const sessions = switch (self.backend) {
-            .v2 => |children| {
-                // A v2 child reaches the disk with its first turn, under
-                // the id its spawn line names (D34); until then only its
-                // settings wait here.
-                try children.rememberSeed(child_id, .{
-                    .preferences = .{
-                        .provider = defaults.provider,
-                        .model = @constCast(defaults.model),
-                        .effort = defaults.effort,
-                        .fast_mode = defaults.fast_mode,
-                        .ultrafast_mode = defaults.ultrafast_mode,
-                    },
-                    .language = defaults.conversation_language,
-                });
-                debug_trace.logf(
-                    "subagent",
-                    "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
-                    .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
-                );
-                return;
+        // A child reaches the disk with its first turn, under the id its
+        // spawn line names (D34); until then only its settings wait here.
+        try self.children.rememberSeed(child_id, .{
+            .preferences = .{
+                .provider = defaults.provider,
+                .model = @constCast(defaults.model),
+                .effort = defaults.effort,
+                .fast_mode = defaults.fast_mode,
+                .ultrafast_mode = defaults.ultrafast_mode,
             },
-            .v1 => |value| value,
-        };
-        var state = try freshChildState(
-            alloc,
-            child_id,
-            sessions.workspace_root,
-            work_id,
-            defaults,
+            .language = defaults.conversation_language,
+        });
+        debug_trace.logf(
+            "subagent",
+            "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
+            .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
         );
-        defer state.deinit(alloc);
-        if (sessions.startWritableSession(alloc, state)) |writable_value| {
-            var writable = writable_value;
-            writable.log.park();
-            writable.deinit(alloc);
-            debug_trace.logf(
-                "subagent",
-                "child session created child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
-                .{
-                    child_id,
-                    work_id,
-                    @tagName(state.preferences.provider),
-                    state.preferences.model,
-                    state.preferences.effort.label(),
-                    state.preferences.fast_mode,
-                    state.preferences.ultrafast_mode,
-                },
-            );
-        } else |err| switch (err) {
-            error.SessionAlreadyExists => {},
-            else => return err,
-        }
-        try self.childStateStore().markChildSession(alloc, child_id);
     }
 
     fn observeManagedState(
@@ -810,7 +761,7 @@ pub const Runtime = struct {
                     if (steering_worker) |worker| {
                         if (worker.hasPendingPlainSteering()) {
                             debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
-                            const pending_text = try std.fmt.allocPrint(alloc, "{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
+                            const pending_text = try alloc.print("{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
                             defer alloc.free(pending_text);
                             var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
                             if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
@@ -907,7 +858,7 @@ pub const Runtime = struct {
                 .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
                 .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
                 .delivered = false,
-                .receipt_sequence = @as(u64, @intFromEnum(update.delivery)) + 1,
+                .receipt_sequence = @as(u64, @backingInt(update.delivery)) + 1,
             });
         }
         return results.toOwnedSlice(arena);
@@ -1009,35 +960,15 @@ pub const Runtime = struct {
         child_id: []const u8,
         work_id: []const u8,
     ) !?[]u8 {
-        switch (self.backend) {
-            .v1 => |sessions| {
-                var state = sessions.loadReadOnly(alloc, child_id) catch return null;
-                defer state.deinit(alloc);
-                const text = assistantTextForWork(state.history, work_id) orelse return null;
-                return @as(?[]u8, try alloc.dupe(u8, text));
-            },
-            .v2 => |children| {
-                const history = children.parent.store.childHistory(alloc, child_id) catch return null;
-                defer types.freeHistoryTurnSlice(alloc, history);
-                const text = assistantTextForWork(history, work_id) orelse return null;
-                return @as(?[]u8, try alloc.dupe(u8, text));
-            },
-        }
+        const history = self.children.parent.store.childHistory(alloc, child_id) catch return null;
+        defer types.freeHistoryTurnSlice(alloc, history);
+        const text = assistantTextForWork(history, work_id) orelse return null;
+        return @as(?[]u8, try alloc.dupe(u8, text));
     }
 
     /// A child's saved preferences, read without opening it. Caller owns.
     fn childPreferences(self: *Runtime, alloc: Allocator, child_id: []const u8) !session_codec.DurableSessionPreferences {
-        switch (self.backend) {
-            .v1 => |sessions| {
-                var state = try sessions.loadReadOnly(alloc, child_id);
-                defer state.deinit(alloc);
-                const model = try alloc.dupe(u8, state.preferences.model);
-                var preferences = state.preferences;
-                preferences.model = model;
-                return preferences;
-            },
-            .v2 => |children| return children.parent.store.childPreferences(alloc, child_id),
-        }
+        return self.children.parent.store.childPreferences(alloc, child_id);
     }
 
     fn encodeManaged(
@@ -1049,6 +980,7 @@ pub const Runtime = struct {
         const body = try model_contract.encodeResultAlloc(alloc, result);
         return .{
             .success = result.ok,
+            .pending = result.pending,
             .body = body,
         };
     }
@@ -1153,12 +1085,12 @@ fn operationIdAlloc(
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(alloc, "fxop:2:m:{d}:{s}", .{ epoch, &hex });
+    return alloc.print("fxop:2:m:{d}:{s}", .{ epoch, &hex });
 }
 
 fn checkYieldedOwnership(alloc: Allocator) !void {
-    var runtime = Runtime{ .alloc = alloc, .backend = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
-    runtime.managed = .{ .alloc = alloc, .backend = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    runtime.managed = .{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
     defer runtime.yielded.deinit(alloc);
     defer while (runtime.yielded.items.len > 0) {
         const item = runtime.yielded.items[0];
@@ -1184,35 +1116,20 @@ fn checkYieldedOwnership(alloc: Allocator) !void {
 }
 
 test "subagent yielded identity is owned and allocation failures do not leak" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkYieldedOwnership, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkYieldedOwnership, .{});
 }
 
 test "subagent admission preserves an undelivered result before advancing its child" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var history = [_]types.HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("old task"), .work_id = @constCast("old-work") },
         .assistant = @constCast("ORIGINAL_RESULT"),
     } }};
-    var loaded = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("frozen-child"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        .history = &history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer loaded.deinit(alloc);
-    var runtime = Runtime{ .alloc = alloc, .backend = .{ .v1 = &sessions }, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    (try parent.openChild("frozen-child", &history)).close();
+    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
     defer runtime.removeYielded("frozen-child", "old-work");
@@ -1235,7 +1152,7 @@ test "subagent admission preserves an undelivered result before advancing its ch
 
 test "parallel subagent wait bookkeeping stays serialized" {
     const alloc = std.testing.allocator;
-    var runtime = Runtime{ .alloc = alloc, .backend = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
+    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
     defer runtime.yielded.deinit(alloc);
     const Writer = struct {
         runtime: *Runtime,
@@ -1287,7 +1204,7 @@ test "subagent feedback waits for admitted work to install its worker" {
             turn.commit(turn.active_work_id.?, .{ .assistant = .{
                 .user = .{ .text = message.content },
                 .assistant = @constCast("ORIGINAL_RESULT"),
-            } }, 0, 0, 2) catch return error.ProviderFailed;
+            } }) catch return error.ProviderFailed;
             return .completed;
         }
     };
@@ -1321,27 +1238,11 @@ test "subagent feedback waits for admitted work to install its worker" {
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("startup-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var fixture = Fixture{};
-    const runtime = try Runtime.create(alloc, &sessions, "startup-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
     defer runtime.deinit();
     var first = Call{ .runtime = runtime, .text = "original task" };
     var second = Call{ .runtime = runtime, .text = "parent feedback" };
@@ -1362,7 +1263,7 @@ test "subagent feedback waits for admitted work to install its worker" {
     var admitted = false;
     for (0..1000) |_| {
         admitted = blk: {
-            var lock = try runtime.managed.state_store.acquireLock(alloc);
+            var lock = runtime.managed.state_store.acquireLock();
             defer lock.release();
             var registry = try runtime.managed.state_store.load(alloc);
             defer registry.deinit(alloc);
@@ -1372,7 +1273,6 @@ test "subagent feedback waits for admitted work to install its worker" {
         io_mod.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(admitted);
-    try std.testing.expect(!runtime.managed.hasRunningWork());
     second_thread = try std.Thread.spawn(.{}, Call.run, .{&second});
     try second.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
     try std.testing.expectError(error.Timeout, second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } }));
@@ -1407,28 +1307,11 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    const state = session_codec.DurableSessionState{
-        .id = @constCast("failed-start-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    var parent = try sessions.startWritableSession(alloc, state);
-    defer parent.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var fixture = Fixture{};
-    const runtime = try Runtime.create(alloc, &sessions, state.id, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
+    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
     defer runtime.deinit();
     var worker = worker_runtime.WorkerRuntime{};
     defer worker.deinit(alloc);
@@ -1441,10 +1324,10 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     });
     defer request.deinit(alloc);
     const options = ExecuteOptions{
-        .caller_id = state.id,
+        .caller_id = parent.parent.id(),
         .invocation_id = "failed-start",
         .identity_epoch = 1,
-        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = state.conversation_language },
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
         .timestamp_ms = 1,
         .steering_worker = &worker,
@@ -1460,9 +1343,9 @@ fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
     try std.testing.expectEqual(@as(usize, 1), registry.children.len);
     const child = registry.findByOperation(work_id).?;
     try std.testing.expectEqual(child_state.Phase.running, child.phase);
-    var saved = try sessions.loadReadOnly(alloc, child.id);
-    defer saved.deinit(alloc);
-    try std.testing.expect(saved.subagent_child);
+    // The child is reserved: its settings wait for its first turn (D34).
+    var seed = (try parent.children.seedFor(alloc, child.id)).?;
+    defer seed.preferences.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
     try std.testing.expect(!runtime.hasYieldedChild(child.id));
@@ -1492,137 +1375,6 @@ test "subagent failed start removes only its pending tuple for run" {
 
 test "subagent failed start removes only its pending tuple for message" {
     try checkFailedStartBookkeeping(.message);
-}
-
-fn checkObservationFailureBookkeeping(fail_publication: bool) !void {
-    const Fixture = struct {
-        entered: std.Io.Event = .unset,
-        release: std.Io.Event = .unset,
-        publication_failures: usize = 0,
-        cancel: ?*std.atomic.Value(bool) = null,
-
-        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
-            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
-        }
-
-        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.cancel = cancel;
-            self.entered.set(io_mod.getIo());
-            self.release.waitUncancelable(io_mod.getIo());
-            return .completed;
-        }
-
-        fn failSync(raw: ?*anyopaque, _: std.Io.File) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.publication_failures += 1;
-            return error.InjectedPublicationFailure;
-        }
-    };
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("observation-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("test"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
-    var fixture = Fixture{};
-    const runtime = try Runtime.create(alloc, &sessions, "observation-parent", .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
-    defer runtime.deinit();
-    // Release the real child before teardown even when a regression assertion fails.
-    defer fixture.release.set(io_mod.getIo());
-    var worker = worker_runtime.WorkerRuntime{};
-    defer worker.deinit(alloc);
-    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "review this" } });
-    defer request.deinit(alloc);
-    const options = ExecuteOptions{
-        .caller_id = runtime.root_id,
-        .invocation_id = "observation-failure",
-        .identity_epoch = 1,
-        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
-        .max_result_bytes = 4096,
-        .timestamp_ms = 1,
-        .steering_worker = &worker,
-    };
-    const work_id = try operationIdAlloc(alloc, options.invocation_id, options.identity_epoch);
-    defer alloc.free(work_id);
-    var admitted = try runtime.admitManagedWork(alloc, request, work_id, options, null);
-    defer admitted.deinit(alloc);
-    const child_id = admitted.ready.child_id;
-    try runtime.retainYielded(child_id, work_id, options.max_result_bytes, 64);
-    try runtime.retainYielded(child_id, "other-work", 2048, 64);
-    var registry = try runtime.managed.state_store.load(alloc);
-    defer registry.deinit(alloc);
-    try std.testing.expectEqual(child_state.Phase.running, registry.findById(child_id).?.phase);
-    if (fail_publication) runtime.managed.state_store.options.replace_ops = .{ .ctx = &fixture, .sync_file = Fixture.failSync };
-    try std.testing.expectEqual(managed_owner.StartResult.started, try runtime.managed.start(child_id));
-    try fixture.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(1000) } });
-    try std.testing.expect(runtime.managed.hasRunningChild(child_id));
-    try std.testing.expect(!runtime.managed.hasRunningChild("other-child"));
-    if (fail_publication) {
-        fixture.release.set(io_mod.getIo());
-        // Observe only after slotMain finishes publication; do not reap it here.
-        for (0..1000) |_| {
-            if (!runtime.managed.hasRunningWork()) break;
-            io_mod.sleep(std.time.ns_per_ms);
-        }
-        try std.testing.expect(!runtime.managed.hasRunningWork());
-        try std.testing.expectEqual(@as(usize, 1), fixture.publication_failures);
-        var saved = try runtime.managed.state_store.load(alloc);
-        defer saved.deinit(alloc);
-        try std.testing.expectEqual(child_state.Phase.running, saved.findById(child_id).?.phase);
-        try std.testing.expectEqualStrings(work_id, saved.findById(child_id).?.active.?.id);
-    } else {
-        // A transient read failure while the real runner still borrows parent context.
-        var capability = try sessions.openSubagentControlCapabilityWritable(alloc, runtime.root_id, .{});
-        defer capability.deinit();
-        var entry = try capability.atomicReplace(alloc, .subagent_control, "children.json", "{");
-        entry.deinit(alloc);
-    }
-    const result = try runtime.observeManagedState(alloc, child_id, work_id, options.defaults, null, null, &worker, null);
-    defer alloc.free(result.body);
-    const expected = try model_contract.encodeResultAlloc(alloc, .{ .ok = false, .error_code = "state_unavailable" });
-    defer alloc.free(expected);
-    try std.testing.expect(!result.success);
-    try std.testing.expectEqualStrings(expected, result.body);
-    try std.testing.expectEqualStrings("other-work", runtime.yielded.items[runtime.yielded.items.len - 1].work_id);
-    runtime.removeYielded(child_id, "other-work");
-    if (fail_publication) {
-        // Assert before waitYielded to keep stale-state regressions bounded.
-        try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
-        try std.testing.expect(!try runtime.waitYielded(&worker));
-    } else {
-        try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
-        try std.testing.expect(runtime.hasYieldedChild(child_id));
-        try std.testing.expect(runtime.managed.hasRunningWork());
-        try std.testing.expect(!fixture.cancel.?.load(.seq_cst));
-        try runtime.managed.state_store.save(alloc, registry);
-        fixture.release.set(io_mod.getIo());
-        runtime.cancelYielded();
-        try std.testing.expect(!runtime.managed.hasRunningWork());
-        try std.testing.expect(!try runtime.waitYielded(&worker));
-    }
-}
-
-test "subagent observation failure drops unpublished completed work" {
-    try checkObservationFailureBookkeeping(true);
-}
-
-test "subagent observation failure retains a live child for draining" {
-    try checkObservationFailureBookkeeping(false);
 }
 
 test "subagent status publisher carries actual child facts and throttles unchanged metrics" {
@@ -1711,12 +1463,14 @@ const OverrideResolverFixture = struct {
     fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.runs += 1;
-        self.observed_model = std.testing.allocator.dupe(u8, turn.loaded.v1.state.preferences.model) catch return error.ProviderFailed;
+        var preferences = turn.child.currentPreferences(std.testing.allocator) catch return error.ProviderFailed;
+        defer preferences.deinit(std.testing.allocator);
+        self.observed_model = std.testing.allocator.dupe(u8, preferences.model) catch return error.ProviderFailed;
         if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
         turn.commit(turn.active_work_id.?, .{ .assistant = .{
             .user = .{ .text = message.content },
             .assistant = @constCast("CHILD_OK"),
-        } }, 0, 0, 2) catch return error.ProviderFailed;
+        } }) catch return error.ProviderFailed;
         return .completed;
     }
 
@@ -1729,9 +1483,9 @@ const OverrideResolverFixture = struct {
 fn overrideResolverFixtureRuntime(
     alloc: Allocator,
     fixture: *OverrideResolverFixture,
-    sessions: *session_store.Store,
+    parent: *child_state.TestParent,
 ) !*Runtime {
-    return Runtime.create(alloc, sessions, "override-parent", .{ .resolve_fn = OverrideResolverFixture.resolve }, .{ .context = fixture, .run_fn = OverrideResolverFixture.run });
+    return Runtime.create(alloc, &parent.children, .{ .resolve_fn = OverrideResolverFixture.resolve }, .{ .context = fixture, .run_fn = OverrideResolverFixture.run });
 }
 
 test "model override resolves against the catalog before child creation" {
@@ -1739,34 +1493,18 @@ test "model override resolves against the catalog before child creation" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("override-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var fixture = OverrideResolverFixture{};
     defer if (fixture.observed_model) |model| alloc.free(model);
-    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
     var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra-fast" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
-        .caller_id = "override-parent",
+        .caller_id = parent.parent.id(),
         .invocation_id = "override-resolve",
         .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1785,32 +1523,16 @@ test "unknown and ambiguous model overrides reject before any child session" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("override-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var fixture = OverrideResolverFixture{};
     defer if (fixture.observed_model) |model| alloc.free(model);
-    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
     const options = ExecuteOptions{
-        .caller_id = "override-parent",
+        .caller_id = parent.parent.id(),
         .invocation_id = "override-reject",
         .defaults = .{ .provider = .gateway, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1836,7 +1558,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
 
     // Rejections never created or ran a child.
     try std.testing.expectEqual(@as(usize, 0), fixture.runs);
-    var lock = try runtime.managed.state_store.acquireLock(alloc);
+    var lock = runtime.managed.state_store.acquireLock();
     defer lock.release();
     var registry = try runtime.managed.state_store.load(alloc);
     defer registry.deinit(alloc);
@@ -1848,34 +1570,18 @@ test "model override passes through for non-gateway providers" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, .{
-        .id = @constCast("override-parent"),
-        .origin_workspace_root = @constCast(home),
-        .workspace_root = @constCast(home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    });
-    defer parent.deinit(alloc);
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
     var fixture = OverrideResolverFixture{};
     defer if (fixture.observed_model) |model| alloc.free(model);
-    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &sessions);
+    const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
     var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "unknown-model" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
-        .caller_id = "override-parent",
+        .caller_id = parent.parent.id(),
         .invocation_id = "override-non-gateway",
         .defaults = .{ .provider = .codex, .model = "parent-model", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
         .max_result_bytes = 4096,
@@ -1893,7 +1599,7 @@ test "model override passes through for non-gateway providers" {
 fn formatFailedResult(alloc: Allocator, failure: ?[]const u8, partial: ?[]const u8) ![]u8 {
     const reason = failure orelse "failure reason unavailable";
     const text = partial orelse "";
-    return std.fmt.allocPrint(alloc, "Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
+    return alloc.print("Subagent failed: {s}. Earlier tool calls may have completed; their effects are not rolled back.{s}{s}", .{
         reason,
         if (text.len > 0) "\n\nPartial result:\n" else "",
         text,
@@ -2116,46 +1822,6 @@ fn effectiveDefaults(
     if (override.model) |model| resolved.model = resolved_model orelse model;
     if (override.effort) |effort| resolved.effort = effort;
     return resolved;
-}
-
-fn freshChildState(
-    alloc: Allocator,
-    child_id: []const u8,
-    workspace_root: []const u8,
-    work_id: []const u8,
-    defaults: Defaults,
-) !session_codec.DurableSessionState {
-    const now = io_mod.milliTimestamp();
-    const id = try alloc.dupe(u8, child_id);
-    errdefer alloc.free(id);
-    const origin = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(origin);
-    const workspace = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(workspace);
-    const model = try alloc.dupe(u8, defaults.model);
-    errdefer alloc.free(model);
-    const last_subagent_work_id = try alloc.dupe(u8, work_id);
-    errdefer alloc.free(last_subagent_work_id);
-    return .{
-        .id = id,
-        .origin_workspace_root = origin,
-        .workspace_root = workspace,
-        .created_at_ms = now,
-        .updated_at_ms = now,
-        .conversation_language = defaults.conversation_language,
-        .preferences = .{
-            .provider = defaults.provider,
-            .model = model,
-            .effort = defaults.effort,
-            .fast_mode = defaults.fast_mode,
-            .ultrafast_mode = defaults.ultrafast_mode,
-        },
-        .history = try alloc.alloc(types.HistoryTurn, 0),
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .last_subagent_work_id = last_subagent_work_id,
-        .subagent_child = true,
-    };
 }
 
 fn captureAdmission(

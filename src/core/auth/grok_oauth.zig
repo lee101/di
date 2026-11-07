@@ -152,8 +152,7 @@ fn prepareBrowserSignIn(alloc: Allocator, transport: oauth_transport.Provider) !
     var listener_owned = true;
     errdefer if (listener_owned) listener.deinit(io_mod.getIo());
     const callback_port = listener.socket.address.getPort();
-    const redirect_uri = try std.fmt.allocPrint(
-        alloc,
+    const redirect_uri = try alloc.print(
         "http://127.0.0.1:{d}/callback",
         .{callback_port},
     );
@@ -389,18 +388,11 @@ const StdinManualCodeReader = struct {
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
         if (self.closed) return null;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, 0);
-        if (ready == 0 or
-            (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        if (!io_mod.pollReadable(io_mod.stdinHandle(), 0)) return null;
 
         var chunk: [512]u8 = undefined;
         defer @memset(&chunk, 0);
-        const read_len = try std.posix.read(std.posix.STDIN_FILENO, &chunk);
+        const read_len = try io_mod.readHandle(io_mod.stdinHandle(), &chunk);
         if (read_len == 0) {
             self.closed = true;
             return if (self.len == 0) null else self.buffer[0..self.len];
@@ -707,7 +699,7 @@ fn fetchAccountId(
 ) ![]u8 {
     const endpoint_url = try configuredEndpoint(alloc, e2e_userinfo_url_env, userinfo_url);
     defer alloc.free(endpoint_url);
-    const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const authorization = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, authorization);
     var response = try transport.execute(alloc, .{
         .method = .get,
