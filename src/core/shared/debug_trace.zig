@@ -470,9 +470,19 @@ fn resolveLogPath(alloc: Allocator, workspace_root: []const u8, raw_path: []cons
 
 fn defaultLogPath(alloc: Allocator) ![]u8 {
     if (io_mod.homeDir()) |home| {
+        ensureDiHome(home);
         return defaultLogPathForHome(alloc, home);
     }
     return fallbackLogPathForMillis(alloc, io_mod.milliTimestamp());
+}
+
+fn ensureDiHome(home: []const u8) void {
+    var home_dir = io_mod.VerifiedDir{
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return,
+    };
+    defer home_dir.close();
+    var di_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.di_root_dir_name) catch return;
+    di_dir.close();
 }
 
 fn defaultLogPathForHome(alloc: Allocator, home: []const u8) ![]u8 {
@@ -529,11 +539,11 @@ test "isTruthy parses accepted and rejected values" {
     try std.testing.expect(!isTruthy(null));
 }
 
-test "home default log path uses fx logs directory" {
+test "home default log path uses di logs directory" {
     const alloc = std.testing.allocator;
     const path = try defaultLogPathForHome(alloc, "/tmp/fake-home");
     defer alloc.free(path);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/logs/trace.log", path);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.di/logs/trace.log", path);
 }
 
 test "fallback default log path uses tmp trace path" {

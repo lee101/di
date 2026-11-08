@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const root_dir_name = ".fx";
+pub const di_root_dir_name = ".di";
 pub const auth_file_name = "auth.json";
 pub const chatgpt_auth_file_name = "chatgpt-auth.json";
 pub const grok_auth_file_name = "grok-auth.json";
@@ -27,6 +28,10 @@ const recordings_dir_name = "recordings";
 
 pub fn rootDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name });
+}
+
+pub fn diRootDir(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, di_root_dir_name });
 }
 
 pub fn settingsPath(alloc: Allocator, home: []const u8) ![]u8 {
@@ -79,17 +84,21 @@ pub fn backupsDir(alloc: Allocator, home: []const u8) ![]u8 {
 }
 
 pub fn logsDir(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, logs_dir_name });
+    return std.Io.Dir.path.join(alloc, &.{ home, di_root_dir_name, logs_dir_name });
 }
 
 pub fn traceLogPath(alloc: Allocator, home: []const u8) ![]u8 {
-    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, logs_dir_name, trace_log_file_name });
+    return std.Io.Dir.path.join(alloc, &.{ home, di_root_dir_name, logs_dir_name, trace_log_file_name });
 }
 
 pub const diagnostics_dir_name = "diagnostics";
 pub const last_shutdown_report_file_name = "last-shutdown.json";
 
 pub fn lastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, di_root_dir_name, diagnostics_dir_name, last_shutdown_report_file_name });
+}
+
+pub fn legacyLastShutdownReportPath(alloc: Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, diagnostics_dir_name, last_shutdown_report_file_name });
 }
 
@@ -156,11 +165,11 @@ test "profile path helpers preserve current default locations" {
 
     const logs = try logsDir(alloc, "/tmp/fake-home");
     defer alloc.free(logs);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/logs", logs);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.di/logs", logs);
 
     const trace = try traceLogPath(alloc, "/tmp/fake-home");
     defer alloc.free(trace);
-    try std.testing.expectEqualStrings("/tmp/fake-home/.fx/logs/trace.log", trace);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.di/logs/trace.log", trace);
 
     const recordings = try recordingsDir(alloc, "/tmp/fake-home");
     defer alloc.free(recordings);

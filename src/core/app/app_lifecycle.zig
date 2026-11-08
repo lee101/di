@@ -1116,9 +1116,9 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
     defer home_dir.close();
-    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
-    defer fx_dir.close();
-    var diagnostics = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
+    var di_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.di_root_dir_name);
+    defer di_dir.close();
+    var diagnostics = try io_mod.openOrCreateVerifiedPrivateDir(&di_dir, profile_paths.diagnostics_dir_name);
     defer diagnostics.close();
     try io_mod.durableReplaceVerified(
         alloc,
@@ -1134,6 +1134,13 @@ pub fn readLastShutdownReport(alloc: Allocator) ?[]u8 {
     const home = io_mod.homeDir() orelse return null;
     const path = profile_paths.lastShutdownReportPath(alloc, home) catch return null;
     defer alloc.free(path);
+    if (readReportFile(alloc, path)) |bytes| return bytes;
+    const legacy = profile_paths.legacyLastShutdownReportPath(alloc, home) catch return null;
+    defer alloc.free(legacy);
+    return readReportFile(alloc, legacy);
+}
+
+fn readReportFile(alloc: Allocator, path: []const u8) ?[]u8 {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch return null;
     defer file.close(io_mod.getIo());
     return io_mod.readFileToEnd(alloc, &file, 64 * 1024) catch null;
